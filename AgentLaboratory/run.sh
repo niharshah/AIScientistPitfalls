@@ -1,0 +1,1 @@
+python ai_lab_repo.py --yaml-location "experiment_configs/MATH_agentlab.yaml"
