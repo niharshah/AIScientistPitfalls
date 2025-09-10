@@ -1,0 +1,4 @@
+import matplotlib.pyplot as plt
+import numpy as np
+
+We will load the saved experiment_data.npy, gather the loss and CWA-2D arrays for every hidden-dim run, and create three figures: (1) a 2×2 grid of loss curves (train+val) for each hidden size, (2) a 2×2 grid of CWA-2D validation curves, and (3) a bar-chart that compares the final epoch CWA-2D score across hidden sizes. Each figure is generated in its own try-except block, titled clearly, saved into the working directory with descriptive names, and the figure is always closed. We also print the final CWA-2D scores so they appear in the notebook / log. Only data already present in experiment_data.npy are used, and we limit ourselves to these three plots to stay within the 5-figure guideline.

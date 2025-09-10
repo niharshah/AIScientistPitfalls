@@ -1,0 +1,575 @@
+{
+  "best node": {
+    "overall_plan": "The overall plan began with hyperparameter tuning focused on varying the number of training epochs to evaluate the impact of training time on model performance. This involved initializing the model for each epoch setting, implementing early stopping, and storing metrics for analysis. The current plan transitions to enhancing the model architecture by replacing the plain GCN with a relational GNN that models relations between tokens based on order, shape, and color. Each sequence is converted into a heterogeneous graph, and the model uses RGCNConv layers followed by mean pooling for classification. New metrics such as Color-Weighted and Shape-Weighted accuracies are introduced, while maintaining the previous early-stopping logic. This plan ensures efficient execution on both CPU and GPU, with a fallback to a synthetic dataset if necessary. Overall, the strategy evolves from optimizing training time to leveraging relational structures for improved model performance.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "loss",
+            "lower_is_better": true,
+            "description": "Measures the error or difference between predicted and actual values.",
+            "data": [
+              {
+                "dataset_name": "Training",
+                "final_value": 0.5801,
+                "best_value": 0.5801
+              },
+              {
+                "dataset_name": "Validation",
+                "final_value": 0.6811,
+                "best_value": 0.6811
+              },
+              {
+                "dataset_name": "Test",
+                "final_value": 0.6945,
+                "best_value": 0.6945
+              }
+            ]
+          },
+          {
+            "metric_name": "CWA",
+            "lower_is_better": false,
+            "description": "Custom Weighted Accuracy, a metric for classification performance.",
+            "data": [
+              {
+                "dataset_name": "Training",
+                "final_value": 0.7286,
+                "best_value": 0.7286
+              },
+              {
+                "dataset_name": "Validation",
+                "final_value": 0.5953,
+                "best_value": 0.5953
+              },
+              {
+                "dataset_name": "Test",
+                "final_value": 0.5906,
+                "best_value": 0.5906
+              }
+            ]
+          },
+          {
+            "metric_name": "SWA",
+            "lower_is_better": false,
+            "description": "Smoothed Weighted Accuracy, another metric for classification performance.",
+            "data": [
+              {
+                "dataset_name": "Training",
+                "final_value": 0.7305,
+                "best_value": 0.7305
+              },
+              {
+                "dataset_name": "Validation",
+                "final_value": 0.5799,
+                "best_value": 0.5799
+              },
+              {
+                "dataset_name": "Test",
+                "final_value": 0.5623,
+                "best_value": 0.5623
+              }
+            ]
+          },
+          {
+            "metric_name": "CmpWA",
+            "lower_is_better": false,
+            "description": "Composite Weighted Accuracy, a combined metric for classification performance.",
+            "data": [
+              {
+                "dataset_name": "Training",
+                "final_value": 0.7295,
+                "best_value": 0.7295
+              },
+              {
+                "dataset_name": "Validation",
+                "final_value": 0.5885,
+                "best_value": 0.5885
+              },
+              {
+                "dataset_name": "Test",
+                "final_value": 0.5778,
+                "best_value": 0.5778
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, pathlib, random, time, copy, numpy as np, torch\nfrom typing import List, Tuple\nfrom torch_geometric.data import Data\nfrom torch_geometric.loader import DataLoader\nfrom torch_geometric.nn import RGCNConv, global_mean_pool\nimport torch.nn as nn\n\n# -------------------------------------------------------------------------\n# required working dir & device boiler-plate\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n# -------------------------------------------------------------------------\n\n\n# try to import official SPR utilities ------------------------------------------------\ndef try_load_real_dataset() -> Tuple[List[dict], List[dict], List[dict]]:\n    try:\n        import SPR\n\n        DATA_PATH = pathlib.Path(os.environ.get(\"SPR_DATA_PATH\", \"./SPR_BENCH\"))\n        dset = SPR.load_spr_bench(DATA_PATH)\n        return dset[\"train\"], dset[\"dev\"], dset[\"test\"]\n    except Exception as e:\n        raise IOError from e\n\n\n# synthetic fallback ------------------------------------------------------------------\ndef build_synthetic_dataset(n_train=600, n_val=150, n_test=150):\n    shapes, colors, labels = [\"C\", \"S\", \"T\"], [\"r\", \"g\", \"b\", \"y\"], [\"rule1\", \"rule2\"]\n\n    def make_seq():\n        L = random.randint(4, 10)\n        return \" \".join(random.choice(shapes) + random.choice(colors) for _ in range(L))\n\n    def make_split(n):\n        return [\n            {\"id\": i, \"sequence\": make_seq(), \"label\": random.choice(labels)}\n            for i in range(n)\n        ]\n\n    def tag(lst):\n        for i, r in enumerate(lst):\n            r[\"id\"] = i\n        return lst\n\n    return tag(make_split(n_train)), tag(make_split(n_val)), tag(make_split(n_test))\n\n\ntry:\n    train_rows, dev_rows, test_rows = try_load_real_dataset()\n    print(\"Loaded real SPR_BENCH.\")\nexcept IOError:\n    print(\"Using synthetic data (real dataset not found).\")\n    train_rows, dev_rows, test_rows = build_synthetic_dataset()\n\n\n# -------------------------------------------------------------------------\n# vocab & label maps ------------------------------------------------------\ndef all_tokens(rows):\n    for r in rows:\n        for tok in r[\"sequence\"].split():\n            yield tok\n\n\ntoken2idx = {\"<PAD>\": 0}\nfor tok in all_tokens(train_rows + dev_rows + test_rows):\n    token2idx.setdefault(tok, len(token2idx))\nlabel2idx = {}\nfor r in train_rows + dev_rows + test_rows:\n    label2idx.setdefault(r[\"label\"], len(label2idx))\nnum_classes = len(label2idx)\nprint(f\"Vocab={len(token2idx)}, Labels={num_classes}\")\n\n\n# -------------------------------------------------------------------------\n# helper metrics ----------------------------------------------------------\ndef count_color_variety(seq):\n    return len({tok[1] for tok in seq.split() if len(tok) > 1})\n\n\ndef count_shape_variety(seq):\n    return len({tok[0] for tok in seq.split() if tok})\n\n\ndef complexity_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) + count_shape_variety(s) for s in seqs]\n    correct = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(correct) / sum(w) if sum(w) > 0 else 0.0\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    correct = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(correct) / sum(w) if sum(w) > 0 else 0.0\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    correct = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(correct) / sum(w) if sum(w) > 0 else 0.0\n\n\n# -------------------------------------------------------------------------\n# graph construction with relation types ---------------------------------\ndef seq_to_graph(seq: str, label: str) -> Data:\n    toks = seq.split()\n    n = len(toks)\n    shapes = [t[0] for t in toks]\n    colors = [t[1] if len(t) > 1 else \"_\" for t in toks]\n    node_feats = torch.tensor([token2idx[t] for t in toks], dtype=torch.long)\n    src, dst, etype = [], [], []\n    # relation 0: next/previous (order)\n    for i in range(n - 1):\n        src.extend([i, i + 1])\n        dst.extend([i + 1, i])\n        etype.extend([0, 0])\n    # relation 1: same shape\n    for i in range(n):\n        for j in range(i + 1, n):\n            if shapes[i] == shapes[j]:\n                src.extend([i, j])\n                dst.extend([j, i])\n                etype.extend([1, 1])\n    # relation 2: same color\n    for i in range(n):\n        for j in range(i + 1, n):\n            if colors[i] == colors[j]:\n                src.extend([i, j])\n                dst.extend([j, i])\n                etype.extend([2, 2])\n    if len(src) == 0:  # fallback self loop\n        src = [0]\n        dst = [0]\n        etype = [0]\n    edge_index = torch.tensor([src, dst], dtype=torch.long)\n    edge_type = torch.tensor(etype, dtype=torch.long)\n    return Data(\n        x=node_feats,\n        edge_index=edge_index,\n        edge_type=edge_type,\n        y=torch.tensor([label2idx[label]], dtype=torch.long),\n        seq=seq,\n    )\n\n\ntrain_graphs = [seq_to_graph(r[\"sequence\"], r[\"label\"]) for r in train_rows]\nval_graphs = [seq_to_graph(r[\"sequence\"], r[\"label\"]) for r in dev_rows]\ntest_graphs = [seq_to_graph(r[\"sequence\"], r[\"label\"]) for r in test_rows]\n\nbatch_size = 128\ntrain_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)\nval_loader = DataLoader(val_graphs, batch_size=batch_size)\ntest_loader = DataLoader(test_graphs, batch_size=batch_size)\n\n\n# -------------------------------------------------------------------------\n# model -------------------------------------------------------------------\nclass SPR_RGCN(nn.Module):\n    def __init__(self, vocab_size, embed_dim=64, hidden_dim=64, num_rel=3, num_cls=2):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)\n        self.conv1 = RGCNConv(embed_dim, hidden_dim, num_relations=num_rel)\n        self.conv2 = RGCNConv(hidden_dim, hidden_dim, num_relations=num_rel)\n        self.lin = nn.Linear(hidden_dim, num_cls)\n\n    def forward(self, x, edge_index, edge_type, batch):\n        x = self.embed(x)\n        x = torch.relu(self.conv1(x, edge_index, edge_type))\n        x = torch.relu(self.conv2(x, edge_index, edge_type))\n        g_emb = global_mean_pool(x, batch)\n        return self.lin(g_emb)\n\n\n# -------------------------------------------------------------------------\n# training utilities ------------------------------------------------------\ndef run_epoch(model, loader, criterion, optimizer=None):\n    train = optimizer is not None\n    model.train() if train else model.eval()\n    tot_loss, seqs, y_true, y_pred = 0.0, [], [], []\n    for batch in loader:\n        batch = batch.to(device)\n        out = model(batch.x, batch.edge_index, batch.edge_type, batch.batch)\n        loss = criterion(out, batch.y.squeeze())\n        if train:\n            optimizer.zero_grad()\n            loss.backward()\n            optimizer.step()\n        tot_loss += loss.item() * batch.num_graphs\n        preds = out.argmax(-1).cpu().tolist()\n        y_pred.extend(preds)\n        y_true.extend(batch.y.squeeze().cpu().tolist())\n        seqs.extend(batch.seq)\n    avg_loss = tot_loss / len(loader.dataset)\n    cwa = color_weighted_accuracy(seqs, y_true, y_pred)\n    swa = shape_weighted_accuracy(seqs, y_true, y_pred)\n    cpx = complexity_weighted_accuracy(seqs, y_true, y_pred)\n    return avg_loss, cwa, swa, cpx, y_pred, y_true, seqs\n\n\n# -------------------------------------------------------------------------\n# experiment tracking dict ------------------------------------------------\nexperiment_data = {\n    \"SPR_RGCN\": {\n        \"metrics\": {\n            \"train\": {\"CWA\": [], \"SWA\": [], \"CmpWA\": []},\n            \"val\": {\"CWA\": [], \"SWA\": [], \"CmpWA\": []},\n        },\n        \"losses\": {\"train\": [], \"val\": []},\n        \"epochs\": [],\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n}\n\n# -------------------------------------------------------------------------\n# training loop -----------------------------------------------------------\nmax_epochs = 40\npatience = 7\nmodel = SPR_RGCN(len(token2idx), num_cls=num_classes).to(device)\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n\nbest_val = float(\"inf\")\nbest_state = None\nwait = 0\nfor epoch in range(1, max_epochs + 1):\n    tr_loss, tr_cwa, tr_swa, tr_cpx, _, _, _ = run_epoch(\n        model, train_loader, criterion, optimizer\n    )\n    val_loss, val_cwa, val_swa, val_cpx, _, _, _ = run_epoch(\n        model, val_loader, criterion\n    )\n    experiment_data[\"SPR_RGCN\"][\"losses\"][\"train\"].append(tr_loss)\n    experiment_data[\"SPR_RGCN\"][\"losses\"][\"val\"].append(val_loss)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"train\"][\"CWA\"].append(tr_cwa)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"train\"][\"SWA\"].append(tr_swa)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"train\"][\"CmpWA\"].append(tr_cpx)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"val\"][\"CWA\"].append(val_cwa)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"val\"][\"SWA\"].append(val_swa)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"val\"][\"CmpWA\"].append(val_cpx)\n    experiment_data[\"SPR_RGCN\"][\"epochs\"].append(epoch)\n    print(\n        f\"Epoch {epoch:02d}: \"\n        f\"train_loss={tr_loss:.4f} val_loss={val_loss:.4f} \"\n        f\"val_CmpWA={val_cpx:.4f}\"\n    )\n    if val_loss < best_val - 1e-4:\n        best_val = val_loss\n        best_state = copy.deepcopy(model.state_dict())\n        wait = 0\n    else:\n        wait += 1\n        if wait >= patience:\n            print(\"Early stopping.\")\n            break\n\n# -------------------------------------------------------------------------\n# load best & final test --------------------------------------------------\nif best_state is not None:\n    model.load_state_dict(best_state)\ntest_loss, test_cwa, test_swa, test_cpx, test_pred, test_true, _ = run_epoch(\n    model, test_loader, criterion\n)\nprint(\n    f\"TEST: loss={test_loss:.4f} CWA={test_cwa:.4f} \"\n    f\"SWA={test_swa:.4f} CmpWA={test_cpx:.4f}\"\n)\n\nexperiment_data[\"SPR_RGCN\"][\"predictions\"] = test_pred\nexperiment_data[\"SPR_RGCN\"][\"ground_truth\"] = test_true\nexperiment_data[\"SPR_RGCN\"][\"test_metrics\"] = {\n    \"loss\": test_loss,\n    \"CWA\": test_cwa,\n    \"SWA\": test_swa,\n    \"CmpWA\": test_cpx,\n}\n\n# -------------------------------------------------------------------------\n# save experiment data ----------------------------------------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"Saved metrics to working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ---------- setup ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- load ----------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\n    run = experiment_data.get(\"SPR_RGCN\", {})\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    run = {}\n\n\n# helper\ndef save_close(fig_name):\n    plt.tight_layout()\n    plt.savefig(os.path.join(working_dir, fig_name))\n    plt.close()\n\n\n# ---------- 1) loss curve ----------\ntry:\n    plt.figure()\n    ep = run[\"epochs\"]\n    plt.plot(ep, run[\"losses\"][\"train\"], label=\"train\")\n    plt.plot(ep, run[\"losses\"][\"val\"], \"--\", label=\"val\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Cross-Entropy Loss\")\n    plt.title(\"SPR_RGCN \u2013 Training vs Validation Loss\")\n    plt.legend()\n    save_close(\"SPR_RGCN_loss_curve.png\")\nexcept Exception as e:\n    print(f\"Error creating loss curve: {e}\")\n    plt.close()\n\n# ---------- 2-4) metric curves ----------\nfor metric in [\"CWA\", \"SWA\", \"CmpWA\"]:\n    try:\n        plt.figure()\n        ep = run[\"epochs\"]\n        plt.plot(ep, run[\"metrics\"][\"train\"][metric], label=\"train\")\n        plt.plot(ep, run[\"metrics\"][\"val\"][metric], \"--\", label=\"val\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(metric)\n        plt.title(f\"SPR_RGCN \u2013 Training vs Validation {metric}\")\n        plt.legend()\n        save_close(f\"SPR_RGCN_{metric}_curve.png\")\n    except Exception as e:\n        print(f\"Error creating {metric} curve: {e}\")\n        plt.close()\n\n# ---------- 5) test metrics summary ----------\ntry:\n    plt.figure()\n    names = [\"Loss\", \"CWA\", \"SWA\", \"CmpWA\"]\n    values = [run[\"test_metrics\"][k] for k in [\"loss\", \"CWA\", \"SWA\", \"CmpWA\"]]\n    bars = plt.bar(names, values, color=\"skyblue\")\n    for b, v in zip(bars, values):\n        plt.text(\n            b.get_x() + b.get_width() / 2,\n            b.get_height(),\n            f\"{v:.3f}\",\n            ha=\"center\",\n            va=\"bottom\",\n        )\n    plt.title(\"SPR_RGCN \u2013 Test Set Performance\")\n    save_close(\"SPR_RGCN_test_summary.png\")\nexcept Exception as e:\n    print(f\"Error creating test summary plot: {e}\")\n    plt.close()\n",
+    "plot_plan": "We load the saved experiment_data.npy, extract the single run stored under key 'SPR_RGCN', and read its recorded epochs, losses, and three weighted-accuracy curves. Four line plots are produced: one for loss and one each for CWA, SWA, and CmpWA, with training and validation curves super-imposed. A fifth bar plot summarizes the final test metrics (loss, CWA, SWA, CmpWA) to give a compact end-of-training snapshot. Each figure is generated inside its own try-except block, labelled clearly, saved to working_dir with the dataset and plot type in the filename, and the figure is closed afterwards. All plotting relies solely on the contents of experiment_data.npy\u2014no values are fabricated. The entire script starts with the required imports and working directory creation. No additional stylistic packages are used, respecting the requirement for basic matplotlib only. Finally, the script prints any loading or plotting errors so that failures do not halt subsequent plots.",
+    "plot_analyses": [
+      {
+        "analysis": "The training loss decreases steadily, indicating that the model is learning effectively on the training data. However, the validation loss remains relatively flat and even increases slightly, suggesting overfitting. The model may not generalize well to unseen data, and regularization techniques or additional hyperparameter tuning might be necessary.",
+        "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b17edab791f14c288925c03b997cd4d7_proc_1494370/SPR_RGCN_loss_curve.png"
+      },
+      {
+        "analysis": "The Color-Weighted Accuracy (CWA) for the training set improves consistently over epochs, showing that the model is capturing color-based relationships in the training data. However, the validation CWA peaks early and then declines, further indicating overfitting and poor generalization to the validation set.",
+        "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b17edab791f14c288925c03b997cd4d7_proc_1494370/SPR_RGCN_CWA_curve.png"
+      },
+      {
+        "analysis": "Similar to the CWA, the Shape-Weighted Accuracy (SWA) for the training set increases steadily, reflecting the model's ability to learn shape-based dependencies in the training data. The validation SWA, however, follows a declining trend after an initial peak, again pointing to overfitting.",
+        "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b17edab791f14c288925c03b997cd4d7_proc_1494370/SPR_RGCN_SWA_curve.png"
+      },
+      {
+        "analysis": "The Combined Weighted Accuracy (CmpWA) shows the same trends as the CWA and SWA metrics. The training accuracy improves consistently, but the validation accuracy declines after an initial increase, reinforcing the observation of overfitting.",
+        "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b17edab791f14c288925c03b997cd4d7_proc_1494370/SPR_RGCN_CmpWA_curve.png"
+      },
+      {
+        "analysis": "The test set performance metrics reveal that the model achieves a loss of 0.695, which is relatively high, and the CWA (0.591), SWA (0.562), and CmpWA (0.578) are below the SOTA benchmarks (CWA: 65.0%, SWA: 70.0%). This indicates that the model fails to achieve the desired performance and suggests that further optimization or architectural changes are needed.",
+        "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b17edab791f14c288925c03b997cd4d7_proc_1494370/SPR_RGCN_test_summary.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b17edab791f14c288925c03b997cd4d7_proc_1494370/SPR_RGCN_loss_curve.png",
+      "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b17edab791f14c288925c03b997cd4d7_proc_1494370/SPR_RGCN_CWA_curve.png",
+      "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b17edab791f14c288925c03b997cd4d7_proc_1494370/SPR_RGCN_SWA_curve.png",
+      "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b17edab791f14c288925c03b997cd4d7_proc_1494370/SPR_RGCN_CmpWA_curve.png",
+      "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b17edab791f14c288925c03b997cd4d7_proc_1494370/SPR_RGCN_test_summary.png"
+    ],
+    "vlm_feedback_summary": "The experimental results indicate that while the model learns effectively on the training data, it suffers from significant overfitting, as evidenced by the divergence between training and validation metrics. Additionally, the test set performance falls short of the SOTA benchmarks, highlighting the need for further optimization and potential redesign of the model architecture or training strategy.",
+    "exp_results_dir": "experiment_results/experiment_b17edab791f14c288925c03b997cd4d7_proc_1494370",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_b17edab791f14c288925c03b997cd4d7_proc_1494370/experiment_data.npy"
+    ]
+  },
+  "best node with different seeds": [
+    {
+      "overall_plan": "The overall plan started with hyperparameter tuning aimed at optimizing training epochs to balance training time and model performance. This evolved into enhancing model architecture by transitioning from a plain GCN to a relational GNN, which models relations between tokens by order, shape, and color. The sequences are converted into heterogeneous graphs, processed using RGCNConv layers followed by mean pooling for classification. New metrics, such as Color-Weighted and Shape-Weighted accuracies, were introduced, maintaining early-stopping logic for overfitting prevention. The plan ensures computational efficiency on CPU and GPU, with a synthetic dataset fallback. The current node, being the seed node, suggests a foundational stage, with the main focus on the relational GNN architecture and evaluation metrics introduced in the previous plan, preparing for potential future developments.",
+      "analysis": "",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "loss",
+              "lower_is_better": true,
+              "description": "Measures the error or difference between predicted and actual values.",
+              "data": [
+                {
+                  "dataset_name": "Training",
+                  "final_value": 0.5535,
+                  "best_value": 0.5535
+                },
+                {
+                  "dataset_name": "Validation",
+                  "final_value": 0.6988,
+                  "best_value": 0.6988
+                },
+                {
+                  "dataset_name": "Test",
+                  "final_value": 0.7275,
+                  "best_value": 0.7275
+                }
+              ]
+            },
+            {
+              "metric_name": "CWA",
+              "lower_is_better": false,
+              "description": "Class-weighted accuracy, measures classification performance considering class imbalance.",
+              "data": [
+                {
+                  "dataset_name": "Training",
+                  "final_value": 0.7698,
+                  "best_value": 0.7698
+                },
+                {
+                  "dataset_name": "Validation",
+                  "final_value": 0.5709,
+                  "best_value": 0.5709
+                },
+                {
+                  "dataset_name": "Test",
+                  "final_value": 0.5088,
+                  "best_value": 0.5088
+                }
+              ]
+            },
+            {
+              "metric_name": "SWA",
+              "lower_is_better": false,
+              "description": "Simple weighted accuracy, another metric for evaluating classification performance.",
+              "data": [
+                {
+                  "dataset_name": "Training",
+                  "final_value": 0.7714,
+                  "best_value": 0.7714
+                },
+                {
+                  "dataset_name": "Validation",
+                  "final_value": 0.5628,
+                  "best_value": 0.5628
+                },
+                {
+                  "dataset_name": "Test",
+                  "final_value": 0.5,
+                  "best_value": 0.5
+                }
+              ]
+            },
+            {
+              "metric_name": "CmpWA",
+              "lower_is_better": false,
+              "description": "Composite weighted accuracy, combines multiple accuracy measures.",
+              "data": [
+                {
+                  "dataset_name": "Training",
+                  "final_value": 0.7705,
+                  "best_value": 0.7705
+                },
+                {
+                  "dataset_name": "Validation",
+                  "final_value": 0.5672,
+                  "best_value": 0.5672
+                },
+                {
+                  "dataset_name": "Test",
+                  "final_value": 0.5048,
+                  "best_value": 0.5048
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 0\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os, pathlib, random, time, copy, numpy as np, torch\nfrom typing import List, Tuple\nfrom torch_geometric.data import Data\nfrom torch_geometric.loader import DataLoader\nfrom torch_geometric.nn import RGCNConv, global_mean_pool\nimport torch.nn as nn\n\n# -------------------------------------------------------------------------\n# required working dir & device boiler-plate\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n# -------------------------------------------------------------------------\n\n\n# try to import official SPR utilities ------------------------------------------------\ndef try_load_real_dataset() -> Tuple[List[dict], List[dict], List[dict]]:\n    try:\n        import SPR\n\n        DATA_PATH = pathlib.Path(os.environ.get(\"SPR_DATA_PATH\", \"./SPR_BENCH\"))\n        dset = SPR.load_spr_bench(DATA_PATH)\n        return dset[\"train\"], dset[\"dev\"], dset[\"test\"]\n    except Exception as e:\n        raise IOError from e\n\n\n# synthetic fallback ------------------------------------------------------------------\ndef build_synthetic_dataset(n_train=600, n_val=150, n_test=150):\n    shapes, colors, labels = [\"C\", \"S\", \"T\"], [\"r\", \"g\", \"b\", \"y\"], [\"rule1\", \"rule2\"]\n\n    def make_seq():\n        L = random.randint(4, 10)\n        return \" \".join(random.choice(shapes) + random.choice(colors) for _ in range(L))\n\n    def make_split(n):\n        return [\n            {\"id\": i, \"sequence\": make_seq(), \"label\": random.choice(labels)}\n            for i in range(n)\n        ]\n\n    def tag(lst):\n        for i, r in enumerate(lst):\n            r[\"id\"] = i\n        return lst\n\n    return tag(make_split(n_train)), tag(make_split(n_val)), tag(make_split(n_test))\n\n\ntry:\n    train_rows, dev_rows, test_rows = try_load_real_dataset()\n    print(\"Loaded real SPR_BENCH.\")\nexcept IOError:\n    print(\"Using synthetic data (real dataset not found).\")\n    train_rows, dev_rows, test_rows = build_synthetic_dataset()\n\n\n# -------------------------------------------------------------------------\n# vocab & label maps ------------------------------------------------------\ndef all_tokens(rows):\n    for r in rows:\n        for tok in r[\"sequence\"].split():\n            yield tok\n\n\ntoken2idx = {\"<PAD>\": 0}\nfor tok in all_tokens(train_rows + dev_rows + test_rows):\n    token2idx.setdefault(tok, len(token2idx))\nlabel2idx = {}\nfor r in train_rows + dev_rows + test_rows:\n    label2idx.setdefault(r[\"label\"], len(label2idx))\nnum_classes = len(label2idx)\nprint(f\"Vocab={len(token2idx)}, Labels={num_classes}\")\n\n\n# -------------------------------------------------------------------------\n# helper metrics ----------------------------------------------------------\ndef count_color_variety(seq):\n    return len({tok[1] for tok in seq.split() if len(tok) > 1})\n\n\ndef count_shape_variety(seq):\n    return len({tok[0] for tok in seq.split() if tok})\n\n\ndef complexity_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) + count_shape_variety(s) for s in seqs]\n    correct = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(correct) / sum(w) if sum(w) > 0 else 0.0\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    correct = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(correct) / sum(w) if sum(w) > 0 else 0.0\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    correct = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(correct) / sum(w) if sum(w) > 0 else 0.0\n\n\n# -------------------------------------------------------------------------\n# graph construction with relation types ---------------------------------\ndef seq_to_graph(seq: str, label: str) -> Data:\n    toks = seq.split()\n    n = len(toks)\n    shapes = [t[0] for t in toks]\n    colors = [t[1] if len(t) > 1 else \"_\" for t in toks]\n    node_feats = torch.tensor([token2idx[t] for t in toks], dtype=torch.long)\n    src, dst, etype = [], [], []\n    # relation 0: next/previous (order)\n    for i in range(n - 1):\n        src.extend([i, i + 1])\n        dst.extend([i + 1, i])\n        etype.extend([0, 0])\n    # relation 1: same shape\n    for i in range(n):\n        for j in range(i + 1, n):\n            if shapes[i] == shapes[j]:\n                src.extend([i, j])\n                dst.extend([j, i])\n                etype.extend([1, 1])\n    # relation 2: same color\n    for i in range(n):\n        for j in range(i + 1, n):\n            if colors[i] == colors[j]:\n                src.extend([i, j])\n                dst.extend([j, i])\n                etype.extend([2, 2])\n    if len(src) == 0:  # fallback self loop\n        src = [0]\n        dst = [0]\n        etype = [0]\n    edge_index = torch.tensor([src, dst], dtype=torch.long)\n    edge_type = torch.tensor(etype, dtype=torch.long)\n    return Data(\n        x=node_feats,\n        edge_index=edge_index,\n        edge_type=edge_type,\n        y=torch.tensor([label2idx[label]], dtype=torch.long),\n        seq=seq,\n    )\n\n\ntrain_graphs = [seq_to_graph(r[\"sequence\"], r[\"label\"]) for r in train_rows]\nval_graphs = [seq_to_graph(r[\"sequence\"], r[\"label\"]) for r in dev_rows]\ntest_graphs = [seq_to_graph(r[\"sequence\"], r[\"label\"]) for r in test_rows]\n\nbatch_size = 128\ntrain_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)\nval_loader = DataLoader(val_graphs, batch_size=batch_size)\ntest_loader = DataLoader(test_graphs, batch_size=batch_size)\n\n\n# -------------------------------------------------------------------------\n# model -------------------------------------------------------------------\nclass SPR_RGCN(nn.Module):\n    def __init__(self, vocab_size, embed_dim=64, hidden_dim=64, num_rel=3, num_cls=2):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)\n        self.conv1 = RGCNConv(embed_dim, hidden_dim, num_relations=num_rel)\n        self.conv2 = RGCNConv(hidden_dim, hidden_dim, num_relations=num_rel)\n        self.lin = nn.Linear(hidden_dim, num_cls)\n\n    def forward(self, x, edge_index, edge_type, batch):\n        x = self.embed(x)\n        x = torch.relu(self.conv1(x, edge_index, edge_type))\n        x = torch.relu(self.conv2(x, edge_index, edge_type))\n        g_emb = global_mean_pool(x, batch)\n        return self.lin(g_emb)\n\n\n# -------------------------------------------------------------------------\n# training utilities ------------------------------------------------------\ndef run_epoch(model, loader, criterion, optimizer=None):\n    train = optimizer is not None\n    model.train() if train else model.eval()\n    tot_loss, seqs, y_true, y_pred = 0.0, [], [], []\n    for batch in loader:\n        batch = batch.to(device)\n        out = model(batch.x, batch.edge_index, batch.edge_type, batch.batch)\n        loss = criterion(out, batch.y.squeeze())\n        if train:\n            optimizer.zero_grad()\n            loss.backward()\n            optimizer.step()\n        tot_loss += loss.item() * batch.num_graphs\n        preds = out.argmax(-1).cpu().tolist()\n        y_pred.extend(preds)\n        y_true.extend(batch.y.squeeze().cpu().tolist())\n        seqs.extend(batch.seq)\n    avg_loss = tot_loss / len(loader.dataset)\n    cwa = color_weighted_accuracy(seqs, y_true, y_pred)\n    swa = shape_weighted_accuracy(seqs, y_true, y_pred)\n    cpx = complexity_weighted_accuracy(seqs, y_true, y_pred)\n    return avg_loss, cwa, swa, cpx, y_pred, y_true, seqs\n\n\n# -------------------------------------------------------------------------\n# experiment tracking dict ------------------------------------------------\nexperiment_data = {\n    \"SPR_RGCN\": {\n        \"metrics\": {\n            \"train\": {\"CWA\": [], \"SWA\": [], \"CmpWA\": []},\n            \"val\": {\"CWA\": [], \"SWA\": [], \"CmpWA\": []},\n        },\n        \"losses\": {\"train\": [], \"val\": []},\n        \"epochs\": [],\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n}\n\n# -------------------------------------------------------------------------\n# training loop -----------------------------------------------------------\nmax_epochs = 40\npatience = 7\nmodel = SPR_RGCN(len(token2idx), num_cls=num_classes).to(device)\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n\nbest_val = float(\"inf\")\nbest_state = None\nwait = 0\nfor epoch in range(1, max_epochs + 1):\n    tr_loss, tr_cwa, tr_swa, tr_cpx, _, _, _ = run_epoch(\n        model, train_loader, criterion, optimizer\n    )\n    val_loss, val_cwa, val_swa, val_cpx, _, _, _ = run_epoch(\n        model, val_loader, criterion\n    )\n    experiment_data[\"SPR_RGCN\"][\"losses\"][\"train\"].append(tr_loss)\n    experiment_data[\"SPR_RGCN\"][\"losses\"][\"val\"].append(val_loss)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"train\"][\"CWA\"].append(tr_cwa)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"train\"][\"SWA\"].append(tr_swa)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"train\"][\"CmpWA\"].append(tr_cpx)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"val\"][\"CWA\"].append(val_cwa)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"val\"][\"SWA\"].append(val_swa)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"val\"][\"CmpWA\"].append(val_cpx)\n    experiment_data[\"SPR_RGCN\"][\"epochs\"].append(epoch)\n    print(\n        f\"Epoch {epoch:02d}: \"\n        f\"train_loss={tr_loss:.4f} val_loss={val_loss:.4f} \"\n        f\"val_CmpWA={val_cpx:.4f}\"\n    )\n    if val_loss < best_val - 1e-4:\n        best_val = val_loss\n        best_state = copy.deepcopy(model.state_dict())\n        wait = 0\n    else:\n        wait += 1\n        if wait >= patience:\n            print(\"Early stopping.\")\n            break\n\n# -------------------------------------------------------------------------\n# load best & final test --------------------------------------------------\nif best_state is not None:\n    model.load_state_dict(best_state)\ntest_loss, test_cwa, test_swa, test_cpx, test_pred, test_true, _ = run_epoch(\n    model, test_loader, criterion\n)\nprint(\n    f\"TEST: loss={test_loss:.4f} CWA={test_cwa:.4f} \"\n    f\"SWA={test_swa:.4f} CmpWA={test_cpx:.4f}\"\n)\n\nexperiment_data[\"SPR_RGCN\"][\"predictions\"] = test_pred\nexperiment_data[\"SPR_RGCN\"][\"ground_truth\"] = test_true\nexperiment_data[\"SPR_RGCN\"][\"test_metrics\"] = {\n    \"loss\": test_loss,\n    \"CWA\": test_cwa,\n    \"SWA\": test_swa,\n    \"CmpWA\": test_cpx,\n}\n\n# -------------------------------------------------------------------------\n# save experiment data ----------------------------------------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"Saved metrics to working/experiment_data.npy\")\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ---------- setup ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- load ----------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\n    run = experiment_data.get(\"SPR_RGCN\", {})\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    run = {}\n\n\n# helper\ndef save_close(fig_name):\n    plt.tight_layout()\n    plt.savefig(os.path.join(working_dir, fig_name))\n    plt.close()\n\n\n# ---------- 1) loss curve ----------\ntry:\n    plt.figure()\n    ep = run[\"epochs\"]\n    plt.plot(ep, run[\"losses\"][\"train\"], label=\"train\")\n    plt.plot(ep, run[\"losses\"][\"val\"], \"--\", label=\"val\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Cross-Entropy Loss\")\n    plt.title(\"SPR_RGCN \u2013 Training vs Validation Loss\")\n    plt.legend()\n    save_close(\"SPR_RGCN_loss_curve.png\")\nexcept Exception as e:\n    print(f\"Error creating loss curve: {e}\")\n    plt.close()\n\n# ---------- 2-4) metric curves ----------\nfor metric in [\"CWA\", \"SWA\", \"CmpWA\"]:\n    try:\n        plt.figure()\n        ep = run[\"epochs\"]\n        plt.plot(ep, run[\"metrics\"][\"train\"][metric], label=\"train\")\n        plt.plot(ep, run[\"metrics\"][\"val\"][metric], \"--\", label=\"val\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(metric)\n        plt.title(f\"SPR_RGCN \u2013 Training vs Validation {metric}\")\n        plt.legend()\n        save_close(f\"SPR_RGCN_{metric}_curve.png\")\n    except Exception as e:\n        print(f\"Error creating {metric} curve: {e}\")\n        plt.close()\n\n# ---------- 5) test metrics summary ----------\ntry:\n    plt.figure()\n    names = [\"Loss\", \"CWA\", \"SWA\", \"CmpWA\"]\n    values = [run[\"test_metrics\"][k] for k in [\"loss\", \"CWA\", \"SWA\", \"CmpWA\"]]\n    bars = plt.bar(names, values, color=\"skyblue\")\n    for b, v in zip(bars, values):\n        plt.text(\n            b.get_x() + b.get_width() / 2,\n            b.get_height(),\n            f\"{v:.3f}\",\n            ha=\"center\",\n            va=\"bottom\",\n        )\n    plt.title(\"SPR_RGCN \u2013 Test Set Performance\")\n    save_close(\"SPR_RGCN_test_summary.png\")\nexcept Exception as e:\n    print(f\"Error creating test summary plot: {e}\")\n    plt.close()\n",
+      "plot_analyses": [
+        {
+          "analysis": "The training loss decreases steadily with each epoch, indicating that the model is learning effectively from the training data. However, the validation loss remains relatively flat and even increases slightly after some epochs, suggesting potential overfitting to the training data. This could imply that the model is not generalizing well to unseen data, and additional regularization techniques or hyperparameter tuning may be needed.",
+          "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_019040f1075541dd83a579dedf17f867_proc_1494367/SPR_RGCN_loss_curve.png"
+        },
+        {
+          "analysis": "The Color-Weighted Accuracy (CWA) for the training data improves consistently with each epoch, showing the model's increasing ability to classify sequences based on color-related rules. However, the validation CWA fluctuates significantly and does not show a clear upward trend. This indicates that the model struggles to generalize color-based reasoning to unseen data, potentially due to overfitting or insufficient representation of color-related patterns in the model.",
+          "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_019040f1075541dd83a579dedf17f867_proc_1494367/SPR_RGCN_CWA_curve.png"
+        },
+        {
+          "analysis": "The Shape-Weighted Accuracy (SWA) for the training data also shows steady improvement, mirroring the trend seen in CWA. However, the validation SWA exhibits similar fluctuations and lack of improvement as observed in CWA. This again points to challenges in generalization, particularly for shape-based reasoning, and suggests that the model may need additional adjustments to better capture and generalize shape-related dependencies.",
+          "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_019040f1075541dd83a579dedf17f867_proc_1494367/SPR_RGCN_SWA_curve.png"
+        },
+        {
+          "analysis": "The combined weighted accuracy (CmpWA) follows the same trends as CWA and SWA, with steady improvement on the training data but significant fluctuations and stagnation on the validation data. This reinforces the observation that the model is overfitting to the training data and struggling to generalize to the validation data. Further analysis of the learned embeddings and misclassified examples could provide insights into specific areas of improvement.",
+          "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_019040f1075541dd83a579dedf17f867_proc_1494367/SPR_RGCN_CmpWA_curve.png"
+        },
+        {
+          "analysis": "The test set performance shows that the model achieves a loss of 0.728, with CWA, SWA, and CmpWA scores of 0.509, 0.500, and 0.505, respectively. These results are below the SOTA benchmarks (CWA: 65.0%, SWA: 70.0%), indicating that the current model setup is not yet competitive. The low performance on the test set aligns with the validation trends, emphasizing the need for better generalization strategies, such as improved architecture design, enhanced edge feature representations, or more robust training techniques.",
+          "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_019040f1075541dd83a579dedf17f867_proc_1494367/SPR_RGCN_test_summary.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_019040f1075541dd83a579dedf17f867_proc_1494367/SPR_RGCN_loss_curve.png",
+        "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_019040f1075541dd83a579dedf17f867_proc_1494367/SPR_RGCN_CWA_curve.png",
+        "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_019040f1075541dd83a579dedf17f867_proc_1494367/SPR_RGCN_SWA_curve.png",
+        "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_019040f1075541dd83a579dedf17f867_proc_1494367/SPR_RGCN_CmpWA_curve.png",
+        "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_019040f1075541dd83a579dedf17f867_proc_1494367/SPR_RGCN_test_summary.png"
+      ],
+      "vlm_feedback_summary": "The plots reveal that the model is learning effectively on the training data but struggles to generalize to unseen validation and test data. This is evident from the steady improvement in training metrics and the stagnation or fluctuations in validation metrics. The test set results further confirm that the model's performance is below SOTA benchmarks, highlighting the need for architectural or training improvements to enhance generalization.",
+      "exp_results_dir": "experiment_results/experiment_019040f1075541dd83a579dedf17f867_proc_1494367",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_019040f1075541dd83a579dedf17f867_proc_1494367/experiment_data.npy"
+      ]
+    },
+    {
+      "overall_plan": "The overall plan began with hyperparameter tuning focused on varying the number of training epochs to evaluate the impact of training time on model performance. This involved initializing the model for each epoch setting, implementing early stopping, and storing metrics for analysis. The plan then transitioned to enhancing the model architecture by replacing the plain GCN with a relational GNN that models relations between tokens based on order, shape, and color. Each sequence is converted into a heterogeneous graph, and the model uses RGCNConv layers followed by mean pooling for classification. New metrics such as Color-Weighted and Shape-Weighted accuracies are introduced, while maintaining the previous early-stopping logic. This plan ensures efficient execution on both CPU and GPU, with a fallback to a synthetic dataset if necessary. Currently, the plan is at the seed node stage, likely indicating the start of a new phase or foundational setup. Overall, the strategy evolves from optimizing training time to leveraging relational structures for improved model performance, while potentially setting the groundwork for future exploration.",
+      "analysis": "",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "loss",
+              "lower_is_better": true,
+              "description": "Measures the error or deviation from the expected results.",
+              "data": [
+                {
+                  "dataset_name": "Training",
+                  "final_value": 0.6107,
+                  "best_value": 0.6107
+                },
+                {
+                  "dataset_name": "Validation",
+                  "final_value": 0.7252,
+                  "best_value": 0.7252
+                },
+                {
+                  "dataset_name": "Test",
+                  "final_value": 0.7015,
+                  "best_value": 0.7015
+                }
+              ]
+            },
+            {
+              "metric_name": "CWA",
+              "lower_is_better": false,
+              "description": "Class Weighted Accuracy, measures the accuracy of predictions considering the class weight.",
+              "data": [
+                {
+                  "dataset_name": "Training",
+                  "final_value": 0.7105,
+                  "best_value": 0.7105
+                },
+                {
+                  "dataset_name": "Validation",
+                  "final_value": 0.4691,
+                  "best_value": 0.4691
+                },
+                {
+                  "dataset_name": "Test",
+                  "final_value": 0.5129,
+                  "best_value": 0.5129
+                }
+              ]
+            },
+            {
+              "metric_name": "SWA",
+              "lower_is_better": false,
+              "description": "Sample Weighted Accuracy, measures the accuracy of predictions considering sample weights.",
+              "data": [
+                {
+                  "dataset_name": "Training",
+                  "final_value": 0.7104,
+                  "best_value": 0.7104
+                },
+                {
+                  "dataset_name": "Validation",
+                  "final_value": 0.4652,
+                  "best_value": 0.4652
+                },
+                {
+                  "dataset_name": "Test",
+                  "final_value": 0.4975,
+                  "best_value": 0.4975
+                }
+              ]
+            },
+            {
+              "metric_name": "CmpWA",
+              "lower_is_better": false,
+              "description": "Comparison Weighted Accuracy, measures the accuracy of predictions with additional comparison weighting.",
+              "data": [
+                {
+                  "dataset_name": "Training",
+                  "final_value": 0.7104,
+                  "best_value": 0.7104
+                },
+                {
+                  "dataset_name": "Validation",
+                  "final_value": 0.4673,
+                  "best_value": 0.4673
+                },
+                {
+                  "dataset_name": "Test",
+                  "final_value": 0.5061,
+                  "best_value": 0.5061
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 2\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os, pathlib, random, time, copy, numpy as np, torch\nfrom typing import List, Tuple\nfrom torch_geometric.data import Data\nfrom torch_geometric.loader import DataLoader\nfrom torch_geometric.nn import RGCNConv, global_mean_pool\nimport torch.nn as nn\n\n# -------------------------------------------------------------------------\n# required working dir & device boiler-plate\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n# -------------------------------------------------------------------------\n\n\n# try to import official SPR utilities ------------------------------------------------\ndef try_load_real_dataset() -> Tuple[List[dict], List[dict], List[dict]]:\n    try:\n        import SPR\n\n        DATA_PATH = pathlib.Path(os.environ.get(\"SPR_DATA_PATH\", \"./SPR_BENCH\"))\n        dset = SPR.load_spr_bench(DATA_PATH)\n        return dset[\"train\"], dset[\"dev\"], dset[\"test\"]\n    except Exception as e:\n        raise IOError from e\n\n\n# synthetic fallback ------------------------------------------------------------------\ndef build_synthetic_dataset(n_train=600, n_val=150, n_test=150):\n    shapes, colors, labels = [\"C\", \"S\", \"T\"], [\"r\", \"g\", \"b\", \"y\"], [\"rule1\", \"rule2\"]\n\n    def make_seq():\n        L = random.randint(4, 10)\n        return \" \".join(random.choice(shapes) + random.choice(colors) for _ in range(L))\n\n    def make_split(n):\n        return [\n            {\"id\": i, \"sequence\": make_seq(), \"label\": random.choice(labels)}\n            for i in range(n)\n        ]\n\n    def tag(lst):\n        for i, r in enumerate(lst):\n            r[\"id\"] = i\n        return lst\n\n    return tag(make_split(n_train)), tag(make_split(n_val)), tag(make_split(n_test))\n\n\ntry:\n    train_rows, dev_rows, test_rows = try_load_real_dataset()\n    print(\"Loaded real SPR_BENCH.\")\nexcept IOError:\n    print(\"Using synthetic data (real dataset not found).\")\n    train_rows, dev_rows, test_rows = build_synthetic_dataset()\n\n\n# -------------------------------------------------------------------------\n# vocab & label maps ------------------------------------------------------\ndef all_tokens(rows):\n    for r in rows:\n        for tok in r[\"sequence\"].split():\n            yield tok\n\n\ntoken2idx = {\"<PAD>\": 0}\nfor tok in all_tokens(train_rows + dev_rows + test_rows):\n    token2idx.setdefault(tok, len(token2idx))\nlabel2idx = {}\nfor r in train_rows + dev_rows + test_rows:\n    label2idx.setdefault(r[\"label\"], len(label2idx))\nnum_classes = len(label2idx)\nprint(f\"Vocab={len(token2idx)}, Labels={num_classes}\")\n\n\n# -------------------------------------------------------------------------\n# helper metrics ----------------------------------------------------------\ndef count_color_variety(seq):\n    return len({tok[1] for tok in seq.split() if len(tok) > 1})\n\n\ndef count_shape_variety(seq):\n    return len({tok[0] for tok in seq.split() if tok})\n\n\ndef complexity_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) + count_shape_variety(s) for s in seqs]\n    correct = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(correct) / sum(w) if sum(w) > 0 else 0.0\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    correct = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(correct) / sum(w) if sum(w) > 0 else 0.0\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    correct = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(correct) / sum(w) if sum(w) > 0 else 0.0\n\n\n# -------------------------------------------------------------------------\n# graph construction with relation types ---------------------------------\ndef seq_to_graph(seq: str, label: str) -> Data:\n    toks = seq.split()\n    n = len(toks)\n    shapes = [t[0] for t in toks]\n    colors = [t[1] if len(t) > 1 else \"_\" for t in toks]\n    node_feats = torch.tensor([token2idx[t] for t in toks], dtype=torch.long)\n    src, dst, etype = [], [], []\n    # relation 0: next/previous (order)\n    for i in range(n - 1):\n        src.extend([i, i + 1])\n        dst.extend([i + 1, i])\n        etype.extend([0, 0])\n    # relation 1: same shape\n    for i in range(n):\n        for j in range(i + 1, n):\n            if shapes[i] == shapes[j]:\n                src.extend([i, j])\n                dst.extend([j, i])\n                etype.extend([1, 1])\n    # relation 2: same color\n    for i in range(n):\n        for j in range(i + 1, n):\n            if colors[i] == colors[j]:\n                src.extend([i, j])\n                dst.extend([j, i])\n                etype.extend([2, 2])\n    if len(src) == 0:  # fallback self loop\n        src = [0]\n        dst = [0]\n        etype = [0]\n    edge_index = torch.tensor([src, dst], dtype=torch.long)\n    edge_type = torch.tensor(etype, dtype=torch.long)\n    return Data(\n        x=node_feats,\n        edge_index=edge_index,\n        edge_type=edge_type,\n        y=torch.tensor([label2idx[label]], dtype=torch.long),\n        seq=seq,\n    )\n\n\ntrain_graphs = [seq_to_graph(r[\"sequence\"], r[\"label\"]) for r in train_rows]\nval_graphs = [seq_to_graph(r[\"sequence\"], r[\"label\"]) for r in dev_rows]\ntest_graphs = [seq_to_graph(r[\"sequence\"], r[\"label\"]) for r in test_rows]\n\nbatch_size = 128\ntrain_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)\nval_loader = DataLoader(val_graphs, batch_size=batch_size)\ntest_loader = DataLoader(test_graphs, batch_size=batch_size)\n\n\n# -------------------------------------------------------------------------\n# model -------------------------------------------------------------------\nclass SPR_RGCN(nn.Module):\n    def __init__(self, vocab_size, embed_dim=64, hidden_dim=64, num_rel=3, num_cls=2):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)\n        self.conv1 = RGCNConv(embed_dim, hidden_dim, num_relations=num_rel)\n        self.conv2 = RGCNConv(hidden_dim, hidden_dim, num_relations=num_rel)\n        self.lin = nn.Linear(hidden_dim, num_cls)\n\n    def forward(self, x, edge_index, edge_type, batch):\n        x = self.embed(x)\n        x = torch.relu(self.conv1(x, edge_index, edge_type))\n        x = torch.relu(self.conv2(x, edge_index, edge_type))\n        g_emb = global_mean_pool(x, batch)\n        return self.lin(g_emb)\n\n\n# -------------------------------------------------------------------------\n# training utilities ------------------------------------------------------\ndef run_epoch(model, loader, criterion, optimizer=None):\n    train = optimizer is not None\n    model.train() if train else model.eval()\n    tot_loss, seqs, y_true, y_pred = 0.0, [], [], []\n    for batch in loader:\n        batch = batch.to(device)\n        out = model(batch.x, batch.edge_index, batch.edge_type, batch.batch)\n        loss = criterion(out, batch.y.squeeze())\n        if train:\n            optimizer.zero_grad()\n            loss.backward()\n            optimizer.step()\n        tot_loss += loss.item() * batch.num_graphs\n        preds = out.argmax(-1).cpu().tolist()\n        y_pred.extend(preds)\n        y_true.extend(batch.y.squeeze().cpu().tolist())\n        seqs.extend(batch.seq)\n    avg_loss = tot_loss / len(loader.dataset)\n    cwa = color_weighted_accuracy(seqs, y_true, y_pred)\n    swa = shape_weighted_accuracy(seqs, y_true, y_pred)\n    cpx = complexity_weighted_accuracy(seqs, y_true, y_pred)\n    return avg_loss, cwa, swa, cpx, y_pred, y_true, seqs\n\n\n# -------------------------------------------------------------------------\n# experiment tracking dict ------------------------------------------------\nexperiment_data = {\n    \"SPR_RGCN\": {\n        \"metrics\": {\n            \"train\": {\"CWA\": [], \"SWA\": [], \"CmpWA\": []},\n            \"val\": {\"CWA\": [], \"SWA\": [], \"CmpWA\": []},\n        },\n        \"losses\": {\"train\": [], \"val\": []},\n        \"epochs\": [],\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n}\n\n# -------------------------------------------------------------------------\n# training loop -----------------------------------------------------------\nmax_epochs = 40\npatience = 7\nmodel = SPR_RGCN(len(token2idx), num_cls=num_classes).to(device)\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n\nbest_val = float(\"inf\")\nbest_state = None\nwait = 0\nfor epoch in range(1, max_epochs + 1):\n    tr_loss, tr_cwa, tr_swa, tr_cpx, _, _, _ = run_epoch(\n        model, train_loader, criterion, optimizer\n    )\n    val_loss, val_cwa, val_swa, val_cpx, _, _, _ = run_epoch(\n        model, val_loader, criterion\n    )\n    experiment_data[\"SPR_RGCN\"][\"losses\"][\"train\"].append(tr_loss)\n    experiment_data[\"SPR_RGCN\"][\"losses\"][\"val\"].append(val_loss)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"train\"][\"CWA\"].append(tr_cwa)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"train\"][\"SWA\"].append(tr_swa)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"train\"][\"CmpWA\"].append(tr_cpx)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"val\"][\"CWA\"].append(val_cwa)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"val\"][\"SWA\"].append(val_swa)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"val\"][\"CmpWA\"].append(val_cpx)\n    experiment_data[\"SPR_RGCN\"][\"epochs\"].append(epoch)\n    print(\n        f\"Epoch {epoch:02d}: \"\n        f\"train_loss={tr_loss:.4f} val_loss={val_loss:.4f} \"\n        f\"val_CmpWA={val_cpx:.4f}\"\n    )\n    if val_loss < best_val - 1e-4:\n        best_val = val_loss\n        best_state = copy.deepcopy(model.state_dict())\n        wait = 0\n    else:\n        wait += 1\n        if wait >= patience:\n            print(\"Early stopping.\")\n            break\n\n# -------------------------------------------------------------------------\n# load best & final test --------------------------------------------------\nif best_state is not None:\n    model.load_state_dict(best_state)\ntest_loss, test_cwa, test_swa, test_cpx, test_pred, test_true, _ = run_epoch(\n    model, test_loader, criterion\n)\nprint(\n    f\"TEST: loss={test_loss:.4f} CWA={test_cwa:.4f} \"\n    f\"SWA={test_swa:.4f} CmpWA={test_cpx:.4f}\"\n)\n\nexperiment_data[\"SPR_RGCN\"][\"predictions\"] = test_pred\nexperiment_data[\"SPR_RGCN\"][\"ground_truth\"] = test_true\nexperiment_data[\"SPR_RGCN\"][\"test_metrics\"] = {\n    \"loss\": test_loss,\n    \"CWA\": test_cwa,\n    \"SWA\": test_swa,\n    \"CmpWA\": test_cpx,\n}\n\n# -------------------------------------------------------------------------\n# save experiment data ----------------------------------------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"Saved metrics to working/experiment_data.npy\")\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ---------- setup ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- load ----------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\n    run = experiment_data.get(\"SPR_RGCN\", {})\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    run = {}\n\n\n# helper\ndef save_close(fig_name):\n    plt.tight_layout()\n    plt.savefig(os.path.join(working_dir, fig_name))\n    plt.close()\n\n\n# ---------- 1) loss curve ----------\ntry:\n    plt.figure()\n    ep = run[\"epochs\"]\n    plt.plot(ep, run[\"losses\"][\"train\"], label=\"train\")\n    plt.plot(ep, run[\"losses\"][\"val\"], \"--\", label=\"val\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Cross-Entropy Loss\")\n    plt.title(\"SPR_RGCN \u2013 Training vs Validation Loss\")\n    plt.legend()\n    save_close(\"SPR_RGCN_loss_curve.png\")\nexcept Exception as e:\n    print(f\"Error creating loss curve: {e}\")\n    plt.close()\n\n# ---------- 2-4) metric curves ----------\nfor metric in [\"CWA\", \"SWA\", \"CmpWA\"]:\n    try:\n        plt.figure()\n        ep = run[\"epochs\"]\n        plt.plot(ep, run[\"metrics\"][\"train\"][metric], label=\"train\")\n        plt.plot(ep, run[\"metrics\"][\"val\"][metric], \"--\", label=\"val\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(metric)\n        plt.title(f\"SPR_RGCN \u2013 Training vs Validation {metric}\")\n        plt.legend()\n        save_close(f\"SPR_RGCN_{metric}_curve.png\")\n    except Exception as e:\n        print(f\"Error creating {metric} curve: {e}\")\n        plt.close()\n\n# ---------- 5) test metrics summary ----------\ntry:\n    plt.figure()\n    names = [\"Loss\", \"CWA\", \"SWA\", \"CmpWA\"]\n    values = [run[\"test_metrics\"][k] for k in [\"loss\", \"CWA\", \"SWA\", \"CmpWA\"]]\n    bars = plt.bar(names, values, color=\"skyblue\")\n    for b, v in zip(bars, values):\n        plt.text(\n            b.get_x() + b.get_width() / 2,\n            b.get_height(),\n            f\"{v:.3f}\",\n            ha=\"center\",\n            va=\"bottom\",\n        )\n    plt.title(\"SPR_RGCN \u2013 Test Set Performance\")\n    save_close(\"SPR_RGCN_test_summary.png\")\nexcept Exception as e:\n    print(f\"Error creating test summary plot: {e}\")\n    plt.close()\n",
+      "plot_analyses": [
+        {
+          "analysis": "The training loss consistently decreases over the epochs, indicating that the model is learning from the training data. However, the validation loss increases steadily, suggesting overfitting. The divergence between the training and validation loss highlights that the model generalizes poorly to unseen data and may require regularization techniques or modifications to improve its performance.",
+          "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_857d7db31cdb4858acf44d6627f3b206_proc_1494369/SPR_RGCN_loss_curve.png"
+        },
+        {
+          "analysis": "The Color-Weighted Accuracy (CWA) for the training set improves steadily, showing that the model is learning to classify based on color-related rules. However, the validation CWA decreases, indicating that the model struggles to generalize its understanding of color-based patterns to unseen data. This further reinforces the overfitting observed in the loss plot.",
+          "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_857d7db31cdb4858acf44d6627f3b206_proc_1494369/SPR_RGCN_CWA_curve.png"
+        },
+        {
+          "analysis": "The Shape-Weighted Accuracy (SWA) for the training set shows a similar trend to the CWA, with steady improvement over epochs. However, the validation SWA declines, again suggesting poor generalization to unseen data. The model appears to be overfitting the training data for shape-based reasoning as well.",
+          "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_857d7db31cdb4858acf44d6627f3b206_proc_1494369/SPR_RGCN_SWA_curve.png"
+        },
+        {
+          "analysis": "The Composite Weighted Accuracy (CmpWA) follows the same trend as CWA and SWA, with training performance improving and validation performance declining. This consistent pattern across all metrics indicates that the model is overfitting and not effectively capturing the generalizable relationships in the data.",
+          "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_857d7db31cdb4858acf44d6627f3b206_proc_1494369/SPR_RGCN_CmpWA_curve.png"
+        },
+        {
+          "analysis": "The test set performance shows that the model achieves a loss of 0.701 and moderate scores on the CWA (0.513), SWA (0.498), and CmpWA (0.506) metrics. These values are below the SOTA benchmarks (CWA: 65.0%, SWA: 70.0%), indicating that the model fails to surpass the current state-of-the-art. The results suggest that the model's design or training process requires significant improvements to achieve competitive performance.",
+          "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_857d7db31cdb4858acf44d6627f3b206_proc_1494369/SPR_RGCN_test_summary.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_857d7db31cdb4858acf44d6627f3b206_proc_1494369/SPR_RGCN_loss_curve.png",
+        "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_857d7db31cdb4858acf44d6627f3b206_proc_1494369/SPR_RGCN_CWA_curve.png",
+        "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_857d7db31cdb4858acf44d6627f3b206_proc_1494369/SPR_RGCN_SWA_curve.png",
+        "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_857d7db31cdb4858acf44d6627f3b206_proc_1494369/SPR_RGCN_CmpWA_curve.png",
+        "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_857d7db31cdb4858acf44d6627f3b206_proc_1494369/SPR_RGCN_test_summary.png"
+      ],
+      "vlm_feedback_summary": "The model shows consistent overfitting across all metrics, with training performance improving while validation performance declines. Test set results indicate that the model does not surpass SOTA benchmarks, highlighting the need for better generalization strategies and potential redesign of the model architecture or training process.",
+      "exp_results_dir": "experiment_results/experiment_857d7db31cdb4858acf44d6627f3b206_proc_1494369",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_857d7db31cdb4858acf44d6627f3b206_proc_1494369/experiment_data.npy"
+      ]
+    },
+    {
+      "overall_plan": "The overall plan initiated with hyperparameter tuning by varying training epochs to evaluate model performance, implementing early stopping, and collecting metrics for analysis. Subsequently, the focus shifted to enhancing the model architecture by replacing the plain GCN with a relational GNN to model relations between tokens based on order, shape, and color. This involved creating heterogeneous graphs and using RGCNConv layers followed by mean pooling for classification, introducing new metrics such as Color-Weighted and Shape-Weighted accuracies. The strategy aimed for efficient execution on both CPU and GPU, with a fallback on synthetic datasets if necessary. The current seed node status indicates the beginning of a new exploration phase, likely building on past results, but specific details on new objectives are not provided. Overall, the plan reflects a progression from optimizing training time to architectural improvements and anticipates further exploratory directions.",
+      "analysis": "",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "loss",
+              "lower_is_better": true,
+              "description": "Loss measures the error in predictions. Lower values indicate better performance.",
+              "data": [
+                {
+                  "dataset_name": "Training",
+                  "final_value": 0.6066,
+                  "best_value": 0.6066
+                },
+                {
+                  "dataset_name": "Validation",
+                  "final_value": 0.7014,
+                  "best_value": 0.7014
+                },
+                {
+                  "dataset_name": "Test",
+                  "final_value": 0.6941,
+                  "best_value": 0.6941
+                }
+              ]
+            },
+            {
+              "metric_name": "CWA",
+              "lower_is_better": false,
+              "description": "CWA is a weighted accuracy metric. Higher values indicate better performance.",
+              "data": [
+                {
+                  "dataset_name": "Training",
+                  "final_value": 0.6952,
+                  "best_value": 0.6952
+                },
+                {
+                  "dataset_name": "Validation",
+                  "final_value": 0.5101,
+                  "best_value": 0.5101
+                },
+                {
+                  "dataset_name": "Test",
+                  "final_value": 0.502,
+                  "best_value": 0.502
+                }
+              ]
+            },
+            {
+              "metric_name": "SWA",
+              "lower_is_better": false,
+              "description": "SWA is another weighted accuracy metric. Higher values indicate better performance.",
+              "data": [
+                {
+                  "dataset_name": "Training",
+                  "final_value": 0.6915,
+                  "best_value": 0.6915
+                },
+                {
+                  "dataset_name": "Validation",
+                  "final_value": 0.5084,
+                  "best_value": 0.5084
+                },
+                {
+                  "dataset_name": "Test",
+                  "final_value": 0.5075,
+                  "best_value": 0.5075
+                }
+              ]
+            },
+            {
+              "metric_name": "CmpWA",
+              "lower_is_better": false,
+              "description": "CmpWA is a composite weighted accuracy metric. Higher values indicate better performance.",
+              "data": [
+                {
+                  "dataset_name": "Training",
+                  "final_value": 0.6935,
+                  "best_value": 0.6935
+                },
+                {
+                  "dataset_name": "Validation",
+                  "final_value": 0.5093,
+                  "best_value": 0.5093
+                },
+                {
+                  "dataset_name": "Test",
+                  "final_value": 0.5044,
+                  "best_value": 0.5044
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 1\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os, pathlib, random, time, copy, numpy as np, torch\nfrom typing import List, Tuple\nfrom torch_geometric.data import Data\nfrom torch_geometric.loader import DataLoader\nfrom torch_geometric.nn import RGCNConv, global_mean_pool\nimport torch.nn as nn\n\n# -------------------------------------------------------------------------\n# required working dir & device boiler-plate\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n# -------------------------------------------------------------------------\n\n\n# try to import official SPR utilities ------------------------------------------------\ndef try_load_real_dataset() -> Tuple[List[dict], List[dict], List[dict]]:\n    try:\n        import SPR\n\n        DATA_PATH = pathlib.Path(os.environ.get(\"SPR_DATA_PATH\", \"./SPR_BENCH\"))\n        dset = SPR.load_spr_bench(DATA_PATH)\n        return dset[\"train\"], dset[\"dev\"], dset[\"test\"]\n    except Exception as e:\n        raise IOError from e\n\n\n# synthetic fallback ------------------------------------------------------------------\ndef build_synthetic_dataset(n_train=600, n_val=150, n_test=150):\n    shapes, colors, labels = [\"C\", \"S\", \"T\"], [\"r\", \"g\", \"b\", \"y\"], [\"rule1\", \"rule2\"]\n\n    def make_seq():\n        L = random.randint(4, 10)\n        return \" \".join(random.choice(shapes) + random.choice(colors) for _ in range(L))\n\n    def make_split(n):\n        return [\n            {\"id\": i, \"sequence\": make_seq(), \"label\": random.choice(labels)}\n            for i in range(n)\n        ]\n\n    def tag(lst):\n        for i, r in enumerate(lst):\n            r[\"id\"] = i\n        return lst\n\n    return tag(make_split(n_train)), tag(make_split(n_val)), tag(make_split(n_test))\n\n\ntry:\n    train_rows, dev_rows, test_rows = try_load_real_dataset()\n    print(\"Loaded real SPR_BENCH.\")\nexcept IOError:\n    print(\"Using synthetic data (real dataset not found).\")\n    train_rows, dev_rows, test_rows = build_synthetic_dataset()\n\n\n# -------------------------------------------------------------------------\n# vocab & label maps ------------------------------------------------------\ndef all_tokens(rows):\n    for r in rows:\n        for tok in r[\"sequence\"].split():\n            yield tok\n\n\ntoken2idx = {\"<PAD>\": 0}\nfor tok in all_tokens(train_rows + dev_rows + test_rows):\n    token2idx.setdefault(tok, len(token2idx))\nlabel2idx = {}\nfor r in train_rows + dev_rows + test_rows:\n    label2idx.setdefault(r[\"label\"], len(label2idx))\nnum_classes = len(label2idx)\nprint(f\"Vocab={len(token2idx)}, Labels={num_classes}\")\n\n\n# -------------------------------------------------------------------------\n# helper metrics ----------------------------------------------------------\ndef count_color_variety(seq):\n    return len({tok[1] for tok in seq.split() if len(tok) > 1})\n\n\ndef count_shape_variety(seq):\n    return len({tok[0] for tok in seq.split() if tok})\n\n\ndef complexity_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) + count_shape_variety(s) for s in seqs]\n    correct = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(correct) / sum(w) if sum(w) > 0 else 0.0\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    correct = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(correct) / sum(w) if sum(w) > 0 else 0.0\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    correct = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(correct) / sum(w) if sum(w) > 0 else 0.0\n\n\n# -------------------------------------------------------------------------\n# graph construction with relation types ---------------------------------\ndef seq_to_graph(seq: str, label: str) -> Data:\n    toks = seq.split()\n    n = len(toks)\n    shapes = [t[0] for t in toks]\n    colors = [t[1] if len(t) > 1 else \"_\" for t in toks]\n    node_feats = torch.tensor([token2idx[t] for t in toks], dtype=torch.long)\n    src, dst, etype = [], [], []\n    # relation 0: next/previous (order)\n    for i in range(n - 1):\n        src.extend([i, i + 1])\n        dst.extend([i + 1, i])\n        etype.extend([0, 0])\n    # relation 1: same shape\n    for i in range(n):\n        for j in range(i + 1, n):\n            if shapes[i] == shapes[j]:\n                src.extend([i, j])\n                dst.extend([j, i])\n                etype.extend([1, 1])\n    # relation 2: same color\n    for i in range(n):\n        for j in range(i + 1, n):\n            if colors[i] == colors[j]:\n                src.extend([i, j])\n                dst.extend([j, i])\n                etype.extend([2, 2])\n    if len(src) == 0:  # fallback self loop\n        src = [0]\n        dst = [0]\n        etype = [0]\n    edge_index = torch.tensor([src, dst], dtype=torch.long)\n    edge_type = torch.tensor(etype, dtype=torch.long)\n    return Data(\n        x=node_feats,\n        edge_index=edge_index,\n        edge_type=edge_type,\n        y=torch.tensor([label2idx[label]], dtype=torch.long),\n        seq=seq,\n    )\n\n\ntrain_graphs = [seq_to_graph(r[\"sequence\"], r[\"label\"]) for r in train_rows]\nval_graphs = [seq_to_graph(r[\"sequence\"], r[\"label\"]) for r in dev_rows]\ntest_graphs = [seq_to_graph(r[\"sequence\"], r[\"label\"]) for r in test_rows]\n\nbatch_size = 128\ntrain_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)\nval_loader = DataLoader(val_graphs, batch_size=batch_size)\ntest_loader = DataLoader(test_graphs, batch_size=batch_size)\n\n\n# -------------------------------------------------------------------------\n# model -------------------------------------------------------------------\nclass SPR_RGCN(nn.Module):\n    def __init__(self, vocab_size, embed_dim=64, hidden_dim=64, num_rel=3, num_cls=2):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)\n        self.conv1 = RGCNConv(embed_dim, hidden_dim, num_relations=num_rel)\n        self.conv2 = RGCNConv(hidden_dim, hidden_dim, num_relations=num_rel)\n        self.lin = nn.Linear(hidden_dim, num_cls)\n\n    def forward(self, x, edge_index, edge_type, batch):\n        x = self.embed(x)\n        x = torch.relu(self.conv1(x, edge_index, edge_type))\n        x = torch.relu(self.conv2(x, edge_index, edge_type))\n        g_emb = global_mean_pool(x, batch)\n        return self.lin(g_emb)\n\n\n# -------------------------------------------------------------------------\n# training utilities ------------------------------------------------------\ndef run_epoch(model, loader, criterion, optimizer=None):\n    train = optimizer is not None\n    model.train() if train else model.eval()\n    tot_loss, seqs, y_true, y_pred = 0.0, [], [], []\n    for batch in loader:\n        batch = batch.to(device)\n        out = model(batch.x, batch.edge_index, batch.edge_type, batch.batch)\n        loss = criterion(out, batch.y.squeeze())\n        if train:\n            optimizer.zero_grad()\n            loss.backward()\n            optimizer.step()\n        tot_loss += loss.item() * batch.num_graphs\n        preds = out.argmax(-1).cpu().tolist()\n        y_pred.extend(preds)\n        y_true.extend(batch.y.squeeze().cpu().tolist())\n        seqs.extend(batch.seq)\n    avg_loss = tot_loss / len(loader.dataset)\n    cwa = color_weighted_accuracy(seqs, y_true, y_pred)\n    swa = shape_weighted_accuracy(seqs, y_true, y_pred)\n    cpx = complexity_weighted_accuracy(seqs, y_true, y_pred)\n    return avg_loss, cwa, swa, cpx, y_pred, y_true, seqs\n\n\n# -------------------------------------------------------------------------\n# experiment tracking dict ------------------------------------------------\nexperiment_data = {\n    \"SPR_RGCN\": {\n        \"metrics\": {\n            \"train\": {\"CWA\": [], \"SWA\": [], \"CmpWA\": []},\n            \"val\": {\"CWA\": [], \"SWA\": [], \"CmpWA\": []},\n        },\n        \"losses\": {\"train\": [], \"val\": []},\n        \"epochs\": [],\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n}\n\n# -------------------------------------------------------------------------\n# training loop -----------------------------------------------------------\nmax_epochs = 40\npatience = 7\nmodel = SPR_RGCN(len(token2idx), num_cls=num_classes).to(device)\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n\nbest_val = float(\"inf\")\nbest_state = None\nwait = 0\nfor epoch in range(1, max_epochs + 1):\n    tr_loss, tr_cwa, tr_swa, tr_cpx, _, _, _ = run_epoch(\n        model, train_loader, criterion, optimizer\n    )\n    val_loss, val_cwa, val_swa, val_cpx, _, _, _ = run_epoch(\n        model, val_loader, criterion\n    )\n    experiment_data[\"SPR_RGCN\"][\"losses\"][\"train\"].append(tr_loss)\n    experiment_data[\"SPR_RGCN\"][\"losses\"][\"val\"].append(val_loss)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"train\"][\"CWA\"].append(tr_cwa)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"train\"][\"SWA\"].append(tr_swa)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"train\"][\"CmpWA\"].append(tr_cpx)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"val\"][\"CWA\"].append(val_cwa)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"val\"][\"SWA\"].append(val_swa)\n    experiment_data[\"SPR_RGCN\"][\"metrics\"][\"val\"][\"CmpWA\"].append(val_cpx)\n    experiment_data[\"SPR_RGCN\"][\"epochs\"].append(epoch)\n    print(\n        f\"Epoch {epoch:02d}: \"\n        f\"train_loss={tr_loss:.4f} val_loss={val_loss:.4f} \"\n        f\"val_CmpWA={val_cpx:.4f}\"\n    )\n    if val_loss < best_val - 1e-4:\n        best_val = val_loss\n        best_state = copy.deepcopy(model.state_dict())\n        wait = 0\n    else:\n        wait += 1\n        if wait >= patience:\n            print(\"Early stopping.\")\n            break\n\n# -------------------------------------------------------------------------\n# load best & final test --------------------------------------------------\nif best_state is not None:\n    model.load_state_dict(best_state)\ntest_loss, test_cwa, test_swa, test_cpx, test_pred, test_true, _ = run_epoch(\n    model, test_loader, criterion\n)\nprint(\n    f\"TEST: loss={test_loss:.4f} CWA={test_cwa:.4f} \"\n    f\"SWA={test_swa:.4f} CmpWA={test_cpx:.4f}\"\n)\n\nexperiment_data[\"SPR_RGCN\"][\"predictions\"] = test_pred\nexperiment_data[\"SPR_RGCN\"][\"ground_truth\"] = test_true\nexperiment_data[\"SPR_RGCN\"][\"test_metrics\"] = {\n    \"loss\": test_loss,\n    \"CWA\": test_cwa,\n    \"SWA\": test_swa,\n    \"CmpWA\": test_cpx,\n}\n\n# -------------------------------------------------------------------------\n# save experiment data ----------------------------------------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"Saved metrics to working/experiment_data.npy\")\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ---------- setup ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- load ----------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\n    run = experiment_data.get(\"SPR_RGCN\", {})\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    run = {}\n\n\n# helper\ndef save_close(fig_name):\n    plt.tight_layout()\n    plt.savefig(os.path.join(working_dir, fig_name))\n    plt.close()\n\n\n# ---------- 1) loss curve ----------\ntry:\n    plt.figure()\n    ep = run[\"epochs\"]\n    plt.plot(ep, run[\"losses\"][\"train\"], label=\"train\")\n    plt.plot(ep, run[\"losses\"][\"val\"], \"--\", label=\"val\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Cross-Entropy Loss\")\n    plt.title(\"SPR_RGCN \u2013 Training vs Validation Loss\")\n    plt.legend()\n    save_close(\"SPR_RGCN_loss_curve.png\")\nexcept Exception as e:\n    print(f\"Error creating loss curve: {e}\")\n    plt.close()\n\n# ---------- 2-4) metric curves ----------\nfor metric in [\"CWA\", \"SWA\", \"CmpWA\"]:\n    try:\n        plt.figure()\n        ep = run[\"epochs\"]\n        plt.plot(ep, run[\"metrics\"][\"train\"][metric], label=\"train\")\n        plt.plot(ep, run[\"metrics\"][\"val\"][metric], \"--\", label=\"val\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(metric)\n        plt.title(f\"SPR_RGCN \u2013 Training vs Validation {metric}\")\n        plt.legend()\n        save_close(f\"SPR_RGCN_{metric}_curve.png\")\n    except Exception as e:\n        print(f\"Error creating {metric} curve: {e}\")\n        plt.close()\n\n# ---------- 5) test metrics summary ----------\ntry:\n    plt.figure()\n    names = [\"Loss\", \"CWA\", \"SWA\", \"CmpWA\"]\n    values = [run[\"test_metrics\"][k] for k in [\"loss\", \"CWA\", \"SWA\", \"CmpWA\"]]\n    bars = plt.bar(names, values, color=\"skyblue\")\n    for b, v in zip(bars, values):\n        plt.text(\n            b.get_x() + b.get_width() / 2,\n            b.get_height(),\n            f\"{v:.3f}\",\n            ha=\"center\",\n            va=\"bottom\",\n        )\n    plt.title(\"SPR_RGCN \u2013 Test Set Performance\")\n    save_close(\"SPR_RGCN_test_summary.png\")\nexcept Exception as e:\n    print(f\"Error creating test summary plot: {e}\")\n    plt.close()\n",
+      "plot_analyses": [
+        {
+          "analysis": "The training loss decreases steadily over the epochs, indicating that the model is learning effectively. However, the validation loss plateaus after a few epochs, suggesting possible overfitting or a lack of generalization beyond the training data. The gap between training and validation loss may require further regularization techniques or adjustments to the model architecture.",
+          "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c9fa5343dfba4457b0271b84ff4b26e6_proc_1494368/SPR_RGCN_loss_curve.png"
+        },
+        {
+          "analysis": "The Color-Weighted Accuracy (CWA) on the training set improves steadily, showing that the model is capturing the color-based patterns in the data. However, the validation CWA fluctuates and does not improve significantly over epochs, indicating that the model may struggle to generalize color-based reasoning to unseen data.",
+          "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c9fa5343dfba4457b0271b84ff4b26e6_proc_1494368/SPR_RGCN_CWA_curve.png"
+        },
+        {
+          "analysis": "The Shape-Weighted Accuracy (SWA) follows a similar trend to CWA. There is a consistent improvement on the training set, but the validation SWA fluctuates and remains relatively low. This suggests that the model is overfitting to the shape-based patterns in the training data and is unable to generalize to new sequences.",
+          "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c9fa5343dfba4457b0271b84ff4b26e6_proc_1494368/SPR_RGCN_SWA_curve.png"
+        },
+        {
+          "analysis": "The Composite Weighted Accuracy (CmpWA), which likely combines both CWA and SWA, shows a similar trend. The training performance improves steadily, while the validation performance remains inconsistent and does not show substantial improvement. This reinforces the need for better generalization techniques or a re-evaluation of the model's assumptions.",
+          "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c9fa5343dfba4457b0271b84ff4b26e6_proc_1494368/SPR_RGCN_CmpWA_curve.png"
+        },
+        {
+          "analysis": "The test set performance shows that the model achieves a loss of 0.694, with CWA, SWA, and CmpWA values around 0.50. These results are significantly below the SOTA benchmarks (CWA: 65.0%, SWA: 70.0%), indicating that the model does not outperform existing approaches. The results highlight the need for further experimentation, such as improving the graph representation, adding regularization, or exploring alternative architectures.",
+          "plot_path": "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c9fa5343dfba4457b0271b84ff4b26e6_proc_1494368/SPR_RGCN_test_summary.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c9fa5343dfba4457b0271b84ff4b26e6_proc_1494368/SPR_RGCN_loss_curve.png",
+        "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c9fa5343dfba4457b0271b84ff4b26e6_proc_1494368/SPR_RGCN_CWA_curve.png",
+        "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c9fa5343dfba4457b0271b84ff4b26e6_proc_1494368/SPR_RGCN_SWA_curve.png",
+        "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c9fa5343dfba4457b0271b84ff4b26e6_proc_1494368/SPR_RGCN_CmpWA_curve.png",
+        "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c9fa5343dfba4457b0271b84ff4b26e6_proc_1494368/SPR_RGCN_test_summary.png"
+      ],
+      "vlm_feedback_summary": "The experimental results indicate that while the model learns effectively during training, its generalization to validation and test data is limited. The performance metrics (CWA, SWA, and CmpWA) fall short of SOTA benchmarks, suggesting that the current approach may require significant modifications, such as enhancing the graph structure, incorporating additional features, or addressing overfitting.",
+      "exp_results_dir": "experiment_results/experiment_c9fa5343dfba4457b0271b84ff4b26e6_proc_1494368",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_c9fa5343dfba4457b0271b84ff4b26e6_proc_1494368/experiment_data.npy"
+      ]
+    }
+  ],
+  "aggregated results of nodes with different seeds": {
+    "overall_plan": "The overall plan began with hyperparameter tuning focused on varying the number of training epochs to evaluate the impact of training time on model performance, implementing early stopping, and storing metrics for analysis. This foundational phase transitioned to enhancing the model architecture by replacing the plain GCN with a relational GNN that models relations between tokens based on order, shape, and color, using RGCNConv layers for improved classification. New metrics such as Color-Weighted and Shape-Weighted accuracies were introduced while maintaining early-stopping logic for efficient execution. The current plan adds robustness by aggregating results from multiple seeds to ensure consistent model performance, providing a statistically sound evaluation. The strategy evolves from optimizing training time to leveraging relational structures and ensuring reliable performance assessment.",
+    "metric": {
+      "value": null,
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# plotting aggregation code",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ---------- setup ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- load ----------\nexperiment_data_path_list = [\n    \"experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_019040f1075541dd83a579dedf17f867_proc_1494367/experiment_data.npy\",\n    \"experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c9fa5343dfba4457b0271b84ff4b26e6_proc_1494368/experiment_data.npy\",\n    \"experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_857d7db31cdb4858acf44d6627f3b206_proc_1494369/experiment_data.npy\",\n]\n\nall_runs_by_name = {}\n\ntry:\n    root = os.getenv(\"AI_SCIENTIST_ROOT\", \"\")\n    for p in experiment_data_path_list:\n        full_path = os.path.join(root, p)\n        exp = np.load(full_path, allow_pickle=True).item()\n        for run_name, run_dict in exp.items():\n            all_runs_by_name.setdefault(run_name, []).append(run_dict)\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n\n\ndef save_close(fig_name):\n    plt.tight_layout()\n    plt.savefig(os.path.join(working_dir, fig_name))\n    plt.close()\n\n\ndef _stack(list_of_arrs):\n    # Pad to same length if necessary by truncating to min length\n    lengths = [len(a) for a in list_of_arrs]\n    min_len = min(lengths)\n    return np.stack([a[:min_len] for a in list_of_arrs])\n\n\nfor run_name, run_list in all_runs_by_name.items():\n    if len(run_list) == 0:\n        continue\n    # assume epochs are identical or at least same prefix\n    epochs = np.asarray(run_list[0][\"epochs\"])\n    n_runs = len(run_list)\n\n    # ---------- 1) aggregated loss curve ----------\n    try:\n        train_losses = _stack([r[\"losses\"][\"train\"] for r in run_list])\n        val_losses = _stack([r[\"losses\"][\"val\"] for r in run_list])\n\n        mean_train = train_losses.mean(axis=0)\n        sem_train = train_losses.std(axis=0, ddof=1) / np.sqrt(n_runs)\n        mean_val = val_losses.mean(axis=0)\n        sem_val = val_losses.std(axis=0, ddof=1) / np.sqrt(n_runs)\n\n        plt.figure()\n        plt.plot(\n            epochs[: len(mean_train)], mean_train, label=\"train mean\", color=\"tab:blue\"\n        )\n        plt.fill_between(\n            epochs[: len(mean_train)],\n            mean_train - sem_train,\n            mean_train + sem_train,\n            alpha=0.3,\n            color=\"tab:blue\",\n            label=\"train \u00b1 SEM\",\n        )\n        plt.plot(\n            epochs[: len(mean_val)],\n            mean_val,\n            \"--\",\n            label=\"val mean\",\n            color=\"tab:orange\",\n        )\n        plt.fill_between(\n            epochs[: len(mean_val)],\n            mean_val - sem_val,\n            mean_val + sem_val,\n            alpha=0.3,\n            color=\"tab:orange\",\n            label=\"val \u00b1 SEM\",\n        )\n\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Cross-Entropy Loss\")\n        plt.title(f\"{run_name} \u2013 Aggregated Training vs Validation Loss\")\n        plt.legend()\n        save_close(f\"{run_name}_Agg_loss_curve.png\")\n    except Exception as e:\n        print(f\"Error creating aggregated loss curve for {run_name}: {e}\")\n        plt.close()\n\n    # ---------- 2-4) aggregated metric curves ----------\n    for metric in [\"CWA\", \"SWA\", \"CmpWA\"]:\n        try:\n            # verify key existence\n            if metric not in run_list[0][\"metrics\"][\"train\"]:\n                continue\n\n            train_metric = _stack([r[\"metrics\"][\"train\"][metric] for r in run_list])\n            val_metric = _stack([r[\"metrics\"][\"val\"][metric] for r in run_list])\n\n            mean_train = train_metric.mean(axis=0)\n            sem_train = train_metric.std(axis=0, ddof=1) / np.sqrt(n_runs)\n            mean_val = val_metric.mean(axis=0)\n            sem_val = val_metric.std(axis=0, ddof=1) / np.sqrt(n_runs)\n\n            plt.figure()\n            plt.plot(\n                epochs[: len(mean_train)],\n                mean_train,\n                label=\"train mean\",\n                color=\"tab:blue\",\n            )\n            plt.fill_between(\n                epochs[: len(mean_train)],\n                mean_train - sem_train,\n                mean_train + sem_train,\n                alpha=0.3,\n                color=\"tab:blue\",\n                label=\"train \u00b1 SEM\",\n            )\n            plt.plot(\n                epochs[: len(mean_val)],\n                mean_val,\n                \"--\",\n                label=\"val mean\",\n                color=\"tab:orange\",\n            )\n            plt.fill_between(\n                epochs[: len(mean_val)],\n                mean_val - sem_val,\n                mean_val + sem_val,\n                alpha=0.3,\n                color=\"tab:orange\",\n                label=\"val \u00b1 SEM\",\n            )\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(metric)\n            plt.title(f\"{run_name} \u2013 Aggregated Training vs Validation {metric}\")\n            plt.legend()\n            save_close(f\"{run_name}_Agg_{metric}_curve.png\")\n        except Exception as e:\n            print(f\"Error creating aggregated {metric} curve for {run_name}: {e}\")\n            plt.close()\n\n    # ---------- 5) aggregated test metrics summary ----------\n    try:\n        test_keys = [\"loss\", \"CWA\", \"SWA\", \"CmpWA\"]\n        means = []\n        sems = []\n        for k in test_keys:\n            vals = [r[\"test_metrics\"][k] for r in run_list if k in r[\"test_metrics\"]]\n            if len(vals) == 0:\n                means.append(np.nan)\n                sems.append(0.0)\n            else:\n                vals = np.asarray(vals)\n                means.append(vals.mean())\n                sems.append(vals.std(ddof=1) / np.sqrt(len(vals)))\n\n        plt.figure()\n        x = np.arange(len(test_keys))\n        bars = plt.bar(x, means, yerr=sems, capsize=5, color=\"skyblue\")\n        for xi, m in zip(x, means):\n            if not np.isnan(m):\n                plt.text(xi, m, f\"{m:.3f}\", ha=\"center\", va=\"bottom\")\n        plt.xticks(x, [k.upper() for k in test_keys])\n        plt.title(f\"{run_name} \u2013 Aggregated Test Set Performance\")\n        save_close(f\"{run_name}_Agg_test_summary.png\")\n    except Exception as e:\n        print(f\"Error creating aggregated test summary for {run_name}: {e}\")\n        plt.close()\n",
+    "plot_analyses": [],
+    "plot_paths": [
+      "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/seed_aggregation_67ae2c3a75d34c9c87c01918cb1b4bdb/SPR_RGCN_Agg_loss_curve.png",
+      "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/seed_aggregation_67ae2c3a75d34c9c87c01918cb1b4bdb/SPR_RGCN_Agg_CWA_curve.png",
+      "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/seed_aggregation_67ae2c3a75d34c9c87c01918cb1b4bdb/SPR_RGCN_Agg_SWA_curve.png",
+      "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/seed_aggregation_67ae2c3a75d34c9c87c01918cb1b4bdb/SPR_RGCN_Agg_CmpWA_curve.png",
+      "experiments/2025-08-30_20-55-31_gnn_for_spr_attempt_0/logs/0-run/experiment_results/seed_aggregation_67ae2c3a75d34c9c87c01918cb1b4bdb/SPR_RGCN_Agg_test_summary.png"
+    ],
+    "vlm_feedback_summary": [],
+    "exp_results_dir": "experiment_results/seed_aggregation_67ae2c3a75d34c9c87c01918cb1b4bdb",
+    "exp_results_npy_files": []
+  }
+}

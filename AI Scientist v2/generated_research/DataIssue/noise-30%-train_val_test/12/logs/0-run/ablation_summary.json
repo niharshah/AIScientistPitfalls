@@ -1,0 +1,506 @@
+[
+  {
+    "overall_plan": "The overall plan involves two key components: hyperparameter tuning and an ablation study. Initially, the focus was on optimizing the batch size for training a TinyTransformer model through a grid search over candidate values (32, 64, 128, 256). Each configuration was evaluated by training the model and recording metrics, with the aim of identifying the optimal batch size. In the current phase, the research shifts to a No-Padding-Mask Ablation, introducing a TinyTransformerNoPad model variant that omits the padding mask and computes sequence representations by averaging over all time steps. The same batch sizes are used to maintain consistency. This ablation study explores the effects of removing padding mask information on model performance. Together, these plans form a comprehensive strategy to enhance model performance by combining hyperparameter tuning with architectural experimentation.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "training loss",
+            "lower_is_better": true,
+            "description": "The loss value on the training dataset, indicating how well the model fits the training data.",
+            "data": [
+              {
+                "dataset_name": "training set",
+                "final_value": 0.1219,
+                "best_value": 0.0108
+              }
+            ]
+          },
+          {
+            "metric_name": "training F1 score",
+            "lower_is_better": false,
+            "description": "The F1 score on the training dataset, measuring the balance between precision and recall.",
+            "data": [
+              {
+                "dataset_name": "training set",
+                "final_value": 0.979,
+                "best_value": 0.998
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "The loss value on the validation dataset, indicating how well the model generalizes to unseen data.",
+            "data": [
+              {
+                "dataset_name": "validation set",
+                "final_value": 1.4249,
+                "best_value": 1.4249
+              }
+            ]
+          },
+          {
+            "metric_name": "validation F1 score",
+            "lower_is_better": false,
+            "description": "The F1 score on the validation dataset, measuring the balance between precision and recall.",
+            "data": [
+              {
+                "dataset_name": "validation set",
+                "final_value": 0.6899,
+                "best_value": 0.698
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# No-Padding-Mask Ablation Study  (single-file, self-contained)\nimport os, pathlib, numpy as np, torch, matplotlib\n\nmatplotlib.use(\"Agg\")\nimport matplotlib.pyplot as plt\nfrom torch import nn\nfrom torch.utils.data import Dataset, DataLoader\nfrom datasets import DatasetDict, load_dataset\nfrom sklearn.metrics import f1_score\nfrom typing import List, Dict\n\n# ---------- HOUSE-KEEPING ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ---------- DATA ----------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(csv_name: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for split in [\"train\", \"dev\", \"test\"]:\n        d[split] = _load(f\"{split}.csv\")\n    return d\n\n\nDATA_PATH = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\nspr = load_spr_bench(DATA_PATH)\nprint(\"Dataset sizes:\", {k: len(v) for k, v in spr.items()})\n\n# ---------- VOCAB ----------\nPAD, UNK = \"<pad>\", \"<unk>\"\nchar_set = set(ch for ex in spr[\"train\"] for ch in ex[\"sequence\"])\nitos = [PAD, UNK] + sorted(list(char_set))\nstoi = {ch: i for i, ch in enumerate(itos)}\nmax_len = 128\nnum_classes = len(set(spr[\"train\"][\"label\"]))\n\n\ndef encode(seq: str, max_len: int = 128) -> List[int]:\n    ids = [stoi.get(ch, stoi[UNK]) for ch in seq[:max_len]]\n    if len(ids) < max_len:\n        ids += [stoi[PAD]] * (max_len - len(ids))\n    return ids\n\n\nclass SPRTorchDataset(Dataset):\n    def __init__(self, hf_dataset, max_len=128):\n        self.data = hf_dataset\n        self.max_len = max_len\n\n    def __len__(self):\n        return len(self.data)\n\n    def __getitem__(self, idx):\n        row = self.data[idx]\n        input_ids = torch.tensor(\n            encode(row[\"sequence\"], self.max_len), dtype=torch.long\n        )\n        attention_mask = (input_ids != stoi[PAD]).long()  # still produced but unused\n        label = torch.tensor(row[\"label\"], dtype=torch.long)\n        return {\n            \"input_ids\": input_ids,\n            \"attention_mask\": attention_mask,\n            \"labels\": label,\n        }\n\n\n# ---------- MODEL  (No-Padding-Mask) ----------\nclass TinyTransformerNoPad(nn.Module):\n    def __init__(\n        self,\n        vocab_size: int,\n        num_classes: int,\n        d_model: int = 128,\n        n_heads: int = 4,\n        n_layers: int = 2,\n    ):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, d_model, padding_idx=stoi[PAD])\n        self.pos_embed = nn.Parameter(torch.randn(1, max_len, d_model))\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=d_model, nhead=n_heads, batch_first=True\n        )\n        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)\n        self.fc = nn.Linear(d_model, num_classes)\n\n    def forward(self, input_ids, attention_mask=None):  # attention_mask ignored\n        x = self.embed(input_ids) + self.pos_embed[:, : input_ids.size(1), :]\n        x = self.encoder(x)  # NO src_key_padding_mask\n        x = x.mean(1)  # mean over ALL tokens\n        return self.fc(x)\n\n\n# ---------- TRAIN / EVAL LOOP ----------\ndef run_loader(model, loader, criterion, optimizer=None):\n    train = optimizer is not None\n    model.train() if train else model.eval()\n    total_loss, preds, gts = 0.0, [], []\n    with torch.set_grad_enabled(train):\n        for batch in loader:\n            batch = {k: v.to(device) for k, v in batch.items()}\n            out = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(out, batch[\"labels\"])\n            if train:\n                optimizer.zero_grad()\n                loss.backward()\n                optimizer.step()\n            total_loss += loss.item() * batch[\"labels\"].size(0)\n            preds.extend(out.argmax(-1).cpu().tolist())\n            gts.extend(batch[\"labels\"].cpu().tolist())\n    avg_loss = total_loss / len(loader.dataset)\n    macro_f1 = f1_score(gts, preds, average=\"macro\")\n    return avg_loss, macro_f1, preds, gts\n\n\n# ---------- EXPERIMENT ----------\nexperiment_data: Dict = {\"no_padding_mask_ablation\": {}}\nbatch_sizes = [32, 64, 128, 256]\nepochs = 5\ncriterion = nn.CrossEntropyLoss()\n\nfor bs in batch_sizes:\n    print(f\"\\n=== No-Pad-Mask Ablation: batch_size={bs} ===\")\n    train_loader = DataLoader(\n        SPRTorchDataset(spr[\"train\"], max_len), batch_size=bs, shuffle=True\n    )\n    dev_loader = DataLoader(SPRTorchDataset(spr[\"dev\"], max_len), batch_size=bs)\n    model = TinyTransformerNoPad(len(itos), num_classes).to(device)\n    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)\n\n    run_stats = {\n        \"epochs\": [],\n        \"losses\": {\"train\": [], \"val\": []},\n        \"metrics\": {\"train_f1\": [], \"val_f1\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n\n    for epoch in range(1, epochs + 1):\n        tr_loss, tr_f1, _, _ = run_loader(model, train_loader, criterion, optimizer)\n        val_loss, val_f1, val_preds, val_gts = run_loader(model, dev_loader, criterion)\n\n        run_stats[\"epochs\"].append(epoch)\n        run_stats[\"losses\"][\"train\"].append(tr_loss)\n        run_stats[\"losses\"][\"val\"].append(val_loss)\n        run_stats[\"metrics\"][\"train_f1\"].append(tr_f1)\n        run_stats[\"metrics\"][\"val_f1\"].append(val_f1)\n        if epoch == epochs:\n            run_stats[\"predictions\"] = val_preds\n            run_stats[\"ground_truth\"] = val_gts\n        print(\n            f\"Epoch {epoch}: train_loss={tr_loss:.4f} val_loss={val_loss:.4f} val_macroF1={val_f1:.4f}\"\n        )\n\n    # plots\n    plt.figure()\n    plt.plot(run_stats[\"epochs\"], run_stats[\"losses\"][\"train\"], label=\"train_loss\")\n    plt.plot(run_stats[\"epochs\"], run_stats[\"losses\"][\"val\"], label=\"val_loss\")\n    plt.legend()\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.title(f\"No-Pad Ablation Loss (bs={bs})\")\n    plt.savefig(os.path.join(working_dir, f\"loss_curve_nopad_bs{bs}.png\"))\n    plt.close()\n\n    plt.figure()\n    plt.plot(run_stats[\"epochs\"], run_stats[\"metrics\"][\"val_f1\"], label=\"val_macro_f1\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Macro F1\")\n    plt.title(f\"No-Pad Ablation F1 (bs={bs})\")\n    plt.savefig(os.path.join(working_dir, f\"f1_curve_nopad_bs{bs}.png\"))\n    plt.close()\n\n    experiment_data[\"no_padding_mask_ablation\"][bs] = run_stats\n\n# ---------- SAVE ----------\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"\\nAblation complete. Data saved to working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# Prepare working directory\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------------- Load data ----------------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\n    abl_data = experiment_data.get(\"no_padding_mask_ablation\", {})\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    abl_data = {}\n\n# Helper to fetch colours consistently\ncolors = plt.cm.tab10.colors\n\n# ---------------- Plot 1: Loss curves (train & val) ----------------\ntry:\n    plt.figure(figsize=(10, 4))\n    # Left subplot: train loss\n    plt.subplot(1, 2, 1)\n    for i, (bs, stats) in enumerate(sorted(abl_data.items())):\n        plt.plot(\n            stats[\"epochs\"],\n            stats[\"losses\"][\"train\"],\n            label=f\"bs={bs}\",\n            color=colors[i % len(colors)],\n        )\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.title(\"Training Loss\")\n    plt.legend()\n\n    # Right subplot: val loss\n    plt.subplot(1, 2, 2)\n    for i, (bs, stats) in enumerate(sorted(abl_data.items())):\n        plt.plot(\n            stats[\"epochs\"],\n            stats[\"losses\"][\"val\"],\n            label=f\"bs={bs}\",\n            color=colors[i % len(colors)],\n        )\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.title(\"Validation Loss\")\n\n    plt.suptitle(\n        \"No-Pad Mask Ablation \u2013 Left: Training Loss, Right: Validation Loss (SPR-Bench)\"\n    )\n    fname = os.path.join(working_dir, \"spr_loss_curves_nopad.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating loss curves plot: {e}\")\n    plt.close()\n\n# ---------------- Plot 2: Validation F1 curves ----------------\ntry:\n    plt.figure()\n    for i, (bs, stats) in enumerate(sorted(abl_data.items())):\n        plt.plot(\n            stats[\"epochs\"],\n            stats[\"metrics\"][\"val_f1\"],\n            label=f\"bs={bs}\",\n            color=colors[i % len(colors)],\n        )\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Macro F1\")\n    plt.title(\"Validation Macro-F1 over Epochs \u2013 SPR-Bench\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"spr_val_f1_curves_nopad.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating F1 curves plot: {e}\")\n    plt.close()\n\n# ---------------- Plot 3: Final epoch F1 bar chart ----------------\ntry:\n    plt.figure()\n    bs_vals, final_f1 = [], []\n    for bs, stats in sorted(abl_data.items()):\n        bs_vals.append(str(bs))\n        final_f1.append(stats[\"metrics\"][\"val_f1\"][-1])\n    plt.bar(bs_vals, final_f1, color=\"skyblue\")\n    plt.xlabel(\"Batch Size\")\n    plt.ylabel(\"Final-Epoch Macro F1\")\n    plt.title(\"Final Validation F1 vs Batch Size \u2013 SPR-Bench\")\n    for i, v in enumerate(final_f1):\n        plt.text(i, v + 0.005, f\"{v:.2f}\", ha=\"center\")\n    fname = os.path.join(working_dir, \"spr_final_f1_by_bs_nopad.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating final F1 bar chart: {e}\")\n    plt.close()\n\nprint(f\"Plots saved to {working_dir}\")\n",
+    "plot_plan": "We load the serialized dictionary from experiment_data.npy, extract the sub-dict \u201cno_padding_mask_ablation\u201d, and iterate over the four batch-size runs. For compactness we aggregate results: (1) one figure with two side-by-side subplots showing training and validation loss curves for all batch sizes; (2) one figure with validation macro-F1 curves across epochs for all batch sizes; (3) one bar chart summarising the final-epoch validation macro-F1 for each batch size. Each figure is wrapped in its own try-except block, saved in working_dir with descriptive filenames, explicitly closed, and given clear titles plus subtitles such as \u201cLeft: Training Loss, Right: Validation Loss \u2013 SPR-Bench\u201d. We avoid plotting more than five figures, handle missing/corrupt files gracefully, and rely solely on the data actually stored in experiment_data.npy. All required imports are included, working_dir is (re)created, and the script can be executed standalone to regenerate the visuals. Finally, the script prints a short confirmation so users know where the plots were saved.",
+    "plot_analyses": [
+      {
+        "analysis": "This plot shows the training and validation loss trends for a batch size of 32. The training loss decreases steadily and stabilizes near zero, indicating effective learning. However, the validation loss increases after an initial decrease, suggesting potential overfitting or a mismatch between the training and validation distributions.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/loss_curve_nopad_bs32.png"
+      },
+      {
+        "analysis": "This plot depicts the macro F1 score trend for a batch size of 32. The score initially decreases slightly before showing a sharp increase after epoch 3, stabilizing around 0.698. This indicates improved generalization performance after epoch 3, despite earlier overfitting concerns.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/f1_curve_nopad_bs32.png"
+      },
+      {
+        "analysis": "This plot shows the training and validation loss trends for a batch size of 128. The training loss decreases rapidly and stabilizes near zero, while the validation loss increases after an initial decrease. This behavior points to overfitting, as the model performs well on training data but struggles with validation data.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/loss_curve_nopad_bs64.png"
+      },
+      {
+        "analysis": "This plot illustrates the macro F1 score trend for a batch size of 128. The score improves significantly over the first two epochs, stabilizing around 0.70. This suggests that the model achieves good generalization performance, although the sharp increase in early epochs may indicate sensitivity to initial training dynamics.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/f1_curve_nopad_bs64.png"
+      },
+      {
+        "analysis": "This plot shows the training and validation loss trends for a batch size of 256. The training loss decreases steadily and stabilizes near zero, while the validation loss increases sharply after epoch 3. This indicates overfitting, as the model struggles to generalize to validation data despite effectively minimizing training loss.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/loss_curve_nopad_bs128.png"
+      },
+      {
+        "analysis": "This plot depicts the macro F1 score trend for a batch size of 256. The score improves significantly over the first three epochs, stabilizing around 0.70. This indicates good generalization performance, though the rapid improvement in early epochs may reflect sensitivity to batch size.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/f1_curve_nopad_bs128.png"
+      },
+      {
+        "analysis": "These plots compare training and validation loss for different batch sizes. Training loss decreases more rapidly for larger batch sizes, while validation loss increases more sharply, indicating a trade-off between faster convergence and overfitting. Smaller batch sizes show more stable validation loss trends.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/loss_curve_nopad_bs256.png"
+      },
+      {
+        "analysis": "This plot compares macro F1 scores across batch sizes. All batch sizes achieve similar final F1 scores around 0.70, suggesting that batch size has minimal impact on generalization performance despite differences in training dynamics.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/f1_curve_nopad_bs256.png"
+      },
+      {
+        "analysis": "This bar chart compares final validation F1 scores across batch sizes. The scores are nearly identical, indicating that the model's generalization performance is robust to changes in batch size.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/spr_loss_curves_nopad.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/loss_curve_nopad_bs32.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/f1_curve_nopad_bs32.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/loss_curve_nopad_bs64.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/f1_curve_nopad_bs64.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/loss_curve_nopad_bs128.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/f1_curve_nopad_bs128.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/loss_curve_nopad_bs256.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/f1_curve_nopad_bs256.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/spr_loss_curves_nopad.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/spr_val_f1_curves_nopad.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/spr_final_f1_by_bs_nopad.png"
+    ],
+    "vlm_feedback_summary": "The plots reveal that while training loss decreases effectively across all batch sizes, validation loss trends suggest overfitting, particularly for larger batch sizes. Macro F1 scores stabilize around 0.70, indicating consistent generalization performance. Smaller batch sizes show more stable validation loss, while larger batch sizes lead to faster convergence but higher risk of overfitting.",
+    "exp_results_dir": "experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577",
+    "ablation_name": "No-Padding-Mask Ablation",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_9d5d07360666442cba5c1d791b629371_proc_3475577/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "The research strategy begins with hyperparameter tuning, focusing on grid-searching the training mini-batch size for a TinyTransformer model to identify optimal batch sizes by evaluating per-epoch losses and F1 scores. This phase aims to balance computational efficiency and model performance, with results stored in a hierarchical data structure for easy comparison. The current plan extends this exploration to an ablation study on Transformer architecture, specifically examining the impact of the number of attention heads. Two variants are trained: a baseline with four heads and an ablated single-head model, keeping all other parameters constant to isolate the effects of multi-head attention. Training statistics such as losses and macro-F1 scores are meticulously logged. This holistic approach integrates hyperparameter optimization with architectural investigation, enhancing understanding of model performance and informing future Transformer configurations.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "training loss",
+            "lower_is_better": true,
+            "description": "The loss computed on the training dataset, indicating the model's performance during training.",
+            "data": [
+              {
+                "dataset_name": "SPR-BENCH (multi_head_4)",
+                "final_value": 0.0262,
+                "best_value": 0.0262
+              },
+              {
+                "dataset_name": "SPR-BENCH (single_head)",
+                "final_value": 0.0415,
+                "best_value": 0.0415
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "The loss computed on the validation dataset, indicating the model's performance during validation.",
+            "data": [
+              {
+                "dataset_name": "SPR-BENCH (multi_head_4)",
+                "final_value": 2.235,
+                "best_value": 2.235
+              },
+              {
+                "dataset_name": "SPR-BENCH (single_head)",
+                "final_value": 1.8666,
+                "best_value": 1.8666
+              }
+            ]
+          },
+          {
+            "metric_name": "training macro F1 score",
+            "lower_is_better": false,
+            "description": "The macro-averaged F1 score computed on the training dataset, reflecting the balance between precision and recall.",
+            "data": [
+              {
+                "dataset_name": "SPR-BENCH (multi_head_4)",
+                "final_value": 0.9945,
+                "best_value": 0.9945
+              },
+              {
+                "dataset_name": "SPR-BENCH (single_head)",
+                "final_value": 0.99,
+                "best_value": 0.99
+              }
+            ]
+          },
+          {
+            "metric_name": "validation macro F1 score",
+            "lower_is_better": false,
+            "description": "The macro-averaged F1 score computed on the validation dataset, reflecting the balance between precision and recall.",
+            "data": [
+              {
+                "dataset_name": "SPR-BENCH (multi_head_4)",
+                "final_value": 0.692,
+                "best_value": 0.692
+              },
+              {
+                "dataset_name": "SPR-BENCH (single_head)",
+                "final_value": 0.694,
+                "best_value": 0.694
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# Single-Head-Attention Ablation for SPR-BENCH\nimport os, pathlib, numpy as np, torch, matplotlib\n\nmatplotlib.use(\"Agg\")\nimport matplotlib.pyplot as plt\nfrom torch import nn\nfrom torch.utils.data import Dataset, DataLoader\nfrom datasets import DatasetDict, load_dataset\nfrom sklearn.metrics import f1_score\nfrom typing import List, Dict\n\n# -------------------- HOUSE-KEEPING --------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# -------------------- DATA -----------------------------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(csv_name: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for split in [\"train\", \"dev\", \"test\"]:\n        d[split] = _load(f\"{split}.csv\")\n    return d\n\n\nDATA_PATH = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\nspr = load_spr_bench(DATA_PATH)\nprint(\"Dataset sizes:\", {k: len(v) for k, v in spr.items()})\n\n# -------------------- VOCAB ----------------------------\nPAD, UNK = \"<pad>\", \"<unk>\"\nchar_set = set(ch for ex in spr[\"train\"] for ch in ex[\"sequence\"])\nitos = [PAD, UNK] + sorted(list(char_set))\nstoi = {ch: i for i, ch in enumerate(itos)}\nmax_len = 128\nnum_classes = len(set(spr[\"train\"][\"label\"]))\n\n\ndef encode(seq: str, max_len: int = 128) -> List[int]:\n    ids = [stoi.get(ch, stoi[UNK]) for ch in seq[:max_len]]\n    if len(ids) < max_len:\n        ids += [stoi[PAD]] * (max_len - len(ids))\n    return ids\n\n\nclass SPRTorchDataset(Dataset):\n    def __init__(self, hf_dataset, max_len=128):\n        self.data = hf_dataset\n        self.max_len = max_len\n\n    def __len__(self):\n        return len(self.data)\n\n    def __getitem__(self, idx):\n        row = self.data[idx]\n        input_ids = torch.tensor(\n            encode(row[\"sequence\"], self.max_len), dtype=torch.long\n        )\n        attention_mask = (input_ids != stoi[PAD]).long()\n        label = torch.tensor(row[\"label\"], dtype=torch.long)\n        return {\n            \"input_ids\": input_ids,\n            \"attention_mask\": attention_mask,\n            \"labels\": label,\n        }\n\n\n# -------------------- MODEL ----------------------------\nclass TinyTransformer(nn.Module):\n    def __init__(\n        self,\n        vocab_size: int,\n        num_classes: int,\n        d_model: int = 128,\n        n_heads: int = 4,\n        n_layers: int = 2,\n    ):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, d_model, padding_idx=stoi[PAD])\n        self.pos_embed = nn.Parameter(torch.randn(1, max_len, d_model))\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=d_model, nhead=n_heads, batch_first=True\n        )\n        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)\n        self.fc = nn.Linear(d_model, num_classes)\n\n    def forward(self, input_ids, attention_mask):\n        x = self.embed(input_ids) + self.pos_embed[:, : input_ids.size(1), :]\n        x = self.encoder(x, src_key_padding_mask=~attention_mask.bool())\n        x = (x * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(\n            1, keepdim=True\n        )\n        return self.fc(x)\n\n\ndef run_loader(model, loader, criterion, optimizer=None):\n    train = optimizer is not None\n    model.train() if train else model.eval()\n    total_loss, preds, gts = 0.0, [], []\n    with torch.set_grad_enabled(train):\n        for batch in loader:\n            batch = {k: v.to(device) for k, v in batch.items()}\n            out = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(out, batch[\"labels\"])\n            if train:\n                optimizer.zero_grad()\n                loss.backward()\n                optimizer.step()\n            total_loss += loss.item() * batch[\"labels\"].size(0)\n            preds.extend(out.argmax(-1).cpu().tolist())\n            gts.extend(batch[\"labels\"].cpu().tolist())\n    avg_loss = total_loss / len(loader.dataset)\n    macro_f1 = f1_score(gts, preds, average=\"macro\")\n    return avg_loss, macro_f1, preds, gts\n\n\n# -------------------- EXPERIMENT SETUP -----------------\nexperiment_data: Dict = {\n    \"multi_head_4\": {\"SPR-BENCH\": {}},\n    \"single_head\": {\"SPR-BENCH\": {}},\n}\n\n# Common hyper-params\nbatch_size = 128\nepochs = 5\ncriterion = nn.CrossEntropyLoss()\n\ntrain_loader = DataLoader(\n    SPRTorchDataset(spr[\"train\"], max_len), batch_size=batch_size, shuffle=True\n)\ndev_loader = DataLoader(SPRTorchDataset(spr[\"dev\"], max_len), batch_size=batch_size)\n\nablation_settings = {\"multi_head_4\": 4, \"single_head\": 1}\n\nfor ablation_name, nhead in ablation_settings.items():\n    print(f\"\\n=== Running {ablation_name} (n_heads={nhead}) ===\")\n    model = TinyTransformer(len(itos), num_classes, n_heads=nhead).to(device)\n    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)\n\n    run_stats = {\n        \"epochs\": [],\n        \"losses\": {\"train\": [], \"val\": []},\n        \"metrics\": {\"train_f1\": [], \"val_f1\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n\n    for epoch in range(1, epochs + 1):\n        tr_loss, tr_f1, _, _ = run_loader(model, train_loader, criterion, optimizer)\n        val_loss, val_f1, val_preds, val_gts = run_loader(model, dev_loader, criterion)\n\n        run_stats[\"epochs\"].append(epoch)\n        run_stats[\"losses\"][\"train\"].append(tr_loss)\n        run_stats[\"losses\"][\"val\"].append(val_loss)\n        run_stats[\"metrics\"][\"train_f1\"].append(tr_f1)\n        run_stats[\"metrics\"][\"val_f1\"].append(val_f1)\n\n        if epoch == epochs:\n            run_stats[\"predictions\"] = val_preds\n            run_stats[\"ground_truth\"] = val_gts\n\n        print(\n            f\"Epoch {epoch}: train_loss={tr_loss:.4f} val_loss={val_loss:.4f} \"\n            f\"val_macroF1={val_f1:.4f}\"\n        )\n\n    # Plotting\n    plt.figure()\n    plt.plot(run_stats[\"epochs\"], run_stats[\"losses\"][\"train\"], label=\"train_loss\")\n    plt.plot(run_stats[\"epochs\"], run_stats[\"losses\"][\"val\"], label=\"val_loss\")\n    plt.legend()\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.title(f\"Loss Curve ({ablation_name})\")\n    plt.savefig(os.path.join(working_dir, f\"loss_{ablation_name}.png\"))\n    plt.close()\n\n    plt.figure()\n    plt.plot(run_stats[\"epochs\"], run_stats[\"metrics\"][\"val_f1\"], label=\"val_macro_f1\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Macro F1\")\n    plt.title(f\"Val F1 ({ablation_name})\")\n    plt.savefig(os.path.join(working_dir, f\"f1_{ablation_name}.png\"))\n    plt.close()\n\n    experiment_data[ablation_name][\"SPR-BENCH\"] = run_stats\n\n# -------------------- SAVE RESULTS ---------------------\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"\\nAblation study complete. Data saved to working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ----------- setup -----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ----------- load data -----------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\nbest_scores = {}  # ablation -> (best_f1, epoch)\n\n# ----------- per-ablation plots -----------\nfor ablation_name, runs in experiment_data.items():\n    run = runs.get(\"SPR-BENCH\", {})\n    epochs = run.get(\"epochs\", [])\n    train_loss = run.get(\"losses\", {}).get(\"train\", [])\n    val_loss = run.get(\"losses\", {}).get(\"val\", [])\n    val_f1 = run.get(\"metrics\", {}).get(\"val_f1\", [])\n\n    # cache best score\n    if val_f1:\n        best_epoch = int(np.argmax(val_f1)) + 1\n        best_scores[ablation_name] = (float(np.max(val_f1)), best_epoch)\n\n    # --- Loss curve ---\n    try:\n        plt.figure()\n        plt.plot(epochs, train_loss, label=\"Train Loss\")\n        plt.plot(epochs, val_loss, label=\"Val Loss\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Loss\")\n        plt.title(f\"SPR-BENCH Loss Curve ({ablation_name})\")\n        plt.legend()\n        fname = f\"spr_bench_loss_{ablation_name}.png\"\n        plt.savefig(os.path.join(working_dir, fname))\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating loss plot for {ablation_name}: {e}\")\n        plt.close()\n\n    # --- Validation F1 curve ---\n    try:\n        plt.figure()\n        plt.plot(epochs, val_f1, label=\"Val Macro F1\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Macro F1\")\n        plt.title(f\"SPR-BENCH Validation F1 ({ablation_name})\")\n        plt.legend()\n        fname = f\"spr_bench_f1_{ablation_name}.png\"\n        plt.savefig(os.path.join(working_dir, fname))\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating F1 plot for {ablation_name}: {e}\")\n        plt.close()\n\n# ----------- aggregated bar chart -----------\ntry:\n    if best_scores:\n        names = list(best_scores.keys())\n        scores = [best_scores[n][0] for n in names]\n        plt.figure()\n        plt.bar(names, scores, color=\"skyblue\")\n        for i, s in enumerate(scores):\n            plt.text(i, s + 0.005, f\"{s:.2f}\", ha=\"center\", va=\"bottom\", fontsize=8)\n        plt.ylabel(\"Best Val Macro F1\")\n        plt.title(\"SPR-BENCH: Best Validation F1 Across Ablations\")\n        plt.savefig(os.path.join(working_dir, \"spr_bench_best_f1_bar.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating bar chart: {e}\")\n    plt.close()\n\n# ----------- print summary -----------\nif best_scores:\n    print(\"=== Best Validation F1 per Ablation ===\")\n    for k, (score, ep) in best_scores.items():\n        print(f\"{k:15s}  F1={score:.4f} at epoch {ep}\")\n",
+    "plot_plan": "We will load the saved experiment_data.npy, loop over each ablation (multi-head_4, single_head) and extract its epoch-wise loss and F1 arrays. For every ablation we will create two separate line charts: (1) train vs. validation loss, (2) validation macro-F1, saving them with descriptive filenames that include the dataset name and ablation tag. After processing all runs we will compute the best validation F1 of each model and show them side-by-side in a bar chart for quick comparison. All plotting actions are wrapped in independent try-except blocks; figures are always closed. At most the five required figures are produced (2 per ablation + 1 aggregated bar chart). Finally, the script prints a small table of the best F1 per ablation and the epoch at which it occurred.",
+    "plot_analyses": [
+      {
+        "analysis": "The training loss decreases steadily over the epochs, indicating that the model is successfully learning from the training data. However, the validation loss increases consistently after the first epoch and diverges significantly from the training loss. This suggests overfitting to the training data, as the model's performance on the validation set deteriorates over time.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/loss_multi_head_4.png"
+      },
+      {
+        "analysis": "The validation F1 score improves initially, peaking at epoch 3, and then slightly decreases. This trend aligns with the observed overfitting in the loss curve, where the model's generalization ability diminishes after a certain point in training.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/f1_multi_head_4.png"
+      },
+      {
+        "analysis": "Similar to the multi-head configuration, the training loss decreases steadily, suggesting effective learning on the training data. However, the validation loss increases after the first epoch, indicating overfitting. The divergence between training and validation loss is slightly less pronounced compared to the multi-head configuration, but it is still significant.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/loss_single_head.png"
+      },
+      {
+        "analysis": "The validation F1 score initially dips in epoch 2 but then improves significantly, peaking at epoch 3, before stabilizing. This pattern indicates that the model requires some adjustment to generalize better, as seen from the temporary dip and recovery in performance.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/f1_single_head.png"
+      },
+      {
+        "analysis": "The training loss decreases steadily, but the validation loss diverges and increases after the first epoch. This reiterates the overfitting issue observed in the earlier loss curves. The trend is consistent with the multi-head configuration, where the model struggles to generalize well to the validation dataset.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/spr_bench_loss_multi_head_4.png"
+      },
+      {
+        "analysis": "The validation F1 score follows the same trend as the earlier plots, with an initial improvement peaking at epoch 3, followed by a slight decline. This consistent pattern across configurations suggests a limitation in the model's ability to sustain generalization performance beyond a certain point.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/spr_bench_f1_multi_head_4.png"
+      },
+      {
+        "analysis": "The training loss decreases steadily, while the validation loss increases after the first epoch. This overfitting trend is consistent across configurations. The single-head configuration shows a similar pattern to the multi-head configuration in terms of generalization challenges.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/spr_bench_loss_single_head.png"
+      },
+      {
+        "analysis": "The validation F1 score shows a recovery after an initial dip, peaking at epoch 3, and then stabilizing. This trend highlights the model's difficulty in maintaining consistent generalization performance, similar to the multi-head configuration.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/spr_bench_f1_single_head.png"
+      },
+      {
+        "analysis": "The bar chart shows that the multi-head configuration achieves a slightly higher best validation F1 score (0.70) compared to the single-head configuration (0.69). This indicates that the multi-head configuration has a marginal advantage in terms of generalization performance, but the difference is not substantial.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/spr_bench_best_f1_bar.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/loss_multi_head_4.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/f1_multi_head_4.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/loss_single_head.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/f1_single_head.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/spr_bench_loss_multi_head_4.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/spr_bench_f1_multi_head_4.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/spr_bench_loss_single_head.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/spr_bench_f1_single_head.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/spr_bench_best_f1_bar.png"
+    ],
+    "vlm_feedback_summary": "The experimental results reveal consistent overfitting across both multi-head and single-head configurations, as evidenced by the increasing validation loss and diverging training loss. The validation F1 scores show initial improvement, peaking at epoch 3, but decline thereafter, indicating challenges in sustaining generalization. The multi-head configuration slightly outperforms the single-head configuration in terms of best validation F1 score, but the difference is minimal. These findings suggest that while the model learns effectively on the training data, its ability to generalize to unseen data is limited, requiring further optimization or regularization techniques.",
+    "exp_results_dir": "experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578",
+    "ablation_name": "Single-Head-Attention Ablation",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_7fea0f89632e4f26a4b7544e5ceb90d6_proc_3475578/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "The overall plan integrates hyperparameter tuning and architectural ablation studies to enhance the performance and efficiency of a TinyTransformer model. Initially, a grid search was conducted to optimize the training mini-batch size by evaluating several candidate values (32, 64, 128, 256). This step involved training separate instances of the model and logging per-epoch losses and F1 scores to determine the best batch size, with results stored in a hierarchical experiment_data dictionary. Subsequently, the focus shifted to an ablation study, specifically the No-FeedForward-Ablation, which removes the feedforward network from the Transformer architecture to assess its impact on performance. By retaining only multi-head self-attention, residual connections, and layer normalization, the study isolates the FFN's contribution. Both experiments maintain consistent data handling and logging to ensure comparability, with all findings saved in 'experiment_data.npy'. This comprehensive strategy aims to refine model performance through parameter tuning while exploring structural simplifications for potential efficiency gains.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "training loss",
+            "lower_is_better": true,
+            "description": "The loss value calculated on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR-BENCH",
+                "final_value": 0.007,
+                "best_value": 0.007
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "The loss value calculated on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR-BENCH",
+                "final_value": 2.3341,
+                "best_value": 2.3341
+              }
+            ]
+          },
+          {
+            "metric_name": "training F1 score",
+            "lower_is_better": false,
+            "description": "The F1 score calculated on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR-BENCH",
+                "final_value": 0.9975,
+                "best_value": 0.9975
+              }
+            ]
+          },
+          {
+            "metric_name": "validation F1 score",
+            "lower_is_better": false,
+            "description": "The F1 score calculated on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR-BENCH",
+                "final_value": 0.704,
+                "best_value": 0.704
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# No-FeedForward-Ablation : single-file run script\nimport os, pathlib, numpy as np, torch, matplotlib\n\nmatplotlib.use(\"Agg\")\nimport matplotlib.pyplot as plt\nfrom torch import nn\nfrom torch.utils.data import Dataset, DataLoader\nfrom datasets import DatasetDict, load_dataset\nfrom sklearn.metrics import f1_score\nfrom typing import List, Dict\n\n# ---------------- SETTINGS ----------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(\"Device:\", device)\n\n\n# --------------- DATA ---------------------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    if not root.exists():  # fallback: download public copy\n        return load_dataset(\n            \"gsm8k\", split=\"train[:1%]\"\n        )  # dummy tiny set if path missing\n\n    def _load(csv_name: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    [d.__setitem__(sp, _load(f\"{sp}.csv\")) for sp in [\"train\", \"dev\", \"test\"]]\n    return d\n\n\nDATA_PATH = pathlib.Path(\n    os.getenv(\"SPR_DATA_PATH\", \"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\n)\nspr = load_spr_bench(DATA_PATH)\nprint(\"Dataset sizes:\", {k: len(v) for k, v in spr.items()})\n\n# --------------- VOCAB --------------------\nPAD, UNK = \"<pad>\", \"<unk>\"\nchar_set = set(ch for ex in spr[\"train\"] for ch in ex[\"sequence\"])\nitos = [PAD, UNK] + sorted(list(char_set))\nstoi = {c: i for i, c in enumerate(itos)}\nmax_len, num_classes = 128, len(set(spr[\"train\"][\"label\"]))\n\n\ndef encode(seq: str, max_len: int = 128) -> List[int]:\n    ids = [stoi.get(ch, stoi[UNK]) for ch in seq[:max_len]]\n    ids += [stoi[PAD]] * (max_len - len(ids))\n    return ids\n\n\nclass SPRTorchDataset(Dataset):\n    def __init__(self, hf, max_len=128):\n        self.data, self.max_len = hf, max_len\n\n    def __len__(self):\n        return len(self.data)\n\n    def __getitem__(self, idx):\n        row = self.data[idx]\n        inp = torch.tensor(encode(row[\"sequence\"], self.max_len), dtype=torch.long)\n        mask = (inp != stoi[PAD]).long()\n        return {\n            \"input_ids\": inp,\n            \"attention_mask\": mask,\n            \"labels\": torch.tensor(row[\"label\"], dtype=torch.long),\n        }\n\n\n# ------------- NO-FFN ENCODER -------------\nclass NoFFNEncoderLayer(nn.Module):\n    def __init__(self, d_model: int, nhead: int, drop: float = 0.1):\n        super().__init__()\n        self.self_attn = nn.MultiheadAttention(\n            d_model, nhead, dropout=drop, batch_first=True\n        )\n        self.dropout1 = nn.Dropout(drop)\n        self.norm1 = nn.LayerNorm(d_model)\n\n    def forward(self, src, src_key_padding_mask=None):\n        attn, _ = self.self_attn(src, src, src, key_padding_mask=src_key_padding_mask)\n        src = self.norm1(src + self.dropout1(attn))\n        return src\n\n\n# ------------- MODEL ----------------------\nclass TinyTransformerNoFFN(nn.Module):\n    def __init__(self, vocab: int, classes: int, d_model=128, n_heads=4, n_layers=2):\n        super().__init__()\n        self.embed = nn.Embedding(vocab, d_model, padding_idx=stoi[PAD])\n        self.pos_embed = nn.Parameter(torch.randn(1, max_len, d_model))\n        layers = [NoFFNEncoderLayer(d_model, n_heads) for _ in range(n_layers)]\n        self.encoder = nn.ModuleList(layers)\n        self.fc = nn.Linear(d_model, classes)\n\n    def forward(self, input_ids, attention_mask):\n        x = self.embed(input_ids) + self.pos_embed[:, : input_ids.size(1), :]\n        pad_mask = ~attention_mask.bool()\n        for layer in self.encoder:\n            x = layer(x, src_key_padding_mask=pad_mask)\n        x = (x * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(\n            1, keepdim=True\n        )\n        return self.fc(x)\n\n\n# ------------- TRAIN / EVAL ---------------\ndef run_loader(model, loader, criterion, opt=None):\n    model.train() if opt else model.eval()\n    tot, preds, gts = 0.0, [], []\n    with torch.set_grad_enabled(opt is not None):\n        for b in loader:\n            b = {k: v.to(device) for k, v in b.items()}\n            out = model(b[\"input_ids\"], b[\"attention_mask\"])\n            loss = criterion(out, b[\"labels\"])\n            if opt:\n                opt.zero_grad()\n                loss.backward()\n                opt.step()\n            tot += loss.item() * b[\"labels\"].size(0)\n            preds += out.argmax(-1).cpu().tolist()\n            gts += b[\"labels\"].cpu().tolist()\n    return tot / len(loader.dataset), f1_score(gts, preds, average=\"macro\"), preds, gts\n\n\n# ------------- EXPERIMENT -----------------\nexperiment_data = {\"no_ffn\": {\"SPR-BENCH\": {\"batch_size\": {}}}}\nbatch_sizes = [32, 64, 128, 256]\nepochs = 5\ncriterion = nn.CrossEntropyLoss()\n\nfor bs in batch_sizes:\n    print(f\"\\n== BS {bs} ==\")\n    tr_loader = DataLoader(\n        SPRTorchDataset(spr[\"train\"], max_len), batch_size=bs, shuffle=True\n    )\n    dv_loader = DataLoader(SPRTorchDataset(spr[\"dev\"], max_len), batch_size=bs)\n    model = TinyTransformerNoFFN(len(itos), num_classes).to(device)\n    opt = torch.optim.Adam(model.parameters(), lr=3e-4)\n    stats = {\n        \"epochs\": [],\n        \"losses\": {\"train\": [], \"val\": []},\n        \"metrics\": {\"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n    for ep in range(1, epochs + 1):\n        tr_loss, tr_f1, _, _ = run_loader(model, tr_loader, criterion, opt)\n        dv_loss, dv_f1, preds, gts = run_loader(model, dv_loader, criterion)\n        stats[\"epochs\"].append(ep)\n        stats[\"losses\"][\"train\"].append(tr_loss)\n        stats[\"losses\"][\"val\"].append(dv_loss)\n        stats[\"metrics\"][\"train\"].append(tr_f1)\n        stats[\"metrics\"][\"val\"].append(dv_f1)\n        if ep == epochs:\n            stats[\"predictions\"], stats[\"ground_truth\"] = preds, gts\n        print(f\"Ep{ep} TL{tr_loss:.3f} VL{dv_loss:.3f} VF1{dv_f1:.3f}\")\n    # plots\n    plt.figure()\n    plt.plot(stats[\"epochs\"], stats[\"losses\"][\"train\"], label=\"train\")\n    plt.plot(stats[\"epochs\"], stats[\"losses\"][\"val\"], label=\"val\")\n    plt.legend()\n    plt.title(f\"Loss bs{bs}\")\n    plt.savefig(os.path.join(working_dir, f\"loss_bs{bs}.png\"))\n    plt.close()\n    plt.figure()\n    plt.plot(stats[\"epochs\"], stats[\"metrics\"][\"val\"], label=\"val_f1\")\n    plt.savefig(os.path.join(working_dir, f\"f1_bs{bs}.png\"))\n    plt.close()\n    experiment_data[\"no_ffn\"][\"SPR-BENCH\"][\"batch_size\"][bs] = stats\n\n# ------------- SAVE -----------------------\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Saved to working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ------------------ LOAD DATA ------------------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\nsummary = []  # (batch, last_val_f1)\n\n# ------------------ PLOTS ----------------------\nfor exp_name, dsets in experiment_data.items():\n    for dset_name, cfg in dsets.items():\n        for bs, stats in cfg.get(\"batch_size\", {}).items():\n            epochs = stats[\"epochs\"]\n            tr_loss = stats[\"losses\"][\"train\"]\n            val_loss = stats[\"losses\"][\"val\"]\n            val_f1 = stats[\"metrics\"][\"val\"]\n            last_f1 = val_f1[-1] if val_f1 else float(\"nan\")\n            summary.append((bs, last_f1))\n\n            # Loss curves\n            try:\n                plt.figure()\n                plt.plot(epochs, tr_loss, label=\"Train Loss\")\n                plt.plot(epochs, val_loss, label=\"Val Loss\")\n                plt.xlabel(\"Epoch\")\n                plt.ylabel(\"Loss\")\n                plt.title(f\"{dset_name} Loss Curves (bs={bs})\")\n                plt.legend()\n                fname = f\"{dset_name}_loss_bs{bs}.png\"\n                plt.savefig(os.path.join(working_dir, fname))\n                plt.close()\n            except Exception as e:\n                print(f\"Error creating loss plot for bs{bs}: {e}\")\n                plt.close()\n\n            # F1 curves\n            try:\n                plt.figure()\n                plt.plot(epochs, val_f1, label=\"Val F1\")\n                plt.xlabel(\"Epoch\")\n                plt.ylabel(\"Macro F1\")\n                plt.title(f\"{dset_name} Validation F1 (bs={bs})\")\n                plt.legend()\n                fname = f\"{dset_name}_f1_bs{bs}.png\"\n                plt.savefig(os.path.join(working_dir, fname))\n                plt.close()\n            except Exception as e:\n                print(f\"Error creating F1 plot for bs{bs}: {e}\")\n                plt.close()\n\n# ------------- SUMMARY BAR CHART --------------\ntry:\n    if summary:\n        bss, f1s = zip(*sorted(summary))\n        plt.figure()\n        plt.bar(range(len(bss)), f1s, tick_label=bss)\n        plt.xlabel(\"Batch Size\")\n        plt.ylabel(\"Final Val Macro F1\")\n        plt.title(\"SPR-BENCH Final Validation F1 vs Batch Size\")\n        plt.savefig(os.path.join(working_dir, \"SPR-BENCH_final_f1_bar.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating summary bar chart: {e}\")\n    plt.close()\n\n# ------------- PRINT SUMMARY ------------------\nprint(\"Batch Size | Final Val F1\")\nfor bs, f1 in sorted(summary):\n    print(f\"{bs:10} | {f1:.3f}\")\n",
+    "plot_plan": "The script loads the serialized dictionary, iterates through each experiment-dataset-batch combination, and pulls out epochs, train/val losses and F1 scores. It then produces a loss curve and an F1 curve for every batch size, wrapping each figure in its own try-except so that a single failure will not halt subsequent plots. Each file is saved to working_dir with descriptive names that include the dataset and batch size, and figures are always closed to free resources. After processing all batches we add a bar chart summarizing the final validation F1 for quick comparison of hyper-parameter choices, again wrapped safely. The code begins with the required imports and working_dir creation, never invents data, limits itself to information inside experiment_data.npy, and prints a small tabular summary of the best/last validation F1 per batch size so users can see numerical results alongside the graphics.",
+    "plot_analyses": [
+      {
+        "analysis": "The plot shows the training and validation loss over epochs for a batch size of 32. The training loss decreases steadily and stabilizes, indicating that the model is learning from the training data. However, the validation loss increases significantly after the first epoch, suggesting overfitting. The model is not generalizing well to the validation data.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/loss_bs32.png"
+      },
+      {
+        "analysis": "This plot represents the validation F1 score over epochs for a batch size of 32. There is significant fluctuation in the F1 score, with a slight upward trend by the final epoch. However, the instability indicates that the model's performance on the validation set is inconsistent, possibly due to overfitting or insufficient training.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/f1_bs32.png"
+      },
+      {
+        "analysis": "The training and validation loss for a batch size of 64 are shown. Similar to the batch size 32 case, the training loss decreases and stabilizes, while the validation loss increases over epochs. This pattern again indicates overfitting, with the model failing to generalize to unseen data.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/loss_bs64.png"
+      },
+      {
+        "analysis": "The validation F1 score for a batch size of 64 shows an initial increase followed by stabilization. While the trend is less erratic compared to the batch size of 32, the overall F1 score is still relatively low, suggesting limited generalization capability.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/f1_bs64.png"
+      },
+      {
+        "analysis": "For a batch size of 128, the training loss decreases steadily and stabilizes at a low value, indicating effective learning on the training data. The validation loss, however, increases significantly over epochs, further confirming overfitting. The larger batch size does not seem to mitigate the generalization issue.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/loss_bs128.png"
+      },
+      {
+        "analysis": "The validation F1 score for a batch size of 128 shows a sharp drop in the initial epochs, followed by a recovery and stabilization. The overall F1 score remains low, indicating that the model struggles to generalize effectively, even with a larger batch size.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/f1_bs128.png"
+      },
+      {
+        "analysis": "The loss curves for batch size 32 show a clear overfitting pattern, with training loss decreasing steadily and validation loss increasing. The model struggles to generalize to unseen data, as evidenced by the divergence between training and validation loss.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/loss_bs256.png"
+      },
+      {
+        "analysis": "The validation F1 score for batch size 32 fluctuates significantly, indicating inconsistent performance on the validation set. While there is a slight upward trend, the instability suggests potential issues with the model's ability to generalize.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/f1_bs256.png"
+      },
+      {
+        "analysis": "The loss curves for batch size 64 indicate overfitting, with a consistent decrease in training loss and an increase in validation loss. The model's inability to generalize to validation data is evident.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/SPR-BENCH_loss_bs32.png"
+      },
+      {
+        "analysis": "The validation F1 score for batch size 64 shows an initial improvement followed by stabilization. However, the overall score remains low, pointing to limited generalization capabilities.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/SPR-BENCH_f1_bs32.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/loss_bs32.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/f1_bs32.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/loss_bs64.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/f1_bs64.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/loss_bs128.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/f1_bs128.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/loss_bs256.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/f1_bs256.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/SPR-BENCH_loss_bs32.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/SPR-BENCH_f1_bs32.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/SPR-BENCH_loss_bs64.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/SPR-BENCH_f1_bs64.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/SPR-BENCH_loss_bs128.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/SPR-BENCH_f1_bs128.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/SPR-BENCH_loss_bs256.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/SPR-BENCH_f1_bs256.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/SPR-BENCH_final_f1_bar.png"
+    ],
+    "vlm_feedback_summary": "The plots reveal consistent overfitting across different batch sizes. Training losses decrease steadily, while validation losses increase, indicating poor generalization. Validation F1 scores show instability or limited improvement, further highlighting the model's struggle to perform well on unseen data. Strategies to address overfitting, such as regularization or adjustments to the model architecture, should be considered.",
+    "exp_results_dir": "experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578",
+    "ablation_name": "No-FeedForward-Ablation",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_abcbd94041774ef5b328ad514d064b2a_proc_3475578/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "The overall plan initially focused on hyperparameter tuning by exploring the effect of different batch sizes (32, 64, 128, 256) on the performance of a TinyTransformer model. This was achieved through a grid search, where each batch size was evaluated by creating new dataloaders and model instances, logging per-epoch losses and F1 scores, and storing the results in a hierarchical experiment_data dictionary. This provided a structured dataset for analyzing the impact of batch size on model performance. The current plan introduces a new experimental idea: the Frozen-Embedding Ablation, which adds a feature to freeze the token-embedding weight matrix during training by setting a boolean flag. This allows for an investigation into the effects of frozen embeddings on model performance, using the same training loop as the baseline. The results are recorded in a structured format to facilitate comparison with previous experiments. Together, these plans offer a comprehensive exploration of TinyTransformer's performance, combining systematic hyperparameter tuning with innovative ablation studies.",
+    "analysis": "The execution output indicates that the ablation study for frozen embeddings ran successfully without any errors. The dataset was loaded correctly, and the training and validation processes for different batch sizes were completed as expected. The results, including loss and macro F1 scores, were logged for each epoch, and the experiment data was saved properly. No bugs or issues were detected.",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "Training loss",
+            "lower_is_better": true,
+            "description": "Measures the error on the training dataset. Lower values indicate better performance.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.07563733500242233,
+                "best_value": 0.007782461888156831
+              }
+            ]
+          },
+          {
+            "metric_name": "Validation loss",
+            "lower_is_better": true,
+            "description": "Measures the error on the validation dataset. Lower values indicate better performance.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 1.5960234718322754,
+                "best_value": 1.5960234718322754
+              }
+            ]
+          },
+          {
+            "metric_name": "Training F1 score",
+            "lower_is_better": false,
+            "description": "F1 score on the training dataset. Higher values indicate better performance.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.9839959029511556,
+                "best_value": 0.9979999979999981
+              }
+            ]
+          },
+          {
+            "metric_name": "Validation F1 score",
+            "lower_is_better": false,
+            "description": "F1 score on the validation dataset. Higher values indicate better performance.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6919556416123922,
+                "best_value": 0.6999951999231988
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# Frozen-Embedding Ablation Study for SPR-BENCH\nimport os, pathlib, numpy as np, torch, matplotlib\n\nmatplotlib.use(\"Agg\")\nimport matplotlib.pyplot as plt\nfrom torch import nn\nfrom torch.utils.data import Dataset, DataLoader\nfrom datasets import DatasetDict, load_dataset\nfrom sklearn.metrics import f1_score\nfrom typing import List, Dict\n\n# --------------------- HOUSE-KEEPING ---------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# --------------------- DATA LOADING ----------------------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(csv_name: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    return DatasetDict({spl: _load(f\"{spl}.csv\") for spl in [\"train\", \"dev\", \"test\"]})\n\n\nDATA_PATH = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\nspr = load_spr_bench(DATA_PATH)\nprint(\"Dataset sizes:\", {k: len(v) for k, v in spr.items()})\n\n# --------------------- VOCAB -----------------------------\nPAD, UNK = \"<pad>\", \"<unk>\"\nchar_set = set(ch for ex in spr[\"train\"] for ch in ex[\"sequence\"])\nitos = [PAD, UNK] + sorted(list(char_set))\nstoi = {ch: i for i, ch in enumerate(itos)}\nmax_len = 128\nnum_classes = len(set(spr[\"train\"][\"label\"]))\n\n\ndef encode(seq: str, max_len: int = 128) -> List[int]:\n    ids = [stoi.get(ch, stoi[UNK]) for ch in seq[:max_len]]\n    ids += [stoi[PAD]] * (max_len - len(ids))\n    return ids\n\n\nclass SPRTorchDataset(Dataset):\n    def __init__(self, hf_dataset, max_len=128):\n        self.data = hf_dataset\n        self.max_len = max_len\n\n    def __len__(self):\n        return len(self.data)\n\n    def __getitem__(self, idx):\n        row = self.data[idx]\n        input_ids = torch.tensor(\n            encode(row[\"sequence\"], self.max_len), dtype=torch.long\n        )\n        attention_mask = (input_ids != stoi[PAD]).long()\n        label = torch.tensor(row[\"label\"], dtype=torch.long)\n        return {\n            \"input_ids\": input_ids,\n            \"attention_mask\": attention_mask,\n            \"labels\": label,\n        }\n\n\n# --------------------- MODEL -----------------------------\nclass TinyTransformer(nn.Module):\n    def __init__(\n        self,\n        vocab_size: int,\n        num_classes: int,\n        d_model: int = 128,\n        n_heads: int = 4,\n        n_layers: int = 2,\n        freeze_embed: bool = False,\n    ):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, d_model, padding_idx=stoi[PAD])\n        if freeze_embed:\n            self.embed.weight.requires_grad = False\n        self.pos_embed = nn.Parameter(torch.randn(1, max_len, d_model))\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=d_model, nhead=n_heads, batch_first=True\n        )\n        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)\n        self.fc = nn.Linear(d_model, num_classes)\n\n    def forward(self, input_ids, attention_mask):\n        x = self.embed(input_ids) + self.pos_embed[:, : input_ids.size(1), :]\n        x = self.encoder(x, src_key_padding_mask=~attention_mask.bool())\n        x = (x * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(\n            1, keepdim=True\n        )\n        return self.fc(x)\n\n\ndef run_loader(model, loader, criterion, optimizer=None):\n    train = optimizer is not None\n    model.train() if train else model.eval()\n    total_loss, preds, gts = 0.0, [], []\n    with torch.set_grad_enabled(train):\n        for batch in loader:\n            batch = {k: v.to(device) for k, v in batch.items()}\n            out = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(out, batch[\"labels\"])\n            if train:\n                optimizer.zero_grad()\n                loss.backward()\n                optimizer.step()\n            total_loss += loss.item() * batch[\"labels\"].size(0)\n            preds.extend(out.argmax(-1).cpu().tolist())\n            gts.extend(batch[\"labels\"].cpu().tolist())\n    return (\n        total_loss / len(loader.dataset),\n        f1_score(gts, preds, average=\"macro\"),\n        preds,\n        gts,\n    )\n\n\n# --------------------- EXPERIMENT CONFIG ----------------\nexperiment_data: Dict = {\"frozen_embedding\": {\"SPR_BENCH\": {\"batch_size\": {}}}}\ncriterion = nn.CrossEntropyLoss()\nbatch_sizes = [32, 64, 128, 256]\nepochs = 5\n\nfor bs in batch_sizes:\n    print(f\"\\n=== Frozen-Embedding Ablation | batch_size={bs} ===\")\n    train_loader = DataLoader(\n        SPRTorchDataset(spr[\"train\"], max_len), batch_size=bs, shuffle=True\n    )\n    dev_loader = DataLoader(SPRTorchDataset(spr[\"dev\"], max_len), batch_size=bs)\n    model = TinyTransformer(len(itos), num_classes, freeze_embed=True).to(device)\n    optimizer = torch.optim.Adam(\n        filter(lambda p: p.requires_grad, model.parameters()), lr=3e-4\n    )\n\n    run_stats = {\n        \"epochs\": [],\n        \"losses\": {\"train\": [], \"val\": []},\n        \"metrics\": {\"train_f1\": [], \"val_f1\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n\n    for epoch in range(1, epochs + 1):\n        tr_loss, tr_f1, _, _ = run_loader(model, train_loader, criterion, optimizer)\n        val_loss, val_f1, val_preds, val_gts = run_loader(model, dev_loader, criterion)\n        run_stats[\"epochs\"].append(epoch)\n        run_stats[\"losses\"][\"train\"].append(tr_loss)\n        run_stats[\"losses\"][\"val\"].append(val_loss)\n        run_stats[\"metrics\"][\"train_f1\"].append(tr_f1)\n        run_stats[\"metrics\"][\"val_f1\"].append(val_f1)\n        if epoch == epochs:\n            run_stats[\"predictions\"] = val_preds\n            run_stats[\"ground_truth\"] = val_gts\n        print(\n            f\"Epoch {epoch}: train_loss={tr_loss:.4f} val_loss={val_loss:.4f} \"\n            f\"val_macroF1={val_f1:.4f}\"\n        )\n\n    # ---------- plotting for this batch size -------------\n    plt.figure()\n    plt.plot(run_stats[\"epochs\"], run_stats[\"losses\"][\"train\"], label=\"train_loss\")\n    plt.plot(run_stats[\"epochs\"], run_stats[\"losses\"][\"val\"], label=\"val_loss\")\n    plt.legend()\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.title(f\"Loss (frozen, bs={bs})\")\n    plt.savefig(os.path.join(working_dir, f\"loss_curve_frozen_bs{bs}.png\"))\n    plt.close()\n\n    plt.figure()\n    plt.plot(run_stats[\"epochs\"], run_stats[\"metrics\"][\"val_f1\"], label=\"val_macro_f1\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Macro F1\")\n    plt.title(f\"Val F1 (frozen, bs={bs})\")\n    plt.savefig(os.path.join(working_dir, f\"f1_curve_frozen_bs{bs}.png\"))\n    plt.close()\n\n    experiment_data[\"frozen_embedding\"][\"SPR_BENCH\"][\"batch_size\"][bs] = run_stats\n\n# --------------------- SAVE RESULTS ---------------------\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"\\nAblation study complete. Data saved to working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ------------------ LOAD DATA ------------------\ntry:\n    exp_path = os.path.join(working_dir, \"experiment_data.npy\")\n    experiment_data = np.load(exp_path, allow_pickle=True).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\n\n# Quick helper to retrieve safely\ndef get_bs_dict(data_dict):\n    try:\n        return data_dict[\"frozen_embedding\"][\"SPR_BENCH\"][\"batch_size\"]\n    except KeyError:\n        return {}\n\n\nbs_dict = get_bs_dict(experiment_data)\nbatch_sizes = sorted(bs_dict.keys())\n\n# ------------------ PLOT FIGURES ------------------\n# 1) Combined Loss Curves -------------------------------------------------\ntry:\n    plt.figure()\n    for bs in batch_sizes:\n        epochs = bs_dict[bs][\"epochs\"]\n        tr_loss = bs_dict[bs][\"losses\"][\"train\"]\n        val_loss = bs_dict[bs][\"losses\"][\"val\"]\n        plt.plot(epochs, tr_loss, label=f\"train_loss_bs{bs}\")\n        plt.plot(epochs, val_loss, linestyle=\"--\", label=f\"val_loss_bs{bs}\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Cross-Entropy Loss\")\n    plt.title(\n        \"SPR_BENCH Frozen-Embedding\\nLeft: Train Loss, Right: Val Loss (all batch sizes)\"\n    )\n    plt.legend(fontsize=6)\n    fname = os.path.join(working_dir, \"spr_bench_frozen_loss_all_bs.png\")\n    plt.savefig(fname, dpi=150, bbox_inches=\"tight\")\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating combined loss plot: {e}\")\n    plt.close()\n\n# 2) Combined Validation F1 Curves ---------------------------------------\ntry:\n    plt.figure()\n    for bs in batch_sizes:\n        epochs = bs_dict[bs][\"epochs\"]\n        val_f1 = bs_dict[bs][\"metrics\"][\"val_f1\"]\n        plt.plot(epochs, val_f1, label=f\"val_f1_bs{bs}\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Macro-F1\")\n    plt.title(\"SPR_BENCH Frozen-Embedding\\nValidation Macro-F1 vs Epoch\")\n    plt.legend(fontsize=6)\n    fname = os.path.join(working_dir, \"spr_bench_frozen_valF1_all_bs.png\")\n    plt.savefig(fname, dpi=150, bbox_inches=\"tight\")\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating combined val-F1 plot: {e}\")\n    plt.close()\n\n# 3) Final Epoch Val-F1 Bar Chart ----------------------------------------\ntry:\n    plt.figure()\n    final_f1s = [bs_dict[bs][\"metrics\"][\"val_f1\"][-1] for bs in batch_sizes]\n    plt.bar(range(len(batch_sizes)), final_f1s, tick_label=batch_sizes)\n    plt.xlabel(\"Batch Size\")\n    plt.ylabel(\"Final Epoch Macro-F1\")\n    plt.title(\"SPR_BENCH Frozen-Embedding\\nFinal Validation Macro-F1 by Batch Size\")\n    fname = os.path.join(working_dir, \"spr_bench_frozen_final_valF1_bar.png\")\n    plt.savefig(fname, dpi=150, bbox_inches=\"tight\")\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating final val-F1 bar chart: {e}\")\n    plt.close()\n\nprint(\"Plot generation complete. Files saved to 'working/'.\")\n",
+    "plot_plan": "We will begin by loading the saved dict from experiment_data.npy and validating that the expected nested keys exist.  From there we will iterate over the four batch-size runs (32, 64, 128, 256) and collect (1) the epoch-wise training and validation loss, (2) the epoch-wise validation macro-F1, and (3) the final-epoch validation macro-F1.  Three figures will be generated: a combined loss curve (train/val) with one color per batch size, a combined validation-F1 curve, and a bar chart summarizing the final validation-F1 for each batch size.  Each plotting block is wrapped in try-except to avoid cascading failures, figures are closed after saving, and files are named descriptively.  We keep the number of figures \u2264 5 and include clear titles/subtitles that mention the SPR_BENCH dataset and the frozen-embedding setting. The code follows the developer guidelines, uses only data present in experiment_data.npy, and stores all plots under the working directory.  No extra styling or simulated data are introduced, and the code prints a small confirmation when successful.  Finally, all imports occur at the top and working_dir is created if missing.",
+    "plot_analyses": [
+      {
+        "analysis": "The loss trends for both training and validation differ significantly. While training loss decreases steadily and plateaus, the validation loss increases, suggesting overfitting. This indicates that the model is not generalizing well to unseen data, despite its ability to minimize training loss effectively. Adjustments such as increased regularization or early stopping may be required.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/loss_curve_frozen_bs32.png"
+      },
+      {
+        "analysis": "The validation F1 score shows an initial drop, followed by a steady increase. The dip indicates instability in the model's performance during early epochs, potentially due to overfitting or inadequate learning rate scheduling. Subsequent improvement suggests the model eventually learns meaningful patterns, though initial instability needs addressing.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/f1_curve_frozen_bs32.png"
+      },
+      {
+        "analysis": "Training loss decreases consistently and converges, while validation loss initially rises sharply before stabilizing. This pattern indicates overfitting, as the model performs well on training data but struggles with validation data. The sharp rise in validation loss may also suggest issues with model capacity or hyperparameter tuning.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/loss_curve_frozen_bs64.png"
+      },
+      {
+        "analysis": "The validation F1 score improves significantly in the early epochs and stabilizes, indicating that the model is learning effectively after initial adjustments. However, the lack of further improvement suggests the model may have reached its capacity for this task, or that additional tuning is required to achieve better performance.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/f1_curve_frozen_bs64.png"
+      },
+      {
+        "analysis": "The combined plot for various batch sizes shows that larger batch sizes generally result in higher validation loss, while smaller batch sizes maintain lower losses. This suggests that smaller batch sizes may promote better generalization, while larger batch sizes may lead to overfitting. The trend highlights the importance of batch size as a critical hyperparameter in this task.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/loss_curve_frozen_bs128.png"
+      },
+      {
+        "analysis": "The validation F1 scores across batch sizes indicate minimal differences in final performance, with all batch sizes converging to similar F1 scores. This suggests that while batch size affects the training dynamics (as seen in the loss trends), the final validation performance is relatively robust to this parameter.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/f1_curve_frozen_bs128.png"
+      },
+      {
+        "analysis": "The bar chart confirms that the final validation F1 scores are nearly identical across batch sizes. This consistency suggests that the model's ultimate ability to generalize is not significantly impacted by batch size, though training efficiency and dynamics may vary.",
+        "plot_path": "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/loss_curve_frozen_bs256.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/loss_curve_frozen_bs32.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/f1_curve_frozen_bs32.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/loss_curve_frozen_bs64.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/f1_curve_frozen_bs64.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/loss_curve_frozen_bs128.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/f1_curve_frozen_bs128.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/loss_curve_frozen_bs256.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/f1_curve_frozen_bs256.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/spr_bench_frozen_loss_all_bs.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/spr_bench_frozen_valF1_all_bs.png",
+      "experiments/2025-08-17_23-44-14_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/spr_bench_frozen_final_valF1_bar.png"
+    ],
+    "vlm_feedback_summary": "The results indicate challenges with overfitting and generalization, particularly in the loss trends. Smaller batch sizes appear to promote better generalization during training. Validation F1 scores are relatively robust across batch sizes, though initial instability in learning dynamics is observed. Further tuning of hyperparameters and regularization techniques is recommended to address overfitting and improve generalization.",
+    "exp_results_dir": "experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577",
+    "ablation_name": "Frozen-Embedding Ablation",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_9759bdd5085b4370985595c54a4033dc_proc_3475577/experiment_data.npy"
+    ]
+  }
+]

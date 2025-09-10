@@ -1,0 +1,125 @@
+{
+  "best node": {
+    "overall_plan": "The overall plan has evolved from hyperparameter tuning of pre-training epochs to enhancing the baseline model with explicit shape and color knowledge. Initially, the focus was on methodically exploring the impact of different pre-training epochs on model performance by re-initializing the encoder/classifier and conducting contrastive pre-training followed by fine-tuning. Metrics were stored and visualized for analysis. The current plan introduces compositional embeddings by decomposing tokens into shape and color symbols, learning separate embeddings, and using a bi-GRU encoder. It employs stochastic context augmentations for contrastive views and monitors validation loss along with specific accuracy metrics during pre-training with InfoNCE and fine-tuning with cross-entropy. This new approach aims for better generalization and efficiency, reflecting a shift towards more sophisticated model enhancement strategies.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "self-supervised pretraining loss",
+            "lower_is_better": true,
+            "description": "Measures the loss during the self-supervised pretraining phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 4.6853,
+                "best_value": 4.6853
+              }
+            ]
+          },
+          {
+            "metric_name": "supervised training loss",
+            "lower_is_better": true,
+            "description": "Measures the loss during the supervised training phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.0163,
+                "best_value": 0.0163
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "Measures the loss on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.0088,
+                "best_value": 0.0088
+              }
+            ]
+          },
+          {
+            "metric_name": "shape-weighted accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy weighted by shape-related criteria.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.9974,
+                "best_value": 0.9974
+              }
+            ]
+          },
+          {
+            "metric_name": "color-weighted accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy weighted by color-related criteria.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.9976,
+                "best_value": 0.9976
+              }
+            ]
+          },
+          {
+            "metric_name": "complexity-weighted accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy weighted by complexity-related criteria.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.9975,
+                "best_value": 0.9975
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, pathlib, random, gc, time\nimport numpy as np\nimport torch\nfrom torch import nn\nfrom torch.utils.data import Dataset, DataLoader\nfrom torch.nn.utils.rnn import pad_sequence, pack_padded_sequence\nimport matplotlib.pyplot as plt\nfrom datasets import load_dataset, DatasetDict\n\n# ---------- working dir ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- device ---------------\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ---------- data loading ----------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _ld(csv_name):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    out = DatasetDict()\n    for sp in [\"train\", \"dev\", \"test\"]:\n        out[sp] = _ld(f\"{sp}.csv\")\n    return out\n\n\ndata_roots = [\n    pathlib.Path(\"SPR_BENCH\"),\n    pathlib.Path(\"./data/SPR_BENCH\"),\n    pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\"),\n]\nspr = None\nfor p in data_roots:\n    if (p / \"train.csv\").exists():\n        spr = load_spr_bench(p)\n        print(f\"Loaded real SPR_BENCH from {p}\")\n        break\nif spr is None:  # fallback tiny synthetic\n    print(\"Real SPR_BENCH not found \u2013 creating tiny synthetic dataset\")\n\n    def synth(n):\n        sh, col = \"ABCD\", \"1234\"\n        seq, lab = [], []\n        for i in range(n):\n            L = random.randint(4, 8)\n            seq.append(\n                \" \".join(random.choice(sh) + random.choice(col) for _ in range(L))\n            )\n            lab.append(random.randint(0, 1))\n        return {\"id\": list(range(n)), \"sequence\": seq, \"label\": lab}\n\n    spr = DatasetDict()\n    for sp, n in [(\"train\", 800), (\"dev\", 200), (\"test\", 200)]:\n        spr[sp] = load_dataset(\"json\", data_files=None, split=\"train\", data=synth(n))\n\n# ---------- vocabularies ----------\ntok2id = {\"<PAD>\": 0, \"<MASK>\": 1}\nshape2id = {\"<PAD>\": 0}\ncolor2id = {\"<PAD>\": 0}\n\n\ndef register_token(tok: str):\n    if tok not in tok2id:\n        tok2id[tok] = len(tok2id)\n    sh, col = tok[0], (tok[1] if len(tok) > 1 else \"0\")\n    if sh not in shape2id:\n        shape2id[sh] = len(shape2id)\n    if col not in color2id:\n        color2id[col] = len(color2id)\n\n\nfor split in spr.values():\n    for seq in split[\"sequence\"]:\n        for t in seq.strip().split():\n            register_token(t)\n# also register mask pseudo token\nshape2id[\"?\"] = len(shape2id)\ncolor2id[\"?\"] = len(color2id)\n\nprint(f\"Token vocab: {len(tok2id)} | shapes: {len(shape2id)} | colors: {len(color2id)}\")\n\n\n# ---------- metrics ----------\ndef count_shape_variety(seq):\n    return len(set(t[0] for t in seq.split()))\n\n\ndef count_color_variety(seq):\n    return len(set((t[1] if len(t) > 1 else \"0\") for t in seq.split()))\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    return sum(wi for wi, yt, yp in zip(w, y_true, y_pred) if yt == yp) / max(1, sum(w))\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    return sum(wi for wi, yt, yp in zip(w, y_true, y_pred) if yt == yp) / max(1, sum(w))\n\n\ndef complexity_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) + count_color_variety(s) for s in seqs]\n    return sum(wi for wi, yt, yp in zip(w, y_true, y_pred) if yt == yp) / max(1, sum(w))\n\n\n# ---------- augmentation ----------\ndef augment_tokens(toks):\n    toks = toks[:]  # copy\n    # 15% masking\n    out = []\n    for t in toks:\n        if random.random() < 0.15:\n            out.append(\"<MASK>\")\n        else:\n            out.append(t)\n    # random single swap\n    if len(out) > 1 and random.random() < 0.3:\n        i = random.randint(0, len(out) - 2)\n        out[i], out[i + 1] = out[i + 1], out[i]\n    return out\n\n\n# ---------- datasets ----------\nclass ContrastiveDS(Dataset):\n    def __init__(self, hf_ds):\n        self.seqs = hf_ds[\"sequence\"]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        toks = self.seqs[idx].split()\n        return augment_tokens(toks), augment_tokens(toks)\n\n\nclass ClassifyDS(Dataset):\n    def __init__(self, hf_ds):\n        self.seqs, self.labels = hf_ds[\"sequence\"], hf_ds[\"label\"]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        return self.seqs[idx].split(), self.labels[idx], self.seqs[idx]\n\n\n# ---------- collators ----------\ndef encode_lists(token_lists):\n    tok_ids, sh_ids, col_ids, lens = [], [], [], []\n    for toks in token_lists:\n        ids, sh, co = [], [], []\n        for t in toks:\n            tid = tok2id.get(t, tok2id[\"<MASK>\"])\n            sid = shape2id.get((t[0] if t not in [\"<MASK>\"] else \"?\"), shape2id[\"?\"])\n            cid = color2id.get(\n                (t[1] if len(t) > 1 and t not in [\"<MASK>\"] else \"?\"), color2id[\"?\"]\n            )\n            ids.append(tid)\n            sh.append(sid)\n            co.append(cid)\n        tok_ids.append(torch.tensor(ids))\n        sh_ids.append(torch.tensor(sh))\n        col_ids.append(torch.tensor(co))\n        lens.append(len(ids))\n    pad = lambda seqs: pad_sequence(seqs, batch_first=True, padding_value=0)\n    return pad(tok_ids), pad(sh_ids), pad(col_ids), torch.tensor(lens)\n\n\ndef collate_contrastive(batch):\n    v1, v2 = zip(*batch)\n    ids1, sh1, col1, len1 = encode_lists(v1)\n    ids2, sh2, col2, len2 = encode_lists(v2)\n    batch_tensors = {\n        \"ids1\": ids1.to(device),\n        \"sh1\": sh1.to(device),\n        \"col1\": col1.to(device),\n        \"len1\": len1.to(device),\n        \"ids2\": ids2.to(device),\n        \"sh2\": sh2.to(device),\n        \"col2\": col2.to(device),\n        \"len2\": len2.to(device),\n    }\n    return batch_tensors\n\n\ndef collate_classifier(batch):\n    toks, lbls, raw_seq = zip(*batch)\n    ids, sh, col, lens = encode_lists(toks)\n    return {\n        \"ids\": ids.to(device),\n        \"sh\": sh.to(device),\n        \"col\": col.to(device),\n        \"len\": lens.to(device),\n        \"label\": torch.tensor(lbls, dtype=torch.long).to(device),\n        \"sequence\": raw_seq,\n    }\n\n\n# ---------- model ----------\nclass Encoder(nn.Module):\n    def __init__(self, d_tok=32, d_model=64):\n        super().__init__()\n        self.token_emb = nn.Embedding(len(tok2id), d_tok, padding_idx=0)\n        self.shape_emb = nn.Embedding(len(shape2id), d_tok, padding_idx=0)\n        self.color_emb = nn.Embedding(len(color2id), d_tok, padding_idx=0)\n        self.proj = nn.Linear(d_tok * 3, d_model)\n        self.gru = nn.GRU(d_model, d_model, batch_first=True, bidirectional=True)\n        self.out = nn.Linear(d_model * 2, d_model)\n\n    def forward(self, ids, sh, col, lens):\n        x = torch.cat(\n            [self.token_emb(ids), self.shape_emb(sh), self.color_emb(col)], dim=-1\n        )\n        x = self.proj(x)\n        packed = pack_padded_sequence(\n            x, lens.cpu(), batch_first=True, enforce_sorted=False\n        )\n        _, h = self.gru(packed)\n        h = torch.cat([h[-2], h[-1]], dim=1)\n        return self.out(h)  # (B, d_model)\n\n\nclass Classifier(nn.Module):\n    def __init__(self, enc, n_classes):\n        super().__init__()\n        self.enc = enc\n        self.head = nn.Linear(enc.out.out_features, n_classes)\n\n    def forward(self, ids, sh, col, lens):\n        z = self.enc(ids, sh, col, lens)\n        return self.head(z)\n\n\n# ---------- contrastive loss ----------\ndef info_nce(z1, z2, temp=0.5):\n    z1, z2 = nn.functional.normalize(z1, dim=1), nn.functional.normalize(z2, dim=1)\n    N = z1.size(0)\n    z = torch.cat([z1, z2], 0)\n    sim = (z @ z.T) / temp\n    mask = torch.eye(2 * N, device=z.device).bool()\n    sim.masked_fill_(mask, -9e15)\n    targets = torch.arange(N, 2 * N, device=z.device)\n    loss = (\n        nn.functional.cross_entropy(sim[:N], targets)\n        + nn.functional.cross_entropy(sim[N:], targets - N)\n    ) * 0.5\n    return loss\n\n\n# ---------- dataloaders ----------\nbatch_c = 256\npt_loader = DataLoader(\n    ContrastiveDS(spr[\"train\"]),\n    batch_size=batch_c,\n    shuffle=True,\n    collate_fn=collate_contrastive,\n)\ntr_loader = DataLoader(\n    ClassifyDS(spr[\"train\"]),\n    batch_size=batch_c,\n    shuffle=True,\n    collate_fn=collate_classifier,\n)\ndv_loader = DataLoader(\n    ClassifyDS(spr[\"dev\"]),\n    batch_size=batch_c,\n    shuffle=False,\n    collate_fn=collate_classifier,\n)\n\n# ---------- experiment dict ----------\nexperiment_data = {\n    \"SPR_BENCH\": {\n        \"metrics\": {\"train\": [], \"val\": []},\n        \"losses\": {\"pretrain\": [], \"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n}\n\n# ---------- model / optim ----------\nencoder = Encoder().to(device)\nclf = Classifier(encoder, n_classes=len(set(spr[\"train\"][\"label\"]))).to(device)\n\n# ---------- pre-training ----------\nopt_pt = torch.optim.Adam(encoder.parameters(), lr=1e-3)\npretrain_epochs = 4\nfor ep in range(1, pretrain_epochs + 1):\n    encoder.train()\n    running = 0.0\n    for batch in pt_loader:\n        opt_pt.zero_grad()\n        z1 = encoder(batch[\"ids1\"], batch[\"sh1\"], batch[\"col1\"], batch[\"len1\"])\n        z2 = encoder(batch[\"ids2\"], batch[\"sh2\"], batch[\"col2\"], batch[\"len2\"])\n        loss = info_nce(z1, z2)\n        loss.backward()\n        opt_pt.step()\n        running += loss.item() * batch[\"ids1\"].size(0)\n    epoch_loss = running / len(pt_loader.dataset)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"pretrain\"].append(epoch_loss)\n    print(f\"Pretrain epoch {ep}/{pretrain_epochs} loss={epoch_loss:.4f}\")\n\n# ---------- fine-tuning ----------\nopt_ft = torch.optim.Adam(clf.parameters(), lr=1e-3)\ncriterion = nn.CrossEntropyLoss()\nft_epochs = 3\nfor ep in range(1, ft_epochs + 1):\n    # train\n    clf.train()\n    run_tr = 0.0\n    for batch in tr_loader:\n        opt_ft.zero_grad()\n        logits = clf(batch[\"ids\"], batch[\"sh\"], batch[\"col\"], batch[\"len\"])\n        loss = criterion(logits, batch[\"label\"])\n        loss.backward()\n        opt_ft.step()\n        run_tr += loss.item() * batch[\"ids\"].size(0)\n    tr_loss = run_tr / len(tr_loader.dataset)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"train\"].append(tr_loss)\n\n    # val\n    clf.eval()\n    run_val = 0.0\n    all_p, all_t, all_s = [], [], []\n    with torch.no_grad():\n        for batch in dv_loader:\n            logits = clf(batch[\"ids\"], batch[\"sh\"], batch[\"col\"], batch[\"len\"])\n            loss = criterion(logits, batch[\"label\"])\n            run_val += loss.item() * batch[\"ids\"].size(0)\n            preds = logits.argmax(1).cpu().tolist()\n            all_p.extend(preds)\n            all_t.extend(batch[\"label\"].cpu().tolist())\n            all_s.extend(batch[\"sequence\"])\n    val_loss = run_val / len(dv_loader.dataset)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"val\"].append(val_loss)\n    swa = shape_weighted_accuracy(all_s, all_t, all_p)\n    cwa = color_weighted_accuracy(all_s, all_t, all_p)\n    comp = complexity_weighted_accuracy(all_s, all_t, all_p)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"val\"].append((swa, cwa, comp))\n    print(\n        f\"Epoch {ep}: validation_loss = {val_loss:.4f} | SWA={swa:.3f} CWA={cwa:.3f} CompWA={comp:.3f}\"\n    )\n\n# ---------- save ----------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"Saved experiment data to\", working_dir)\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- load data ----------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\n\ndef _style(idx):\n    colors = plt.rcParams[\"axes.prop_cycle\"].by_key()[\"color\"]\n    return colors[idx % len(colors)], \"-\" if idx < len(colors) else \"--\"\n\n\nfor d_idx, (ds, ddict) in enumerate(experiment_data.items()):\n    losses = ddict.get(\"losses\", {})\n    metrics_val = ddict.get(\"metrics\", {}).get(\"val\", [])\n    swa = [t[0] for t in metrics_val] if metrics_val else []\n    cwa = [t[1] for t in metrics_val] if metrics_val else []\n    comp = [t[2] for t in metrics_val] if metrics_val else []\n\n    # 1. pre-training loss\n    try:\n        if losses.get(\"pretrain\"):\n            plt.figure()\n            plt.plot(\n                range(1, len(losses[\"pretrain\"]) + 1),\n                losses[\"pretrain\"],\n                label=\"Pre-train\",\n                color=_style(d_idx)[0],\n            )\n            plt.title(f\"{ds}: Pre-training Loss vs Epochs\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Loss\")\n            plt.legend()\n            fname = os.path.join(working_dir, f\"{ds}_pretrain_loss.png\")\n            plt.savefig(fname)\n            print(f\"Saved {fname}\")\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating pre-training loss plot for {ds}: {e}\")\n        plt.close()\n\n    # 2. fine-tuning loss\n    try:\n        if losses.get(\"train\") or losses.get(\"val\"):\n            plt.figure()\n            if losses.get(\"train\"):\n                plt.plot(\n                    range(1, len(losses[\"train\"]) + 1),\n                    losses[\"train\"],\n                    label=\"Train\",\n                    color=_style(d_idx)[0],\n                    linestyle=\"-\",\n                )\n            if losses.get(\"val\"):\n                plt.plot(\n                    range(1, len(losses[\"val\"]) + 1),\n                    losses[\"val\"],\n                    label=\"Val\",\n                    color=_style(d_idx)[0],\n                    linestyle=\"--\",\n                )\n            plt.title(f\"{ds}: Fine-tuning Loss (Train vs Val)\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Loss\")\n            plt.legend()\n            fname = os.path.join(working_dir, f\"{ds}_finetune_loss.png\")\n            plt.savefig(fname)\n            print(f\"Saved {fname}\")\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating fine-tuning loss plot for {ds}: {e}\")\n        plt.close()\n\n    # helper for metric curves\n    def _plot_metric(values, metric_name, file_suffix):\n        try:\n            if values:\n                plt.figure()\n                plt.plot(\n                    range(1, len(values) + 1),\n                    values,\n                    label=metric_name,\n                    color=_style(d_idx)[0],\n                )\n                plt.title(f\"{ds}: {metric_name} across Fine-tuning Epochs\")\n                plt.xlabel(\"Epoch\")\n                plt.ylabel(metric_name)\n                plt.legend()\n                fname = os.path.join(working_dir, f\"{ds}_{file_suffix}.png\")\n                plt.savefig(fname)\n                print(f\"Saved {fname}\")\n            plt.close()\n        except Exception as e:\n            print(f\"Error creating {metric_name} plot for {ds}: {e}\")\n            plt.close()\n\n    # 3-5. metric curves\n    _plot_metric(swa, \"SWA\", \"SWA_curve\")\n    _plot_metric(cwa, \"CWA\", \"CWA_curve\")\n    _plot_metric(comp, \"CompWA\", \"CompWA_curve\")\n",
+    "plot_plan": "We first load experiment_data.npy and loop over each dataset key (currently only \u201cSPR_BENCH\u201d).  \nFor every dataset we extract the stored lists: losses[\"pretrain\"], losses[\"train\"], losses[\"val\"] and metrics[\"val\"] whose tuples contain (SWA, CWA, CompWA).  \nUsing a small helper _style() we keep colours/linestyles readable even if more datasets are added later.  \nThen, inside separate try-except blocks, we generate at most five figures: (1) pre-training loss, (2) fine-tuning train vs val loss, and three metric curves (SWA, CWA, CompWA).  \nEach figure\u2019s title and saved filename embeds the dataset name plus the curve type, e.g. \u201cSPR_BENCH_pretrain_loss.png\u201d.  \nAll plots are saved to working_dir, figures are always closed, and any exception is caught and reported without stopping the rest of the script.  \nNo synthetic values are created\u2014only the numpy data that really exists are plotted.  \nIf a particular list is empty we simply skip that line to avoid errors.  \nThe code is concise, self-contained, and follows the provided base-imports and plotting conventions.",
+    "plot_analyses": [
+      {
+        "analysis": "The pre-training loss decreases steadily across epochs, indicating that the model is learning effectively during the pre-training phase. The consistent downward trend suggests that the context-aware contrastive learning framework is successfully optimizing the embeddings for symbolic sequences.",
+        "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_3d06141ae8b047d08d4ff80712400b32_proc_2997847/SPR_BENCH_pretrain_loss.png"
+      },
+      {
+        "analysis": "The fine-tuning loss for both the train and validation sets decreases significantly across epochs, demonstrating effective fine-tuning of the pre-trained model. The validation loss follows a similar trend to the training loss, indicating that the model is not overfitting and generalizes well to unseen data.",
+        "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_3d06141ae8b047d08d4ff80712400b32_proc_2997847/SPR_BENCH_finetune_loss.png"
+      },
+      {
+        "analysis": "The SWA metric improves consistently over the fine-tuning epochs, indicating that the model's ability to classify symbolic sequences based on shape complexity is improving. The upward trend suggests that the pre-trained embeddings are effectively fine-tuned for the SPR task.",
+        "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_3d06141ae8b047d08d4ff80712400b32_proc_2997847/SPR_BENCH_SWA_curve.png"
+      },
+      {
+        "analysis": "The CWA metric also shows a consistent improvement across fine-tuning epochs, demonstrating the model's enhanced capability to classify sequences based on color complexity. The results align with the hypothesis that context-aware data augmentation and denoising contribute to better feature representations.",
+        "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_3d06141ae8b047d08d4ff80712400b32_proc_2997847/SPR_BENCH_CWA_curve.png"
+      },
+      {
+        "analysis": "The CompWA metric, which likely combines both shape and color complexities, exhibits a similar upward trend as SWA and CWA. This indicates that the model is improving its overall performance in recognizing symbolic patterns that incorporate both aspects. The results further validate the effectiveness of the proposed approach.",
+        "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_3d06141ae8b047d08d4ff80712400b32_proc_2997847/SPR_BENCH_CompWA_curve.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_3d06141ae8b047d08d4ff80712400b32_proc_2997847/SPR_BENCH_pretrain_loss.png",
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_3d06141ae8b047d08d4ff80712400b32_proc_2997847/SPR_BENCH_finetune_loss.png",
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_3d06141ae8b047d08d4ff80712400b32_proc_2997847/SPR_BENCH_SWA_curve.png",
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_3d06141ae8b047d08d4ff80712400b32_proc_2997847/SPR_BENCH_CWA_curve.png",
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_3d06141ae8b047d08d4ff80712400b32_proc_2997847/SPR_BENCH_CompWA_curve.png"
+    ],
+    "vlm_feedback_summary": "The plots demonstrate that the context-aware contrastive learning framework is effective in pre-training and fine-tuning for the SPR task. The steady decrease in losses and consistent improvement in evaluation metrics (SWA, CWA, and CompWA) highlight the success of the approach in surpassing the SOTA performance.",
+    "exp_results_dir": "experiment_results/experiment_3d06141ae8b047d08d4ff80712400b32_proc_2997847",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_3d06141ae8b047d08d4ff80712400b32_proc_2997847/experiment_data.npy"
+    ]
+  },
+  "best node with different seeds": []
+}

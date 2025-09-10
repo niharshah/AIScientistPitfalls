@@ -1,0 +1,611 @@
+{
+  "best node": {
+    "overall_plan": "Hyperparam tuning name: pretrain_epochs.\nThe solution repeats the original pipeline for several values of pretrain_epochs (2, 4, 6, 8, 10).  \nFor every setting it re-initialises the encoder / classifier, runs contrastive pre-training for the chosen number of epochs, fine-tunes for three epochs, and stores all losses and metrics in the mandatory experiment_data dictionary (organised as experiment_data['pretrain_epochs']['SPR_BENCH'][str(pretrain_epochs)] = \u2026).  \nFinally it saves the dictionary to working/experiment_data.npy and produces a loss-curve PNG for each run.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "pretraining loss",
+            "lower_is_better": true,
+            "description": "Loss during the pretraining phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 4.0024,
+                "best_value": 4.0024
+              }
+            ]
+          },
+          {
+            "metric_name": "fine-tuning train loss",
+            "lower_is_better": true,
+            "description": "Loss during the fine-tuning phase on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.0049,
+                "best_value": 0.0049
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "Loss on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.0087,
+                "best_value": 0.006
+              }
+            ]
+          },
+          {
+            "metric_name": "shape-weighted accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy metric weighted by shape-specific performance.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.9969,
+                "best_value": 0.9985
+              }
+            ]
+          },
+          {
+            "metric_name": "color-weighted accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy metric weighted by color-specific performance.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.9969,
+                "best_value": 0.9985
+              }
+            ]
+          },
+          {
+            "metric_name": "SCHM score",
+            "lower_is_better": false,
+            "description": "A combined metric score for shape and color-weighted accuracy.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.9969,
+                "best_value": 0.9985
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, pathlib, random, math, time, json, gc\nimport numpy as np\nimport torch\nfrom torch import nn\nfrom torch.utils.data import Dataset, DataLoader\nfrom torch.nn.utils.rnn import pad_sequence, pack_padded_sequence\nimport matplotlib.pyplot as plt\n\n# ------------------------- I/O -----------------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ------------------------- Device --------------------------\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n# ---------------------- Data loading -----------------------\nfrom datasets import load_dataset, DatasetDict\n\n\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(split_csv: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / split_csv),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for s in [\"train\", \"dev\", \"test\"]:\n        d[s] = _load(f\"{s}.csv\")\n    return d\n\n\ndata_root_candidates = [\n    pathlib.Path(\"SPR_BENCH\"),\n    pathlib.Path(\"./data/SPR_BENCH\"),\n    pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\"),\n]\nspr_bench = None\nfor p in data_root_candidates:\n    if (p / \"train.csv\").exists():\n        spr_bench = load_spr_bench(p)\n        print(f\"Loaded data from {p}\")\n        break\nif spr_bench is None:\n    print(\"SPR_BENCH not found, generating synthetic data.\")\n\n    def synth(n):\n        seqs, labels = [], []\n        shapes, colors = \"ABCD\", \"1234\"\n        for _ in range(n):\n            L = random.randint(4, 9)\n            seq = \" \".join(\n                random.choice(shapes) + random.choice(colors) for _ in range(L)\n            )\n            seqs.append(seq)\n            labels.append(random.randint(0, 1))\n        return {\"id\": list(range(n)), \"sequence\": seqs, \"label\": labels}\n\n    spr_bench = DatasetDict()\n    for split, n in [(\"train\", 500), (\"dev\", 100), (\"test\", 100)]:\n        spr_bench[split] = load_dataset(\n            \"json\", data_files={\"train\": None}, split=\"train\", data=synth(n)\n        )\n\n\ndef tokenize(seq):\n    return seq.strip().split()\n\n\n# ---------------------- Vocabulary -------------------------\nvocab = {\"<PAD>\": 0, \"<MASK>\": 1}\nfor split in spr_bench.values():\n    for seq in split[\"sequence\"]:\n        for tok in tokenize(seq):\n            if tok not in vocab:\n                vocab[tok] = len(vocab)\nvocab_size = len(vocab)\nmask_id = vocab[\"<MASK>\"]\nprint(\"Vocab size:\", vocab_size)\n\n\n# ---------------------- Metrics ----------------------------\ndef count_shape_variety(sequence: str) -> int:\n    return len(set(tok[0] for tok in sequence.strip().split() if tok))\n\n\ndef count_color_variety(sequence: str) -> int:\n    return len(set(tok[1] for tok in sequence.strip().split() if len(tok) > 1))\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    corr = [wi if yt == yp else 0 for wi, yt, yp in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if sum(w) else 0.0\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    corr = [wi if yt == yp else 0 for wi, yt, yp in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if sum(w) else 0.0\n\n\n# --------------------- Datasets ----------------------------\nclass SPRContrastiveDataset(Dataset):\n    def __init__(self, hf_ds):\n        self.seqs = hf_ds[\"sequence\"]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def _augment(self, toks, p=0.15):\n        out = [t for t in toks if random.random() >= p]\n        if not out:\n            out = [random.choice(toks)]\n        return out\n\n    def __getitem__(self, idx):\n        toks = tokenize(self.seqs[idx])\n        return self._augment(toks), self._augment(toks)\n\n\nclass SPRClassifierDataset(Dataset):\n    def __init__(self, hf_ds):\n        self.seqs = hf_ds[\"sequence\"]\n        self.labels = hf_ds[\"label\"]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        return tokenize(self.seqs[idx]), self.labels[idx], self.seqs[idx]\n\n\ndef collate_contrastive(batch):\n    v1, v2 = zip(*batch)\n\n    def encode(tok_list):\n        ids = [\n            torch.tensor([vocab[t] for t in toks], dtype=torch.long)\n            for toks in tok_list\n        ]\n        lens = [len(i) for i in ids]\n        ids = pad_sequence(ids, batch_first=True, padding_value=0)\n        return ids.to(device), torch.tensor(lens, dtype=torch.long).to(device)\n\n    ids1, len1 = encode(v1)\n    ids2, len2 = encode(v2)\n    return {\"ids1\": ids1, \"len1\": len1, \"ids2\": ids2, \"len2\": len2}\n\n\ndef collate_classifier(batch):\n    toks, labels, raw_seq = zip(*batch)\n    ids = [torch.tensor([vocab[t] for t in t], dtype=torch.long) for t in toks]\n    lens = [len(i) for i in ids]\n    ids = pad_sequence(ids, batch_first=True, padding_value=0).to(device)\n    return {\n        \"ids\": ids,\n        \"len\": torch.tensor(lens, dtype=torch.long).to(device),\n        \"label\": torch.tensor(labels, dtype=torch.long).to(device),\n        \"sequence\": raw_seq,\n    }\n\n\n# ---------------------- Model ------------------------------\nclass Encoder(nn.Module):\n    def __init__(self, vocab, emb_dim=64, hidden=128):\n        super().__init__()\n        self.emb = nn.Embedding(len(vocab), emb_dim, padding_idx=0)\n        self.gru = nn.GRU(emb_dim, hidden, batch_first=True, bidirectional=True)\n        self.proj = nn.Linear(hidden * 2, hidden)\n\n    def forward(self, ids, lens):\n        x = self.emb(ids)\n        packed = pack_padded_sequence(\n            x, lens.cpu(), batch_first=True, enforce_sorted=False\n        )\n        _, h = self.gru(packed)\n        h = torch.cat([h[-2], h[-1]], dim=1)\n        return self.proj(h)\n\n\nclass Classifier(nn.Module):\n    def __init__(self, encoder, num_classes):\n        super().__init__()\n        self.encoder = encoder\n        self.head = nn.Linear(encoder.proj.out_features, num_classes)\n\n    def forward(self, ids, lens):\n        return self.head(self.encoder(ids, lens))\n\n\n# ---------------- Contrastive loss -------------------------\ndef nt_xent_loss(z1, z2, temp=0.5):\n    z1 = nn.functional.normalize(z1, dim=1)\n    z2 = nn.functional.normalize(z2, dim=1)\n    N = z1.size(0)\n    z = torch.cat([z1, z2], dim=0)\n    sim = torch.matmul(z, z.T) / temp\n    mask = torch.eye(2 * N, dtype=torch.bool, device=z.device)\n    sim.masked_fill_(mask, -9e15)\n    targets = torch.arange(N, 2 * N, device=z.device)\n    logits_12 = sim[:N, N:]\n    logits_21 = sim[N:, :N]\n    denom_12 = torch.logsumexp(sim[:N], dim=1)\n    denom_21 = torch.logsumexp(sim[N:], dim=1)\n    loss = (-logits_12.diag() + denom_12 + -logits_21.diag() + denom_21).mean() * 0.5\n    return loss\n\n\n# ---------------- Experiment container ---------------------\nexperiment_data = {\"pretrain_epochs\": {\"SPR_BENCH\": {}}}\n\n# ------------- Hyperparameter values to try ----------------\nepoch_settings = [2, 4, 6, 8, 10]\n\nfor pretrain_epochs in epoch_settings:\n    print(f\"\\n=== Running experiment with pretrain_epochs={pretrain_epochs} ===\")\n    run_dict = {\n        \"losses\": {\"pretrain\": [], \"train\": [], \"val\": []},\n        \"metrics\": {\"SWA\": [], \"CWA\": [], \"SCHM\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n\n    # Dataloaders (fresh shuffle each run)\n    pretrain_loader = DataLoader(\n        SPRContrastiveDataset(spr_bench[\"train\"]),\n        batch_size=128,\n        shuffle=True,\n        collate_fn=collate_contrastive,\n    )\n    train_loader = DataLoader(\n        SPRClassifierDataset(spr_bench[\"train\"]),\n        batch_size=128,\n        shuffle=True,\n        collate_fn=collate_classifier,\n    )\n    dev_loader = DataLoader(\n        SPRClassifierDataset(spr_bench[\"dev\"]),\n        batch_size=256,\n        shuffle=False,\n        collate_fn=collate_classifier,\n    )\n\n    # Model instantiation\n    encoder = Encoder(vocab).to(device)\n    clf_model = Classifier(\n        encoder, num_classes=len(set(spr_bench[\"train\"][\"label\"]))\n    ).to(device)\n\n    # -------- Contrastive pre-training ----------\n    optimizer_pt = torch.optim.Adam(encoder.parameters(), lr=1e-3)\n    for ep in range(1, pretrain_epochs + 1):\n        encoder.train()\n        epoch_loss = 0.0\n        for batch in pretrain_loader:\n            optimizer_pt.zero_grad()\n            z1 = encoder(batch[\"ids1\"], batch[\"len1\"])\n            z2 = encoder(batch[\"ids2\"], batch[\"len2\"])\n            loss = nt_xent_loss(z1, z2)\n            loss.backward()\n            optimizer_pt.step()\n            epoch_loss += loss.item() * batch[\"ids1\"].size(0)\n        epoch_loss /= len(pretrain_loader.dataset)\n        run_dict[\"losses\"][\"pretrain\"].append(epoch_loss)\n        print(f\"  Pretrain epoch {ep}/{pretrain_epochs} loss={epoch_loss:.4f}\")\n\n    # --------------- Fine-tuning ----------------\n    optimizer_ft = torch.optim.Adam(clf_model.parameters(), lr=1e-3)\n    criterion = nn.CrossEntropyLoss()\n    ft_epochs = 3\n    for ep in range(1, ft_epochs + 1):\n        # train\n        clf_model.train()\n        running_loss = 0.0\n        for batch in train_loader:\n            optimizer_ft.zero_grad()\n            logits = clf_model(batch[\"ids\"], batch[\"len\"])\n            loss = criterion(logits, batch[\"label\"])\n            loss.backward()\n            optimizer_ft.step()\n            running_loss += loss.item() * batch[\"ids\"].size(0)\n        train_loss = running_loss / len(train_loader.dataset)\n        run_dict[\"losses\"][\"train\"].append(train_loss)\n        # evaluate\n        clf_model.eval()\n        val_loss = 0.0\n        all_pred = []\n        all_true = []\n        all_seq = []\n        with torch.no_grad():\n            for batch in dev_loader:\n                logits = clf_model(batch[\"ids\"], batch[\"len\"])\n                loss = criterion(logits, batch[\"label\"])\n                val_loss += loss.item() * batch[\"ids\"].size(0)\n                preds = logits.argmax(1).cpu().tolist()\n                all_pred.extend(preds)\n                all_true.extend(batch[\"label\"].cpu().tolist())\n                all_seq.extend(batch[\"sequence\"])\n        val_loss /= len(dev_loader.dataset)\n        run_dict[\"losses\"][\"val\"].append(val_loss)\n        swa = shape_weighted_accuracy(all_seq, all_true, all_pred)\n        cwa = color_weighted_accuracy(all_seq, all_true, all_pred)\n        schm = 2 * swa * cwa / (swa + cwa) if (swa + cwa) > 0 else 0.0\n        run_dict[\"metrics\"][\"SWA\"].append(swa)\n        run_dict[\"metrics\"][\"CWA\"].append(cwa)\n        run_dict[\"metrics\"][\"SCHM\"].append(schm)\n        print(\n            f\"  FT epoch {ep}/{ft_epochs} train_loss={train_loss:.4f} val_loss={val_loss:.4f} | SWA={swa:.3f} CWA={cwa:.3f} SCHM={schm:.3f}\"\n        )\n\n    # store final preds/gt from last epoch\n    run_dict[\"predictions\"] = all_pred\n    run_dict[\"ground_truth\"] = all_true\n    experiment_data[\"pretrain_epochs\"][\"SPR_BENCH\"][str(pretrain_epochs)] = run_dict\n\n    # plot loss curves for this run\n    plt.figure()\n    plt.plot(run_dict[\"losses\"][\"train\"], label=\"train\")\n    plt.plot(run_dict[\"losses\"][\"val\"], label=\"val\")\n    plt.title(f\"FT Loss (pretrain_epochs={pretrain_epochs})\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.legend()\n    plt.savefig(os.path.join(working_dir, f\"loss_curve_ep{pretrain_epochs}.png\"))\n    plt.close()\n\n    # free memory\n    del encoder, clf_model, optimizer_pt, optimizer_ft\n    torch.cuda.empty_cache()\n    gc.collect()\n\n# --------------- Save experiment data ----------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"\\nSaved experiment data and plots to ./working/\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- load data ----------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\nruns_dict = experiment_data.get(\"pretrain_epochs\", {}).get(\"SPR_BENCH\", {})\nrun_keys = sorted(runs_dict.keys(), key=lambda x: int(x))  # e.g. ['2','4','6',...]\n\n\n# Helper to pick colors/linestyles that fit within default palette even for many lines\ndef _style(idx):\n    colors = plt.rcParams[\"axes.prop_cycle\"].by_key()[\"color\"]\n    return colors[idx % len(colors)], \"-\" if idx < len(colors) else \"--\"\n\n\n# ---------- 1. Pre-training loss curves ----------\ntry:\n    plt.figure()\n    for i, k in enumerate(run_keys):\n        losses = runs_dict[k][\"losses\"].get(\"pretrain\", [])\n        c, ls = _style(i)\n        plt.plot(\n            range(1, len(losses) + 1), losses, label=f\"PT={k}\", color=c, linestyle=ls\n        )\n    plt.title(\"SPR_BENCH: Pre-training Loss vs Epochs\")\n    plt.xlabel(\"Pre-training Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_BENCH_pretrain_loss.png\")\n    plt.savefig(fname)\n    print(f\"Saved {fname}\")\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating pre-training loss plot: {e}\")\n    plt.close()\n\n# ---------- 2. Fine-tuning loss curves ----------\ntry:\n    plt.figure()\n    for i, k in enumerate(run_keys):\n        losses_train = runs_dict[k][\"losses\"].get(\"train\", [])\n        losses_val = runs_dict[k][\"losses\"].get(\"val\", [])\n        c, _ = _style(i)\n        plt.plot(\n            range(1, len(losses_train) + 1),\n            losses_train,\n            color=c,\n            linestyle=\"-\",\n            label=f\"Train (PT={k})\",\n        )\n        plt.plot(\n            range(1, len(losses_val) + 1),\n            losses_val,\n            color=c,\n            linestyle=\"--\",\n            label=f\"Val (PT={k})\",\n        )\n    plt.title(\"SPR_BENCH: Fine-tuning Loss (Train vs Val)\")\n    plt.xlabel(\"Fine-tuning Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.legend(ncol=2, fontsize=\"small\")\n    fname = os.path.join(working_dir, \"SPR_BENCH_finetune_loss.png\")\n    plt.savefig(fname)\n    print(f\"Saved {fname}\")\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating fine-tuning loss plot: {e}\")\n    plt.close()\n\n\n# ---------- Metric plotting helper ----------\ndef plot_metric(metric_name, file_suffix):\n    try:\n        plt.figure()\n        for i, k in enumerate(run_keys):\n            vals = runs_dict[k][\"metrics\"].get(metric_name, [])\n            c, ls = _style(i)\n            plt.plot(\n                range(1, len(vals) + 1),\n                vals,\n                label=f\"{metric_name} (PT={k})\",\n                color=c,\n                linestyle=ls,\n            )\n        plt.title(f\"SPR_BENCH: {metric_name} across Fine-tuning Epochs\")\n        plt.xlabel(\"Fine-tuning Epoch\")\n        plt.ylabel(metric_name)\n        plt.legend(fontsize=\"small\")\n        fname = os.path.join(working_dir, f\"SPR_BENCH_{file_suffix}.png\")\n        plt.savefig(fname)\n        print(f\"Saved {fname}\")\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating {metric_name} plot: {e}\")\n        plt.close()\n\n\n# ---------- 3-5. Metric curves ----------\nplot_metric(\"SWA\", \"SWA_curve\")\nplot_metric(\"CWA\", \"CWA_curve\")\nplot_metric(\"SCHM\", \"SCHM_curve\")\n",
+    "plot_plan": "We will first load experiment_data.npy from the working directory and extract the dictionary stored inside. From it we gather the list of runs (different pre-training epoch settings) then, for each run, obtain arrays for pre-training losses, fine-tuning train/validation losses and the three metrics (SWA, CWA, SCHM). We aggregate these so we can overlay several runs on the same figure, keeping the number of plots \u2264 5. In total we will create five figures: (1) pre-training loss curves, (2) fine-tuning train/val loss curves, and (3-5) one figure for each metric across fine-tuning epochs. Every figure is wrapped in its own try-except block, uses a clear title referencing SPR_BENCH, employs descriptive subtitles where helpful, and is saved to working_dir with informative filenames. We respect the requirement to plot only existing data, close every figure in both normal and error cases, and refrain from drawing more than one figure per metric type. Finally, the script prints confirmation statements indicating where each plot was saved.",
+    "plot_analyses": [
+      {
+        "analysis": "This plot shows the fine-tuning loss for both training and validation datasets with 2 pretraining epochs. Both training and validation losses decrease consistently, indicating effective learning. However, the gap between training and validation losses is minimal, suggesting that the model is not overfitting at this stage.",
+        "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/loss_curve_ep2.png"
+      },
+      {
+        "analysis": "This plot shows the fine-tuning loss for both training and validation datasets with 4 pretraining epochs. The losses decrease more rapidly compared to 2 pretraining epochs, and the validation loss closely follows the training loss. This indicates improved generalization and effective pretraining.",
+        "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/loss_curve_ep4.png"
+      },
+      {
+        "analysis": "This plot shows the fine-tuning loss for both training and validation datasets with 6 pretraining epochs. The training and validation losses decrease further, and the validation loss aligns closely with the training loss. This suggests that increasing pretraining epochs enhances the model's ability to generalize.",
+        "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/loss_curve_ep6.png"
+      },
+      {
+        "analysis": "This plot shows the fine-tuning loss for both training and validation datasets with 8 pretraining epochs. The losses are further reduced, and the validation loss continues to align closely with the training loss. This indicates that the model benefits from additional pretraining epochs without overfitting.",
+        "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/loss_curve_ep8.png"
+      },
+      {
+        "analysis": "This plot shows the fine-tuning loss for both training and validation datasets with 10 pretraining epochs. Both losses decrease significantly, and the validation loss is almost identical to the training loss. This suggests that 10 pretraining epochs result in the most effective learning and generalization so far.",
+        "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/loss_curve_ep10.png"
+      },
+      {
+        "analysis": "This plot depicts the pretraining loss across different numbers of pretraining epochs. The loss decreases consistently with increasing pretraining epochs, indicating that the pretraining process effectively optimizes the model parameters. The diminishing returns in loss reduction at higher epochs suggest an optimal range for pretraining epochs.",
+        "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/SPR_BENCH_pretrain_loss.png"
+      },
+      {
+        "analysis": "This plot compares the fine-tuning loss for training and validation datasets across different numbers of pretraining epochs. The losses decrease consistently across all pretraining configurations, with higher pretraining epochs resulting in lower losses. This highlights the positive impact of extensive pretraining on fine-tuning performance.",
+        "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/SPR_BENCH_finetune_loss.png"
+      },
+      {
+        "analysis": "This plot shows the Shape-Weighted Accuracy (SWA) across fine-tuning epochs for different pretraining configurations. Higher pretraining epochs lead to better SWA, with 10 pretraining epochs achieving the highest accuracy. This indicates that extensive pretraining enhances the model's ability to capture shape-related patterns.",
+        "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/SPR_BENCH_SWA_curve.png"
+      },
+      {
+        "analysis": "This plot shows the Color-Weighted Accuracy (CWA) across fine-tuning epochs for different pretraining configurations. Similar to SWA, higher pretraining epochs result in better CWA, with 10 pretraining epochs achieving the best performance. This suggests that the model benefits from extensive pretraining in recognizing color-related patterns.",
+        "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/SPR_BENCH_CWA_curve.png"
+      },
+      {
+        "analysis": "This plot shows the Schema Score (SCHM) across fine-tuning epochs for different pretraining configurations. The trend is consistent with SWA and CWA, where higher pretraining epochs lead to better schema recognition. The results highlight the importance of pretraining in improving the model's schema-related reasoning capabilities.",
+        "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/SPR_BENCH_SCHM_curve.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/loss_curve_ep2.png",
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/loss_curve_ep4.png",
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/loss_curve_ep6.png",
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/loss_curve_ep8.png",
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/loss_curve_ep10.png",
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/SPR_BENCH_pretrain_loss.png",
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/SPR_BENCH_finetune_loss.png",
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/SPR_BENCH_SWA_curve.png",
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/SPR_BENCH_CWA_curve.png",
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/SPR_BENCH_SCHM_curve.png"
+    ],
+    "vlm_feedback_summary": "The provided plots effectively demonstrate the impact of varying pretraining epochs on fine-tuning performance metrics. Increasing the number of pretraining epochs consistently improves the model's ability to generalize and recognize patterns, as evidenced by reduced losses and enhanced accuracy metrics (SWA, CWA, and SCHM). The results validate the hypothesis that extensive pretraining benefits the SPR task.",
+    "exp_results_dir": "experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_479d9bad55604ae6b69aad9d4d40ac72_proc_2989519/experiment_data.npy"
+    ]
+  },
+  "best node with different seeds": [
+    {
+      "overall_plan": "The overall plan initially focused on hyperparameter tuning by evaluating the effect of varying pretrain_epochs (2, 4, 6, 8, 10) on model performance. This involved reinitializing the model components, conducting contrastive pre-training, and fine-tuning while systematically recording performance metrics. The current plan, marked as a 'Seed node,' suggests the establishment of a new baseline or preparation for future research directions, building upon insights from the previous tuning experiments. This step signifies a transition point aimed at consolidating findings and possibly exploring new experimental avenues.",
+      "analysis": "The execution of the training script was successful, and there were no bugs or failures observed. The script ran multiple experiments with different pretraining epochs and fine-tuning phases. The output logs showed consistent improvements in the metrics (Shape-Weighted Accuracy, Color-Weighted Accuracy, and Schema Score) as the training progressed. All data was saved successfully, and the execution completed within the time limit. No issues were detected.",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "pretraining loss",
+              "lower_is_better": true,
+              "description": "The loss value during the pretraining phase.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 4.0056,
+                  "best_value": 4.0056
+                }
+              ]
+            },
+            {
+              "metric_name": "fine-tuning train loss",
+              "lower_is_better": true,
+              "description": "The loss value during the fine-tuning training phase.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.0035,
+                  "best_value": 0.0035
+                }
+              ]
+            },
+            {
+              "metric_name": "validation loss",
+              "lower_is_better": true,
+              "description": "The loss value during the validation phase.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.0045,
+                  "best_value": 0.0045
+                }
+              ]
+            },
+            {
+              "metric_name": "shape-weighted accuracy",
+              "lower_is_better": false,
+              "description": "Accuracy weighted by the shape of the objects in the dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.9987,
+                  "best_value": 0.9987
+                }
+              ]
+            },
+            {
+              "metric_name": "color-weighted accuracy",
+              "lower_is_better": false,
+              "description": "Accuracy weighted by the color of the objects in the dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.9984,
+                  "best_value": 0.9984
+                }
+              ]
+            },
+            {
+              "metric_name": "SCHM score",
+              "lower_is_better": false,
+              "description": "A composite score that measures overall performance.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.9985,
+                  "best_value": 0.9985
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 0\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os, pathlib, random, math, time, json, gc\nimport numpy as np\nimport torch\nfrom torch import nn\nfrom torch.utils.data import Dataset, DataLoader\nfrom torch.nn.utils.rnn import pad_sequence, pack_padded_sequence\nimport matplotlib.pyplot as plt\n\n# ------------------------- I/O -----------------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ------------------------- Device --------------------------\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n# ---------------------- Data loading -----------------------\nfrom datasets import load_dataset, DatasetDict\n\n\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(split_csv: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / split_csv),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for s in [\"train\", \"dev\", \"test\"]:\n        d[s] = _load(f\"{s}.csv\")\n    return d\n\n\ndata_root_candidates = [\n    pathlib.Path(\"SPR_BENCH\"),\n    pathlib.Path(\"./data/SPR_BENCH\"),\n    pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\"),\n]\nspr_bench = None\nfor p in data_root_candidates:\n    if (p / \"train.csv\").exists():\n        spr_bench = load_spr_bench(p)\n        print(f\"Loaded data from {p}\")\n        break\nif spr_bench is None:\n    print(\"SPR_BENCH not found, generating synthetic data.\")\n\n    def synth(n):\n        seqs, labels = [], []\n        shapes, colors = \"ABCD\", \"1234\"\n        for _ in range(n):\n            L = random.randint(4, 9)\n            seq = \" \".join(\n                random.choice(shapes) + random.choice(colors) for _ in range(L)\n            )\n            seqs.append(seq)\n            labels.append(random.randint(0, 1))\n        return {\"id\": list(range(n)), \"sequence\": seqs, \"label\": labels}\n\n    spr_bench = DatasetDict()\n    for split, n in [(\"train\", 500), (\"dev\", 100), (\"test\", 100)]:\n        spr_bench[split] = load_dataset(\n            \"json\", data_files={\"train\": None}, split=\"train\", data=synth(n)\n        )\n\n\ndef tokenize(seq):\n    return seq.strip().split()\n\n\n# ---------------------- Vocabulary -------------------------\nvocab = {\"<PAD>\": 0, \"<MASK>\": 1}\nfor split in spr_bench.values():\n    for seq in split[\"sequence\"]:\n        for tok in tokenize(seq):\n            if tok not in vocab:\n                vocab[tok] = len(vocab)\nvocab_size = len(vocab)\nmask_id = vocab[\"<MASK>\"]\nprint(\"Vocab size:\", vocab_size)\n\n\n# ---------------------- Metrics ----------------------------\ndef count_shape_variety(sequence: str) -> int:\n    return len(set(tok[0] for tok in sequence.strip().split() if tok))\n\n\ndef count_color_variety(sequence: str) -> int:\n    return len(set(tok[1] for tok in sequence.strip().split() if len(tok) > 1))\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    corr = [wi if yt == yp else 0 for wi, yt, yp in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if sum(w) else 0.0\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    corr = [wi if yt == yp else 0 for wi, yt, yp in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if sum(w) else 0.0\n\n\n# --------------------- Datasets ----------------------------\nclass SPRContrastiveDataset(Dataset):\n    def __init__(self, hf_ds):\n        self.seqs = hf_ds[\"sequence\"]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def _augment(self, toks, p=0.15):\n        out = [t for t in toks if random.random() >= p]\n        if not out:\n            out = [random.choice(toks)]\n        return out\n\n    def __getitem__(self, idx):\n        toks = tokenize(self.seqs[idx])\n        return self._augment(toks), self._augment(toks)\n\n\nclass SPRClassifierDataset(Dataset):\n    def __init__(self, hf_ds):\n        self.seqs = hf_ds[\"sequence\"]\n        self.labels = hf_ds[\"label\"]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        return tokenize(self.seqs[idx]), self.labels[idx], self.seqs[idx]\n\n\ndef collate_contrastive(batch):\n    v1, v2 = zip(*batch)\n\n    def encode(tok_list):\n        ids = [\n            torch.tensor([vocab[t] for t in toks], dtype=torch.long)\n            for toks in tok_list\n        ]\n        lens = [len(i) for i in ids]\n        ids = pad_sequence(ids, batch_first=True, padding_value=0)\n        return ids.to(device), torch.tensor(lens, dtype=torch.long).to(device)\n\n    ids1, len1 = encode(v1)\n    ids2, len2 = encode(v2)\n    return {\"ids1\": ids1, \"len1\": len1, \"ids2\": ids2, \"len2\": len2}\n\n\ndef collate_classifier(batch):\n    toks, labels, raw_seq = zip(*batch)\n    ids = [torch.tensor([vocab[t] for t in t], dtype=torch.long) for t in toks]\n    lens = [len(i) for i in ids]\n    ids = pad_sequence(ids, batch_first=True, padding_value=0).to(device)\n    return {\n        \"ids\": ids,\n        \"len\": torch.tensor(lens, dtype=torch.long).to(device),\n        \"label\": torch.tensor(labels, dtype=torch.long).to(device),\n        \"sequence\": raw_seq,\n    }\n\n\n# ---------------------- Model ------------------------------\nclass Encoder(nn.Module):\n    def __init__(self, vocab, emb_dim=64, hidden=128):\n        super().__init__()\n        self.emb = nn.Embedding(len(vocab), emb_dim, padding_idx=0)\n        self.gru = nn.GRU(emb_dim, hidden, batch_first=True, bidirectional=True)\n        self.proj = nn.Linear(hidden * 2, hidden)\n\n    def forward(self, ids, lens):\n        x = self.emb(ids)\n        packed = pack_padded_sequence(\n            x, lens.cpu(), batch_first=True, enforce_sorted=False\n        )\n        _, h = self.gru(packed)\n        h = torch.cat([h[-2], h[-1]], dim=1)\n        return self.proj(h)\n\n\nclass Classifier(nn.Module):\n    def __init__(self, encoder, num_classes):\n        super().__init__()\n        self.encoder = encoder\n        self.head = nn.Linear(encoder.proj.out_features, num_classes)\n\n    def forward(self, ids, lens):\n        return self.head(self.encoder(ids, lens))\n\n\n# ---------------- Contrastive loss -------------------------\ndef nt_xent_loss(z1, z2, temp=0.5):\n    z1 = nn.functional.normalize(z1, dim=1)\n    z2 = nn.functional.normalize(z2, dim=1)\n    N = z1.size(0)\n    z = torch.cat([z1, z2], dim=0)\n    sim = torch.matmul(z, z.T) / temp\n    mask = torch.eye(2 * N, dtype=torch.bool, device=z.device)\n    sim.masked_fill_(mask, -9e15)\n    targets = torch.arange(N, 2 * N, device=z.device)\n    logits_12 = sim[:N, N:]\n    logits_21 = sim[N:, :N]\n    denom_12 = torch.logsumexp(sim[:N], dim=1)\n    denom_21 = torch.logsumexp(sim[N:], dim=1)\n    loss = (-logits_12.diag() + denom_12 + -logits_21.diag() + denom_21).mean() * 0.5\n    return loss\n\n\n# ---------------- Experiment container ---------------------\nexperiment_data = {\"pretrain_epochs\": {\"SPR_BENCH\": {}}}\n\n# ------------- Hyperparameter values to try ----------------\nepoch_settings = [2, 4, 6, 8, 10]\n\nfor pretrain_epochs in epoch_settings:\n    print(f\"\\n=== Running experiment with pretrain_epochs={pretrain_epochs} ===\")\n    run_dict = {\n        \"losses\": {\"pretrain\": [], \"train\": [], \"val\": []},\n        \"metrics\": {\"SWA\": [], \"CWA\": [], \"SCHM\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n\n    # Dataloaders (fresh shuffle each run)\n    pretrain_loader = DataLoader(\n        SPRContrastiveDataset(spr_bench[\"train\"]),\n        batch_size=128,\n        shuffle=True,\n        collate_fn=collate_contrastive,\n    )\n    train_loader = DataLoader(\n        SPRClassifierDataset(spr_bench[\"train\"]),\n        batch_size=128,\n        shuffle=True,\n        collate_fn=collate_classifier,\n    )\n    dev_loader = DataLoader(\n        SPRClassifierDataset(spr_bench[\"dev\"]),\n        batch_size=256,\n        shuffle=False,\n        collate_fn=collate_classifier,\n    )\n\n    # Model instantiation\n    encoder = Encoder(vocab).to(device)\n    clf_model = Classifier(\n        encoder, num_classes=len(set(spr_bench[\"train\"][\"label\"]))\n    ).to(device)\n\n    # -------- Contrastive pre-training ----------\n    optimizer_pt = torch.optim.Adam(encoder.parameters(), lr=1e-3)\n    for ep in range(1, pretrain_epochs + 1):\n        encoder.train()\n        epoch_loss = 0.0\n        for batch in pretrain_loader:\n            optimizer_pt.zero_grad()\n            z1 = encoder(batch[\"ids1\"], batch[\"len1\"])\n            z2 = encoder(batch[\"ids2\"], batch[\"len2\"])\n            loss = nt_xent_loss(z1, z2)\n            loss.backward()\n            optimizer_pt.step()\n            epoch_loss += loss.item() * batch[\"ids1\"].size(0)\n        epoch_loss /= len(pretrain_loader.dataset)\n        run_dict[\"losses\"][\"pretrain\"].append(epoch_loss)\n        print(f\"  Pretrain epoch {ep}/{pretrain_epochs} loss={epoch_loss:.4f}\")\n\n    # --------------- Fine-tuning ----------------\n    optimizer_ft = torch.optim.Adam(clf_model.parameters(), lr=1e-3)\n    criterion = nn.CrossEntropyLoss()\n    ft_epochs = 3\n    for ep in range(1, ft_epochs + 1):\n        # train\n        clf_model.train()\n        running_loss = 0.0\n        for batch in train_loader:\n            optimizer_ft.zero_grad()\n            logits = clf_model(batch[\"ids\"], batch[\"len\"])\n            loss = criterion(logits, batch[\"label\"])\n            loss.backward()\n            optimizer_ft.step()\n            running_loss += loss.item() * batch[\"ids\"].size(0)\n        train_loss = running_loss / len(train_loader.dataset)\n        run_dict[\"losses\"][\"train\"].append(train_loss)\n        # evaluate\n        clf_model.eval()\n        val_loss = 0.0\n        all_pred = []\n        all_true = []\n        all_seq = []\n        with torch.no_grad():\n            for batch in dev_loader:\n                logits = clf_model(batch[\"ids\"], batch[\"len\"])\n                loss = criterion(logits, batch[\"label\"])\n                val_loss += loss.item() * batch[\"ids\"].size(0)\n                preds = logits.argmax(1).cpu().tolist()\n                all_pred.extend(preds)\n                all_true.extend(batch[\"label\"].cpu().tolist())\n                all_seq.extend(batch[\"sequence\"])\n        val_loss /= len(dev_loader.dataset)\n        run_dict[\"losses\"][\"val\"].append(val_loss)\n        swa = shape_weighted_accuracy(all_seq, all_true, all_pred)\n        cwa = color_weighted_accuracy(all_seq, all_true, all_pred)\n        schm = 2 * swa * cwa / (swa + cwa) if (swa + cwa) > 0 else 0.0\n        run_dict[\"metrics\"][\"SWA\"].append(swa)\n        run_dict[\"metrics\"][\"CWA\"].append(cwa)\n        run_dict[\"metrics\"][\"SCHM\"].append(schm)\n        print(\n            f\"  FT epoch {ep}/{ft_epochs} train_loss={train_loss:.4f} val_loss={val_loss:.4f} | SWA={swa:.3f} CWA={cwa:.3f} SCHM={schm:.3f}\"\n        )\n\n    # store final preds/gt from last epoch\n    run_dict[\"predictions\"] = all_pred\n    run_dict[\"ground_truth\"] = all_true\n    experiment_data[\"pretrain_epochs\"][\"SPR_BENCH\"][str(pretrain_epochs)] = run_dict\n\n    # plot loss curves for this run\n    plt.figure()\n    plt.plot(run_dict[\"losses\"][\"train\"], label=\"train\")\n    plt.plot(run_dict[\"losses\"][\"val\"], label=\"val\")\n    plt.title(f\"FT Loss (pretrain_epochs={pretrain_epochs})\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.legend()\n    plt.savefig(os.path.join(working_dir, f\"loss_curve_ep{pretrain_epochs}.png\"))\n    plt.close()\n\n    # free memory\n    del encoder, clf_model, optimizer_pt, optimizer_ft\n    torch.cuda.empty_cache()\n    gc.collect()\n\n# --------------- Save experiment data ----------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"\\nSaved experiment data and plots to ./working/\")\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- load data ----------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\nruns_dict = experiment_data.get(\"pretrain_epochs\", {}).get(\"SPR_BENCH\", {})\nrun_keys = sorted(runs_dict.keys(), key=lambda x: int(x))  # e.g. ['2','4','6',...]\n\n\n# Helper to pick colors/linestyles that fit within default palette even for many lines\ndef _style(idx):\n    colors = plt.rcParams[\"axes.prop_cycle\"].by_key()[\"color\"]\n    return colors[idx % len(colors)], \"-\" if idx < len(colors) else \"--\"\n\n\n# ---------- 1. Pre-training loss curves ----------\ntry:\n    plt.figure()\n    for i, k in enumerate(run_keys):\n        losses = runs_dict[k][\"losses\"].get(\"pretrain\", [])\n        c, ls = _style(i)\n        plt.plot(\n            range(1, len(losses) + 1), losses, label=f\"PT={k}\", color=c, linestyle=ls\n        )\n    plt.title(\"SPR_BENCH: Pre-training Loss vs Epochs\")\n    plt.xlabel(\"Pre-training Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_BENCH_pretrain_loss.png\")\n    plt.savefig(fname)\n    print(f\"Saved {fname}\")\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating pre-training loss plot: {e}\")\n    plt.close()\n\n# ---------- 2. Fine-tuning loss curves ----------\ntry:\n    plt.figure()\n    for i, k in enumerate(run_keys):\n        losses_train = runs_dict[k][\"losses\"].get(\"train\", [])\n        losses_val = runs_dict[k][\"losses\"].get(\"val\", [])\n        c, _ = _style(i)\n        plt.plot(\n            range(1, len(losses_train) + 1),\n            losses_train,\n            color=c,\n            linestyle=\"-\",\n            label=f\"Train (PT={k})\",\n        )\n        plt.plot(\n            range(1, len(losses_val) + 1),\n            losses_val,\n            color=c,\n            linestyle=\"--\",\n            label=f\"Val (PT={k})\",\n        )\n    plt.title(\"SPR_BENCH: Fine-tuning Loss (Train vs Val)\")\n    plt.xlabel(\"Fine-tuning Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.legend(ncol=2, fontsize=\"small\")\n    fname = os.path.join(working_dir, \"SPR_BENCH_finetune_loss.png\")\n    plt.savefig(fname)\n    print(f\"Saved {fname}\")\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating fine-tuning loss plot: {e}\")\n    plt.close()\n\n\n# ---------- Metric plotting helper ----------\ndef plot_metric(metric_name, file_suffix):\n    try:\n        plt.figure()\n        for i, k in enumerate(run_keys):\n            vals = runs_dict[k][\"metrics\"].get(metric_name, [])\n            c, ls = _style(i)\n            plt.plot(\n                range(1, len(vals) + 1),\n                vals,\n                label=f\"{metric_name} (PT={k})\",\n                color=c,\n                linestyle=ls,\n            )\n        plt.title(f\"SPR_BENCH: {metric_name} across Fine-tuning Epochs\")\n        plt.xlabel(\"Fine-tuning Epoch\")\n        plt.ylabel(metric_name)\n        plt.legend(fontsize=\"small\")\n        fname = os.path.join(working_dir, f\"SPR_BENCH_{file_suffix}.png\")\n        plt.savefig(fname)\n        print(f\"Saved {fname}\")\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating {metric_name} plot: {e}\")\n        plt.close()\n\n\n# ---------- 3-5. Metric curves ----------\nplot_metric(\"SWA\", \"SWA_curve\")\nplot_metric(\"CWA\", \"CWA_curve\")\nplot_metric(\"SCHM\", \"SCHM_curve\")\n",
+      "plot_analyses": [
+        {
+          "analysis": "The plot shows the fine-tuning loss for both training and validation datasets over 2 epochs, with pretraining epochs set to 2. The loss decreases consistently for both datasets, indicating effective learning. However, the validation loss is slightly lower than the training loss, which could suggest a well-generalizing model or potential underfitting due to limited training duration.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/loss_curve_ep2.png"
+        },
+        {
+          "analysis": "The plot depicts fine-tuning loss for 2 epochs with pretraining epochs set to 4. Both training and validation losses decrease further compared to the previous case, suggesting that additional pretraining epochs improve the model's initialization and learning capability. The gap between training and validation loss remains minimal, indicating stable generalization.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/loss_curve_ep4.png"
+        },
+        {
+          "analysis": "This plot shows fine-tuning loss for 2 epochs with 6 pretraining epochs. The losses for both training and validation datasets continue to decrease, with a more pronounced reduction in validation loss. This suggests that increased pretraining epochs contribute to better feature extraction and generalization.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/loss_curve_ep6.png"
+        },
+        {
+          "analysis": "The plot illustrates fine-tuning loss for 2 epochs with 8 pretraining epochs. The training and validation losses are the lowest observed so far, with a minimal gap between them. This indicates that the model benefits significantly from extended pretraining, resulting in improved generalization and convergence.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/loss_curve_ep8.png"
+        },
+        {
+          "analysis": "The plot demonstrates fine-tuning loss for 2 epochs with 10 pretraining epochs. The losses for both datasets reach their lowest values, with a negligible gap between training and validation loss. This suggests optimal learning and generalization, with diminishing returns from additional pretraining epochs.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/loss_curve_ep10.png"
+        },
+        {
+          "analysis": "This plot shows the pretraining loss across different pretraining epochs (2, 4, 6, 8, and 10). The loss decreases consistently as the number of pretraining epochs increases, with diminishing returns observed after 6 epochs. This suggests that while pretraining improves feature extraction, its benefits plateau with excessive epochs.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/SPR_BENCH_pretrain_loss.png"
+        },
+        {
+          "analysis": "The plot compares fine-tuning loss for training and validation datasets across different pretraining epochs. Loss decreases consistently with fine-tuning epochs, and models pretrained for longer epochs exhibit lower loss values. This highlights the advantage of extended pretraining for improved fine-tuning performance.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/SPR_BENCH_finetune_loss.png"
+        },
+        {
+          "analysis": "The plot depicts Shape-Weighted Accuracy across fine-tuning epochs for models pretrained for different epochs. Accuracy increases with fine-tuning epochs, with higher pretraining epochs resulting in better performance. This shows that extended pretraining improves the model's ability to capture shape-related features.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/SPR_BENCH_SWA_curve.png"
+        },
+        {
+          "analysis": "This plot shows Color-Weighted Accuracy across fine-tuning epochs for various pretraining epochs. Accuracy improves with fine-tuning epochs, and models with more pretraining epochs achieve higher accuracy. This indicates that extended pretraining enhances the model's ability to capture color-related features.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/SPR_BENCH_CWA_curve.png"
+        },
+        {
+          "analysis": "The plot illustrates Schema Score across fine-tuning epochs for different pretraining epochs. The scores increase with fine-tuning, with models pretrained for more epochs achieving higher scores. This demonstrates that extended pretraining improves the model's ability to understand and generalize schema patterns.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/SPR_BENCH_SCHM_curve.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/loss_curve_ep2.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/loss_curve_ep4.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/loss_curve_ep6.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/loss_curve_ep8.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/loss_curve_ep10.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/SPR_BENCH_pretrain_loss.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/SPR_BENCH_finetune_loss.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/SPR_BENCH_SWA_curve.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/SPR_BENCH_CWA_curve.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/SPR_BENCH_SCHM_curve.png"
+      ],
+      "vlm_feedback_summary": "The plots collectively demonstrate that extended pretraining epochs lead to better feature extraction and generalization, as evidenced by lower training and validation losses, and higher accuracy metrics (SWA, CWA, and SCHM). Fine-tuning performance improves consistently with increased pretraining, though benefits plateau after a certain point (around 6-8 epochs). This indicates that pretraining plays a crucial role in initializing the model effectively for the SPR task.",
+      "exp_results_dir": "experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/experiment_data.npy"
+      ]
+    },
+    {
+      "overall_plan": "The experiment's primary focus is on hyperparameter tuning of pretraining epochs, with the goal of assessing its impact on model performance. This involves reinitializing the encoder and classifier, executing contrastive pre-training for varying epochs (2, 4, 6, 8, 10), and fine-tuning for three epochs. All relevant metrics and losses are systematically recorded and visualized. The current plan as a 'Seed node' suggests the establishment of a foundational framework for further experimentation, indicating readiness for future expansions or iterations based on the findings related to pretraining epochs.",
+      "analysis": "The execution completed successfully without any bugs. The code ran multiple experiments with varying pretraining epochs (2, 4, 6, 8, 10) and logged the results, including losses and evaluation metrics (SWA, CWA, SCHM). The results showed consistent improvements in metrics as epochs increased, with the highest performance achieved at pretraining epochs 6 and above. The experiment data and plots were saved successfully. No issues or errors were observed.",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "pretraining loss",
+              "lower_is_better": true,
+              "description": "The loss value during the pretraining phase.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 4.0028,
+                  "best_value": 4.0028
+                }
+              ]
+            },
+            {
+              "metric_name": "fine-tuning train loss",
+              "lower_is_better": true,
+              "description": "The loss value during the fine-tuning training phase.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.0045,
+                  "best_value": 0.0045
+                }
+              ]
+            },
+            {
+              "metric_name": "validation loss",
+              "lower_is_better": true,
+              "description": "The loss value during the validation phase.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.0058,
+                  "best_value": 0.0055
+                }
+              ]
+            },
+            {
+              "metric_name": "shape-weighted accuracy",
+              "lower_is_better": false,
+              "description": "The accuracy weighted by shape.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.998,
+                  "best_value": 0.998
+                }
+              ]
+            },
+            {
+              "metric_name": "color-weighted accuracy",
+              "lower_is_better": false,
+              "description": "The accuracy weighted by color.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.998,
+                  "best_value": 0.998
+                }
+              ]
+            },
+            {
+              "metric_name": "SCHM score",
+              "lower_is_better": false,
+              "description": "The SCHM score achieved.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.998,
+                  "best_value": 0.998
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 1\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os, pathlib, random, math, time, json, gc\nimport numpy as np\nimport torch\nfrom torch import nn\nfrom torch.utils.data import Dataset, DataLoader\nfrom torch.nn.utils.rnn import pad_sequence, pack_padded_sequence\nimport matplotlib.pyplot as plt\n\n# ------------------------- I/O -----------------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ------------------------- Device --------------------------\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n# ---------------------- Data loading -----------------------\nfrom datasets import load_dataset, DatasetDict\n\n\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(split_csv: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / split_csv),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for s in [\"train\", \"dev\", \"test\"]:\n        d[s] = _load(f\"{s}.csv\")\n    return d\n\n\ndata_root_candidates = [\n    pathlib.Path(\"SPR_BENCH\"),\n    pathlib.Path(\"./data/SPR_BENCH\"),\n    pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\"),\n]\nspr_bench = None\nfor p in data_root_candidates:\n    if (p / \"train.csv\").exists():\n        spr_bench = load_spr_bench(p)\n        print(f\"Loaded data from {p}\")\n        break\nif spr_bench is None:\n    print(\"SPR_BENCH not found, generating synthetic data.\")\n\n    def synth(n):\n        seqs, labels = [], []\n        shapes, colors = \"ABCD\", \"1234\"\n        for _ in range(n):\n            L = random.randint(4, 9)\n            seq = \" \".join(\n                random.choice(shapes) + random.choice(colors) for _ in range(L)\n            )\n            seqs.append(seq)\n            labels.append(random.randint(0, 1))\n        return {\"id\": list(range(n)), \"sequence\": seqs, \"label\": labels}\n\n    spr_bench = DatasetDict()\n    for split, n in [(\"train\", 500), (\"dev\", 100), (\"test\", 100)]:\n        spr_bench[split] = load_dataset(\n            \"json\", data_files={\"train\": None}, split=\"train\", data=synth(n)\n        )\n\n\ndef tokenize(seq):\n    return seq.strip().split()\n\n\n# ---------------------- Vocabulary -------------------------\nvocab = {\"<PAD>\": 0, \"<MASK>\": 1}\nfor split in spr_bench.values():\n    for seq in split[\"sequence\"]:\n        for tok in tokenize(seq):\n            if tok not in vocab:\n                vocab[tok] = len(vocab)\nvocab_size = len(vocab)\nmask_id = vocab[\"<MASK>\"]\nprint(\"Vocab size:\", vocab_size)\n\n\n# ---------------------- Metrics ----------------------------\ndef count_shape_variety(sequence: str) -> int:\n    return len(set(tok[0] for tok in sequence.strip().split() if tok))\n\n\ndef count_color_variety(sequence: str) -> int:\n    return len(set(tok[1] for tok in sequence.strip().split() if len(tok) > 1))\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    corr = [wi if yt == yp else 0 for wi, yt, yp in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if sum(w) else 0.0\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    corr = [wi if yt == yp else 0 for wi, yt, yp in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if sum(w) else 0.0\n\n\n# --------------------- Datasets ----------------------------\nclass SPRContrastiveDataset(Dataset):\n    def __init__(self, hf_ds):\n        self.seqs = hf_ds[\"sequence\"]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def _augment(self, toks, p=0.15):\n        out = [t for t in toks if random.random() >= p]\n        if not out:\n            out = [random.choice(toks)]\n        return out\n\n    def __getitem__(self, idx):\n        toks = tokenize(self.seqs[idx])\n        return self._augment(toks), self._augment(toks)\n\n\nclass SPRClassifierDataset(Dataset):\n    def __init__(self, hf_ds):\n        self.seqs = hf_ds[\"sequence\"]\n        self.labels = hf_ds[\"label\"]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        return tokenize(self.seqs[idx]), self.labels[idx], self.seqs[idx]\n\n\ndef collate_contrastive(batch):\n    v1, v2 = zip(*batch)\n\n    def encode(tok_list):\n        ids = [\n            torch.tensor([vocab[t] for t in toks], dtype=torch.long)\n            for toks in tok_list\n        ]\n        lens = [len(i) for i in ids]\n        ids = pad_sequence(ids, batch_first=True, padding_value=0)\n        return ids.to(device), torch.tensor(lens, dtype=torch.long).to(device)\n\n    ids1, len1 = encode(v1)\n    ids2, len2 = encode(v2)\n    return {\"ids1\": ids1, \"len1\": len1, \"ids2\": ids2, \"len2\": len2}\n\n\ndef collate_classifier(batch):\n    toks, labels, raw_seq = zip(*batch)\n    ids = [torch.tensor([vocab[t] for t in t], dtype=torch.long) for t in toks]\n    lens = [len(i) for i in ids]\n    ids = pad_sequence(ids, batch_first=True, padding_value=0).to(device)\n    return {\n        \"ids\": ids,\n        \"len\": torch.tensor(lens, dtype=torch.long).to(device),\n        \"label\": torch.tensor(labels, dtype=torch.long).to(device),\n        \"sequence\": raw_seq,\n    }\n\n\n# ---------------------- Model ------------------------------\nclass Encoder(nn.Module):\n    def __init__(self, vocab, emb_dim=64, hidden=128):\n        super().__init__()\n        self.emb = nn.Embedding(len(vocab), emb_dim, padding_idx=0)\n        self.gru = nn.GRU(emb_dim, hidden, batch_first=True, bidirectional=True)\n        self.proj = nn.Linear(hidden * 2, hidden)\n\n    def forward(self, ids, lens):\n        x = self.emb(ids)\n        packed = pack_padded_sequence(\n            x, lens.cpu(), batch_first=True, enforce_sorted=False\n        )\n        _, h = self.gru(packed)\n        h = torch.cat([h[-2], h[-1]], dim=1)\n        return self.proj(h)\n\n\nclass Classifier(nn.Module):\n    def __init__(self, encoder, num_classes):\n        super().__init__()\n        self.encoder = encoder\n        self.head = nn.Linear(encoder.proj.out_features, num_classes)\n\n    def forward(self, ids, lens):\n        return self.head(self.encoder(ids, lens))\n\n\n# ---------------- Contrastive loss -------------------------\ndef nt_xent_loss(z1, z2, temp=0.5):\n    z1 = nn.functional.normalize(z1, dim=1)\n    z2 = nn.functional.normalize(z2, dim=1)\n    N = z1.size(0)\n    z = torch.cat([z1, z2], dim=0)\n    sim = torch.matmul(z, z.T) / temp\n    mask = torch.eye(2 * N, dtype=torch.bool, device=z.device)\n    sim.masked_fill_(mask, -9e15)\n    targets = torch.arange(N, 2 * N, device=z.device)\n    logits_12 = sim[:N, N:]\n    logits_21 = sim[N:, :N]\n    denom_12 = torch.logsumexp(sim[:N], dim=1)\n    denom_21 = torch.logsumexp(sim[N:], dim=1)\n    loss = (-logits_12.diag() + denom_12 + -logits_21.diag() + denom_21).mean() * 0.5\n    return loss\n\n\n# ---------------- Experiment container ---------------------\nexperiment_data = {\"pretrain_epochs\": {\"SPR_BENCH\": {}}}\n\n# ------------- Hyperparameter values to try ----------------\nepoch_settings = [2, 4, 6, 8, 10]\n\nfor pretrain_epochs in epoch_settings:\n    print(f\"\\n=== Running experiment with pretrain_epochs={pretrain_epochs} ===\")\n    run_dict = {\n        \"losses\": {\"pretrain\": [], \"train\": [], \"val\": []},\n        \"metrics\": {\"SWA\": [], \"CWA\": [], \"SCHM\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n\n    # Dataloaders (fresh shuffle each run)\n    pretrain_loader = DataLoader(\n        SPRContrastiveDataset(spr_bench[\"train\"]),\n        batch_size=128,\n        shuffle=True,\n        collate_fn=collate_contrastive,\n    )\n    train_loader = DataLoader(\n        SPRClassifierDataset(spr_bench[\"train\"]),\n        batch_size=128,\n        shuffle=True,\n        collate_fn=collate_classifier,\n    )\n    dev_loader = DataLoader(\n        SPRClassifierDataset(spr_bench[\"dev\"]),\n        batch_size=256,\n        shuffle=False,\n        collate_fn=collate_classifier,\n    )\n\n    # Model instantiation\n    encoder = Encoder(vocab).to(device)\n    clf_model = Classifier(\n        encoder, num_classes=len(set(spr_bench[\"train\"][\"label\"]))\n    ).to(device)\n\n    # -------- Contrastive pre-training ----------\n    optimizer_pt = torch.optim.Adam(encoder.parameters(), lr=1e-3)\n    for ep in range(1, pretrain_epochs + 1):\n        encoder.train()\n        epoch_loss = 0.0\n        for batch in pretrain_loader:\n            optimizer_pt.zero_grad()\n            z1 = encoder(batch[\"ids1\"], batch[\"len1\"])\n            z2 = encoder(batch[\"ids2\"], batch[\"len2\"])\n            loss = nt_xent_loss(z1, z2)\n            loss.backward()\n            optimizer_pt.step()\n            epoch_loss += loss.item() * batch[\"ids1\"].size(0)\n        epoch_loss /= len(pretrain_loader.dataset)\n        run_dict[\"losses\"][\"pretrain\"].append(epoch_loss)\n        print(f\"  Pretrain epoch {ep}/{pretrain_epochs} loss={epoch_loss:.4f}\")\n\n    # --------------- Fine-tuning ----------------\n    optimizer_ft = torch.optim.Adam(clf_model.parameters(), lr=1e-3)\n    criterion = nn.CrossEntropyLoss()\n    ft_epochs = 3\n    for ep in range(1, ft_epochs + 1):\n        # train\n        clf_model.train()\n        running_loss = 0.0\n        for batch in train_loader:\n            optimizer_ft.zero_grad()\n            logits = clf_model(batch[\"ids\"], batch[\"len\"])\n            loss = criterion(logits, batch[\"label\"])\n            loss.backward()\n            optimizer_ft.step()\n            running_loss += loss.item() * batch[\"ids\"].size(0)\n        train_loss = running_loss / len(train_loader.dataset)\n        run_dict[\"losses\"][\"train\"].append(train_loss)\n        # evaluate\n        clf_model.eval()\n        val_loss = 0.0\n        all_pred = []\n        all_true = []\n        all_seq = []\n        with torch.no_grad():\n            for batch in dev_loader:\n                logits = clf_model(batch[\"ids\"], batch[\"len\"])\n                loss = criterion(logits, batch[\"label\"])\n                val_loss += loss.item() * batch[\"ids\"].size(0)\n                preds = logits.argmax(1).cpu().tolist()\n                all_pred.extend(preds)\n                all_true.extend(batch[\"label\"].cpu().tolist())\n                all_seq.extend(batch[\"sequence\"])\n        val_loss /= len(dev_loader.dataset)\n        run_dict[\"losses\"][\"val\"].append(val_loss)\n        swa = shape_weighted_accuracy(all_seq, all_true, all_pred)\n        cwa = color_weighted_accuracy(all_seq, all_true, all_pred)\n        schm = 2 * swa * cwa / (swa + cwa) if (swa + cwa) > 0 else 0.0\n        run_dict[\"metrics\"][\"SWA\"].append(swa)\n        run_dict[\"metrics\"][\"CWA\"].append(cwa)\n        run_dict[\"metrics\"][\"SCHM\"].append(schm)\n        print(\n            f\"  FT epoch {ep}/{ft_epochs} train_loss={train_loss:.4f} val_loss={val_loss:.4f} | SWA={swa:.3f} CWA={cwa:.3f} SCHM={schm:.3f}\"\n        )\n\n    # store final preds/gt from last epoch\n    run_dict[\"predictions\"] = all_pred\n    run_dict[\"ground_truth\"] = all_true\n    experiment_data[\"pretrain_epochs\"][\"SPR_BENCH\"][str(pretrain_epochs)] = run_dict\n\n    # plot loss curves for this run\n    plt.figure()\n    plt.plot(run_dict[\"losses\"][\"train\"], label=\"train\")\n    plt.plot(run_dict[\"losses\"][\"val\"], label=\"val\")\n    plt.title(f\"FT Loss (pretrain_epochs={pretrain_epochs})\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.legend()\n    plt.savefig(os.path.join(working_dir, f\"loss_curve_ep{pretrain_epochs}.png\"))\n    plt.close()\n\n    # free memory\n    del encoder, clf_model, optimizer_pt, optimizer_ft\n    torch.cuda.empty_cache()\n    gc.collect()\n\n# --------------- Save experiment data ----------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"\\nSaved experiment data and plots to ./working/\")\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- load data ----------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\nruns_dict = experiment_data.get(\"pretrain_epochs\", {}).get(\"SPR_BENCH\", {})\nrun_keys = sorted(runs_dict.keys(), key=lambda x: int(x))  # e.g. ['2','4','6',...]\n\n\n# Helper to pick colors/linestyles that fit within default palette even for many lines\ndef _style(idx):\n    colors = plt.rcParams[\"axes.prop_cycle\"].by_key()[\"color\"]\n    return colors[idx % len(colors)], \"-\" if idx < len(colors) else \"--\"\n\n\n# ---------- 1. Pre-training loss curves ----------\ntry:\n    plt.figure()\n    for i, k in enumerate(run_keys):\n        losses = runs_dict[k][\"losses\"].get(\"pretrain\", [])\n        c, ls = _style(i)\n        plt.plot(\n            range(1, len(losses) + 1), losses, label=f\"PT={k}\", color=c, linestyle=ls\n        )\n    plt.title(\"SPR_BENCH: Pre-training Loss vs Epochs\")\n    plt.xlabel(\"Pre-training Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_BENCH_pretrain_loss.png\")\n    plt.savefig(fname)\n    print(f\"Saved {fname}\")\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating pre-training loss plot: {e}\")\n    plt.close()\n\n# ---------- 2. Fine-tuning loss curves ----------\ntry:\n    plt.figure()\n    for i, k in enumerate(run_keys):\n        losses_train = runs_dict[k][\"losses\"].get(\"train\", [])\n        losses_val = runs_dict[k][\"losses\"].get(\"val\", [])\n        c, _ = _style(i)\n        plt.plot(\n            range(1, len(losses_train) + 1),\n            losses_train,\n            color=c,\n            linestyle=\"-\",\n            label=f\"Train (PT={k})\",\n        )\n        plt.plot(\n            range(1, len(losses_val) + 1),\n            losses_val,\n            color=c,\n            linestyle=\"--\",\n            label=f\"Val (PT={k})\",\n        )\n    plt.title(\"SPR_BENCH: Fine-tuning Loss (Train vs Val)\")\n    plt.xlabel(\"Fine-tuning Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.legend(ncol=2, fontsize=\"small\")\n    fname = os.path.join(working_dir, \"SPR_BENCH_finetune_loss.png\")\n    plt.savefig(fname)\n    print(f\"Saved {fname}\")\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating fine-tuning loss plot: {e}\")\n    plt.close()\n\n\n# ---------- Metric plotting helper ----------\ndef plot_metric(metric_name, file_suffix):\n    try:\n        plt.figure()\n        for i, k in enumerate(run_keys):\n            vals = runs_dict[k][\"metrics\"].get(metric_name, [])\n            c, ls = _style(i)\n            plt.plot(\n                range(1, len(vals) + 1),\n                vals,\n                label=f\"{metric_name} (PT={k})\",\n                color=c,\n                linestyle=ls,\n            )\n        plt.title(f\"SPR_BENCH: {metric_name} across Fine-tuning Epochs\")\n        plt.xlabel(\"Fine-tuning Epoch\")\n        plt.ylabel(metric_name)\n        plt.legend(fontsize=\"small\")\n        fname = os.path.join(working_dir, f\"SPR_BENCH_{file_suffix}.png\")\n        plt.savefig(fname)\n        print(f\"Saved {fname}\")\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating {metric_name} plot: {e}\")\n        plt.close()\n\n\n# ---------- 3-5. Metric curves ----------\nplot_metric(\"SWA\", \"SWA_curve\")\nplot_metric(\"CWA\", \"CWA_curve\")\nplot_metric(\"SCHM\", \"SCHM_curve\")\n",
+      "plot_analyses": [
+        {
+          "analysis": "This plot illustrates the fine-tuning loss for both training and validation sets with pretraining epochs set to 2. The validation loss decreases consistently and converges well with the training loss, suggesting that the model generalizes well. However, the gap between training and validation loss indicates potential for further optimization.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/loss_curve_ep2.png"
+        },
+        {
+          "analysis": "This plot shows the fine-tuning loss for pretraining epochs set to 4. The validation loss decreases more rapidly and converges closely with the training loss compared to the previous configuration, indicating improved generalization and better utilization of the pretrained weights.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/loss_curve_ep4.png"
+        },
+        {
+          "analysis": "Here, the fine-tuning loss for pretraining epochs set to 6 is presented. The validation loss aligns even more closely with the training loss, suggesting that the additional pretraining epochs contribute positively to the model's ability to generalize.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/loss_curve_ep6.png"
+        },
+        {
+          "analysis": "This plot depicts the fine-tuning loss for pretraining epochs set to 8. The validation loss continues to decrease and converge with the training loss, but the improvement over the 6-epoch configuration is less pronounced, indicating diminishing returns from additional pretraining epochs.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/loss_curve_ep8.png"
+        },
+        {
+          "analysis": "This plot represents the fine-tuning loss for pretraining epochs set to 10. The validation loss shows marginal improvement over the 8-epoch configuration, confirming that further pretraining beyond this point yields minimal gains in generalization.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/loss_curve_ep10.png"
+        },
+        {
+          "analysis": "This plot compares the pretraining loss across different numbers of pretraining epochs. The loss decreases consistently across all configurations, with diminishing returns observed after 6 epochs. This suggests that 6-8 pretraining epochs may be optimal for balancing computational cost and performance.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/SPR_BENCH_pretrain_loss.png"
+        },
+        {
+          "analysis": "This plot compares fine-tuning losses for training and validation sets across different pretraining epochs. Configurations with higher pretraining epochs (6, 8, 10) show better convergence and alignment between training and validation losses, indicating improved generalization.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/SPR_BENCH_finetune_loss.png"
+        },
+        {
+          "analysis": "This plot shows Shape-Weighted Accuracy (SWA) across fine-tuning epochs for different pretraining configurations. Higher pretraining epochs (8 and 10) result in slightly better SWA, but the gains plateau after 6 epochs, suggesting diminishing returns.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/SPR_BENCH_SWA_curve.png"
+        },
+        {
+          "analysis": "This plot displays Color-Weighted Accuracy (CWA) across fine-tuning epochs for different pretraining configurations. Similar to SWA, configurations with higher pretraining epochs (8 and 10) achieve marginally better CWA, but the improvement levels off after 6 epochs.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/SPR_BENCH_CWA_curve.png"
+        },
+        {
+          "analysis": "This plot illustrates Schema Score (SCHM) across fine-tuning epochs for different pretraining configurations. Higher pretraining epochs (8 and 10) yield slightly better SCHM, but the improvement diminishes after 6 epochs, aligning with trends observed in SWA and CWA.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/SPR_BENCH_SCHM_curve.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/loss_curve_ep2.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/loss_curve_ep4.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/loss_curve_ep6.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/loss_curve_ep8.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/loss_curve_ep10.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/SPR_BENCH_pretrain_loss.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/SPR_BENCH_finetune_loss.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/SPR_BENCH_SWA_curve.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/SPR_BENCH_CWA_curve.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/SPR_BENCH_SCHM_curve.png"
+      ],
+      "vlm_feedback_summary": "The plots provide clear insights into the impact of varying pretraining epochs on fine-tuning loss, validation loss, and key metrics (SWA, CWA, SCHM). Configurations with 6-8 pretraining epochs appear to be optimal, as they balance computational cost with performance improvements. Beyond 8 epochs, the gains are negligible, indicating diminishing returns.",
+      "exp_results_dir": "experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/experiment_data.npy"
+      ]
+    },
+    {
+      "overall_plan": "The research plan initially focused on hyperparameter tuning by varying the number of pre-training epochs (2, 4, 6, 8, 10) to evaluate its impact on model performance. This involved re-initializing the encoder/classifier, conducting contrastive pre-training, and fine-tuning, with results systematically documented and visualized. The introduction of a 'Seed node' in the current plan indicates a potential new direction or foundational setup for future experiments, leveraging the insights gained from the previous comprehensive evaluations.",
+      "analysis": "",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "Pretraining Loss",
+              "lower_is_better": true,
+              "description": "The loss obtained during pretraining of the model.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 4.0082,
+                  "best_value": 4.0075
+                }
+              ]
+            },
+            {
+              "metric_name": "Fine-tuning Train Loss",
+              "lower_is_better": true,
+              "description": "The loss obtained during fine-tuning on the training dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.0032,
+                  "best_value": 0.0032
+                }
+              ]
+            },
+            {
+              "metric_name": "Validation Loss",
+              "lower_is_better": true,
+              "description": "The loss on the validation dataset during fine-tuning.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.0048,
+                  "best_value": 0.0037
+                }
+              ]
+            },
+            {
+              "metric_name": "Shape-weighted Accuracy",
+              "lower_is_better": false,
+              "description": "The accuracy weighted by shape-related factors.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.9991,
+                  "best_value": 0.9991
+                }
+              ]
+            },
+            {
+              "metric_name": "Color-weighted Accuracy",
+              "lower_is_better": false,
+              "description": "The accuracy weighted by color-related factors.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.9991,
+                  "best_value": 0.9991
+                }
+              ]
+            },
+            {
+              "metric_name": "SCHM Score",
+              "lower_is_better": false,
+              "description": "A combined score evaluating the model's performance.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.9991,
+                  "best_value": 0.9991
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 2\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os, pathlib, random, math, time, json, gc\nimport numpy as np\nimport torch\nfrom torch import nn\nfrom torch.utils.data import Dataset, DataLoader\nfrom torch.nn.utils.rnn import pad_sequence, pack_padded_sequence\nimport matplotlib.pyplot as plt\n\n# ------------------------- I/O -----------------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ------------------------- Device --------------------------\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n# ---------------------- Data loading -----------------------\nfrom datasets import load_dataset, DatasetDict\n\n\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(split_csv: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / split_csv),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for s in [\"train\", \"dev\", \"test\"]:\n        d[s] = _load(f\"{s}.csv\")\n    return d\n\n\ndata_root_candidates = [\n    pathlib.Path(\"SPR_BENCH\"),\n    pathlib.Path(\"./data/SPR_BENCH\"),\n    pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\"),\n]\nspr_bench = None\nfor p in data_root_candidates:\n    if (p / \"train.csv\").exists():\n        spr_bench = load_spr_bench(p)\n        print(f\"Loaded data from {p}\")\n        break\nif spr_bench is None:\n    print(\"SPR_BENCH not found, generating synthetic data.\")\n\n    def synth(n):\n        seqs, labels = [], []\n        shapes, colors = \"ABCD\", \"1234\"\n        for _ in range(n):\n            L = random.randint(4, 9)\n            seq = \" \".join(\n                random.choice(shapes) + random.choice(colors) for _ in range(L)\n            )\n            seqs.append(seq)\n            labels.append(random.randint(0, 1))\n        return {\"id\": list(range(n)), \"sequence\": seqs, \"label\": labels}\n\n    spr_bench = DatasetDict()\n    for split, n in [(\"train\", 500), (\"dev\", 100), (\"test\", 100)]:\n        spr_bench[split] = load_dataset(\n            \"json\", data_files={\"train\": None}, split=\"train\", data=synth(n)\n        )\n\n\ndef tokenize(seq):\n    return seq.strip().split()\n\n\n# ---------------------- Vocabulary -------------------------\nvocab = {\"<PAD>\": 0, \"<MASK>\": 1}\nfor split in spr_bench.values():\n    for seq in split[\"sequence\"]:\n        for tok in tokenize(seq):\n            if tok not in vocab:\n                vocab[tok] = len(vocab)\nvocab_size = len(vocab)\nmask_id = vocab[\"<MASK>\"]\nprint(\"Vocab size:\", vocab_size)\n\n\n# ---------------------- Metrics ----------------------------\ndef count_shape_variety(sequence: str) -> int:\n    return len(set(tok[0] for tok in sequence.strip().split() if tok))\n\n\ndef count_color_variety(sequence: str) -> int:\n    return len(set(tok[1] for tok in sequence.strip().split() if len(tok) > 1))\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    corr = [wi if yt == yp else 0 for wi, yt, yp in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if sum(w) else 0.0\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    corr = [wi if yt == yp else 0 for wi, yt, yp in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if sum(w) else 0.0\n\n\n# --------------------- Datasets ----------------------------\nclass SPRContrastiveDataset(Dataset):\n    def __init__(self, hf_ds):\n        self.seqs = hf_ds[\"sequence\"]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def _augment(self, toks, p=0.15):\n        out = [t for t in toks if random.random() >= p]\n        if not out:\n            out = [random.choice(toks)]\n        return out\n\n    def __getitem__(self, idx):\n        toks = tokenize(self.seqs[idx])\n        return self._augment(toks), self._augment(toks)\n\n\nclass SPRClassifierDataset(Dataset):\n    def __init__(self, hf_ds):\n        self.seqs = hf_ds[\"sequence\"]\n        self.labels = hf_ds[\"label\"]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        return tokenize(self.seqs[idx]), self.labels[idx], self.seqs[idx]\n\n\ndef collate_contrastive(batch):\n    v1, v2 = zip(*batch)\n\n    def encode(tok_list):\n        ids = [\n            torch.tensor([vocab[t] for t in toks], dtype=torch.long)\n            for toks in tok_list\n        ]\n        lens = [len(i) for i in ids]\n        ids = pad_sequence(ids, batch_first=True, padding_value=0)\n        return ids.to(device), torch.tensor(lens, dtype=torch.long).to(device)\n\n    ids1, len1 = encode(v1)\n    ids2, len2 = encode(v2)\n    return {\"ids1\": ids1, \"len1\": len1, \"ids2\": ids2, \"len2\": len2}\n\n\ndef collate_classifier(batch):\n    toks, labels, raw_seq = zip(*batch)\n    ids = [torch.tensor([vocab[t] for t in t], dtype=torch.long) for t in toks]\n    lens = [len(i) for i in ids]\n    ids = pad_sequence(ids, batch_first=True, padding_value=0).to(device)\n    return {\n        \"ids\": ids,\n        \"len\": torch.tensor(lens, dtype=torch.long).to(device),\n        \"label\": torch.tensor(labels, dtype=torch.long).to(device),\n        \"sequence\": raw_seq,\n    }\n\n\n# ---------------------- Model ------------------------------\nclass Encoder(nn.Module):\n    def __init__(self, vocab, emb_dim=64, hidden=128):\n        super().__init__()\n        self.emb = nn.Embedding(len(vocab), emb_dim, padding_idx=0)\n        self.gru = nn.GRU(emb_dim, hidden, batch_first=True, bidirectional=True)\n        self.proj = nn.Linear(hidden * 2, hidden)\n\n    def forward(self, ids, lens):\n        x = self.emb(ids)\n        packed = pack_padded_sequence(\n            x, lens.cpu(), batch_first=True, enforce_sorted=False\n        )\n        _, h = self.gru(packed)\n        h = torch.cat([h[-2], h[-1]], dim=1)\n        return self.proj(h)\n\n\nclass Classifier(nn.Module):\n    def __init__(self, encoder, num_classes):\n        super().__init__()\n        self.encoder = encoder\n        self.head = nn.Linear(encoder.proj.out_features, num_classes)\n\n    def forward(self, ids, lens):\n        return self.head(self.encoder(ids, lens))\n\n\n# ---------------- Contrastive loss -------------------------\ndef nt_xent_loss(z1, z2, temp=0.5):\n    z1 = nn.functional.normalize(z1, dim=1)\n    z2 = nn.functional.normalize(z2, dim=1)\n    N = z1.size(0)\n    z = torch.cat([z1, z2], dim=0)\n    sim = torch.matmul(z, z.T) / temp\n    mask = torch.eye(2 * N, dtype=torch.bool, device=z.device)\n    sim.masked_fill_(mask, -9e15)\n    targets = torch.arange(N, 2 * N, device=z.device)\n    logits_12 = sim[:N, N:]\n    logits_21 = sim[N:, :N]\n    denom_12 = torch.logsumexp(sim[:N], dim=1)\n    denom_21 = torch.logsumexp(sim[N:], dim=1)\n    loss = (-logits_12.diag() + denom_12 + -logits_21.diag() + denom_21).mean() * 0.5\n    return loss\n\n\n# ---------------- Experiment container ---------------------\nexperiment_data = {\"pretrain_epochs\": {\"SPR_BENCH\": {}}}\n\n# ------------- Hyperparameter values to try ----------------\nepoch_settings = [2, 4, 6, 8, 10]\n\nfor pretrain_epochs in epoch_settings:\n    print(f\"\\n=== Running experiment with pretrain_epochs={pretrain_epochs} ===\")\n    run_dict = {\n        \"losses\": {\"pretrain\": [], \"train\": [], \"val\": []},\n        \"metrics\": {\"SWA\": [], \"CWA\": [], \"SCHM\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n\n    # Dataloaders (fresh shuffle each run)\n    pretrain_loader = DataLoader(\n        SPRContrastiveDataset(spr_bench[\"train\"]),\n        batch_size=128,\n        shuffle=True,\n        collate_fn=collate_contrastive,\n    )\n    train_loader = DataLoader(\n        SPRClassifierDataset(spr_bench[\"train\"]),\n        batch_size=128,\n        shuffle=True,\n        collate_fn=collate_classifier,\n    )\n    dev_loader = DataLoader(\n        SPRClassifierDataset(spr_bench[\"dev\"]),\n        batch_size=256,\n        shuffle=False,\n        collate_fn=collate_classifier,\n    )\n\n    # Model instantiation\n    encoder = Encoder(vocab).to(device)\n    clf_model = Classifier(\n        encoder, num_classes=len(set(spr_bench[\"train\"][\"label\"]))\n    ).to(device)\n\n    # -------- Contrastive pre-training ----------\n    optimizer_pt = torch.optim.Adam(encoder.parameters(), lr=1e-3)\n    for ep in range(1, pretrain_epochs + 1):\n        encoder.train()\n        epoch_loss = 0.0\n        for batch in pretrain_loader:\n            optimizer_pt.zero_grad()\n            z1 = encoder(batch[\"ids1\"], batch[\"len1\"])\n            z2 = encoder(batch[\"ids2\"], batch[\"len2\"])\n            loss = nt_xent_loss(z1, z2)\n            loss.backward()\n            optimizer_pt.step()\n            epoch_loss += loss.item() * batch[\"ids1\"].size(0)\n        epoch_loss /= len(pretrain_loader.dataset)\n        run_dict[\"losses\"][\"pretrain\"].append(epoch_loss)\n        print(f\"  Pretrain epoch {ep}/{pretrain_epochs} loss={epoch_loss:.4f}\")\n\n    # --------------- Fine-tuning ----------------\n    optimizer_ft = torch.optim.Adam(clf_model.parameters(), lr=1e-3)\n    criterion = nn.CrossEntropyLoss()\n    ft_epochs = 3\n    for ep in range(1, ft_epochs + 1):\n        # train\n        clf_model.train()\n        running_loss = 0.0\n        for batch in train_loader:\n            optimizer_ft.zero_grad()\n            logits = clf_model(batch[\"ids\"], batch[\"len\"])\n            loss = criterion(logits, batch[\"label\"])\n            loss.backward()\n            optimizer_ft.step()\n            running_loss += loss.item() * batch[\"ids\"].size(0)\n        train_loss = running_loss / len(train_loader.dataset)\n        run_dict[\"losses\"][\"train\"].append(train_loss)\n        # evaluate\n        clf_model.eval()\n        val_loss = 0.0\n        all_pred = []\n        all_true = []\n        all_seq = []\n        with torch.no_grad():\n            for batch in dev_loader:\n                logits = clf_model(batch[\"ids\"], batch[\"len\"])\n                loss = criterion(logits, batch[\"label\"])\n                val_loss += loss.item() * batch[\"ids\"].size(0)\n                preds = logits.argmax(1).cpu().tolist()\n                all_pred.extend(preds)\n                all_true.extend(batch[\"label\"].cpu().tolist())\n                all_seq.extend(batch[\"sequence\"])\n        val_loss /= len(dev_loader.dataset)\n        run_dict[\"losses\"][\"val\"].append(val_loss)\n        swa = shape_weighted_accuracy(all_seq, all_true, all_pred)\n        cwa = color_weighted_accuracy(all_seq, all_true, all_pred)\n        schm = 2 * swa * cwa / (swa + cwa) if (swa + cwa) > 0 else 0.0\n        run_dict[\"metrics\"][\"SWA\"].append(swa)\n        run_dict[\"metrics\"][\"CWA\"].append(cwa)\n        run_dict[\"metrics\"][\"SCHM\"].append(schm)\n        print(\n            f\"  FT epoch {ep}/{ft_epochs} train_loss={train_loss:.4f} val_loss={val_loss:.4f} | SWA={swa:.3f} CWA={cwa:.3f} SCHM={schm:.3f}\"\n        )\n\n    # store final preds/gt from last epoch\n    run_dict[\"predictions\"] = all_pred\n    run_dict[\"ground_truth\"] = all_true\n    experiment_data[\"pretrain_epochs\"][\"SPR_BENCH\"][str(pretrain_epochs)] = run_dict\n\n    # plot loss curves for this run\n    plt.figure()\n    plt.plot(run_dict[\"losses\"][\"train\"], label=\"train\")\n    plt.plot(run_dict[\"losses\"][\"val\"], label=\"val\")\n    plt.title(f\"FT Loss (pretrain_epochs={pretrain_epochs})\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.legend()\n    plt.savefig(os.path.join(working_dir, f\"loss_curve_ep{pretrain_epochs}.png\"))\n    plt.close()\n\n    # free memory\n    del encoder, clf_model, optimizer_pt, optimizer_ft\n    torch.cuda.empty_cache()\n    gc.collect()\n\n# --------------- Save experiment data ----------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"\\nSaved experiment data and plots to ./working/\")\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- load data ----------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\nruns_dict = experiment_data.get(\"pretrain_epochs\", {}).get(\"SPR_BENCH\", {})\nrun_keys = sorted(runs_dict.keys(), key=lambda x: int(x))  # e.g. ['2','4','6',...]\n\n\n# Helper to pick colors/linestyles that fit within default palette even for many lines\ndef _style(idx):\n    colors = plt.rcParams[\"axes.prop_cycle\"].by_key()[\"color\"]\n    return colors[idx % len(colors)], \"-\" if idx < len(colors) else \"--\"\n\n\n# ---------- 1. Pre-training loss curves ----------\ntry:\n    plt.figure()\n    for i, k in enumerate(run_keys):\n        losses = runs_dict[k][\"losses\"].get(\"pretrain\", [])\n        c, ls = _style(i)\n        plt.plot(\n            range(1, len(losses) + 1), losses, label=f\"PT={k}\", color=c, linestyle=ls\n        )\n    plt.title(\"SPR_BENCH: Pre-training Loss vs Epochs\")\n    plt.xlabel(\"Pre-training Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_BENCH_pretrain_loss.png\")\n    plt.savefig(fname)\n    print(f\"Saved {fname}\")\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating pre-training loss plot: {e}\")\n    plt.close()\n\n# ---------- 2. Fine-tuning loss curves ----------\ntry:\n    plt.figure()\n    for i, k in enumerate(run_keys):\n        losses_train = runs_dict[k][\"losses\"].get(\"train\", [])\n        losses_val = runs_dict[k][\"losses\"].get(\"val\", [])\n        c, _ = _style(i)\n        plt.plot(\n            range(1, len(losses_train) + 1),\n            losses_train,\n            color=c,\n            linestyle=\"-\",\n            label=f\"Train (PT={k})\",\n        )\n        plt.plot(\n            range(1, len(losses_val) + 1),\n            losses_val,\n            color=c,\n            linestyle=\"--\",\n            label=f\"Val (PT={k})\",\n        )\n    plt.title(\"SPR_BENCH: Fine-tuning Loss (Train vs Val)\")\n    plt.xlabel(\"Fine-tuning Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.legend(ncol=2, fontsize=\"small\")\n    fname = os.path.join(working_dir, \"SPR_BENCH_finetune_loss.png\")\n    plt.savefig(fname)\n    print(f\"Saved {fname}\")\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating fine-tuning loss plot: {e}\")\n    plt.close()\n\n\n# ---------- Metric plotting helper ----------\ndef plot_metric(metric_name, file_suffix):\n    try:\n        plt.figure()\n        for i, k in enumerate(run_keys):\n            vals = runs_dict[k][\"metrics\"].get(metric_name, [])\n            c, ls = _style(i)\n            plt.plot(\n                range(1, len(vals) + 1),\n                vals,\n                label=f\"{metric_name} (PT={k})\",\n                color=c,\n                linestyle=ls,\n            )\n        plt.title(f\"SPR_BENCH: {metric_name} across Fine-tuning Epochs\")\n        plt.xlabel(\"Fine-tuning Epoch\")\n        plt.ylabel(metric_name)\n        plt.legend(fontsize=\"small\")\n        fname = os.path.join(working_dir, f\"SPR_BENCH_{file_suffix}.png\")\n        plt.savefig(fname)\n        print(f\"Saved {fname}\")\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating {metric_name} plot: {e}\")\n        plt.close()\n\n\n# ---------- 3-5. Metric curves ----------\nplot_metric(\"SWA\", \"SWA_curve\")\nplot_metric(\"CWA\", \"CWA_curve\")\nplot_metric(\"SCHM\", \"SCHM_curve\")\n",
+      "plot_analyses": [
+        {
+          "analysis": "This plot depicts the fine-tuning loss for training and validation data when the pretraining epochs are set to 2. Both the training and validation loss decrease rapidly and converge to near-zero values within two epochs. The validation loss is consistently lower than the training loss, indicating no signs of overfitting. However, the rapid convergence might suggest potential underfitting or insufficient training epochs for capturing complex patterns.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/loss_curve_ep2.png"
+        },
+        {
+          "analysis": "This plot shows the fine-tuning loss for training and validation data with pretraining epochs set to 4. The loss curves exhibit similar trends as the previous plot, with both training and validation losses decreasing rapidly to near-zero values. The slightly lower starting loss values compared to the previous plot indicate that additional pretraining epochs improve the initialization for fine-tuning.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/loss_curve_ep4.png"
+        },
+        {
+          "analysis": "This plot illustrates the fine-tuning loss for pretraining epochs set to 6. The loss curves continue to show a consistent decrease, with validation loss remaining lower than training loss. The slightly lower loss values compared to previous plots suggest improved initialization from extended pretraining, potentially leading to better generalization.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/loss_curve_ep6.png"
+        },
+        {
+          "analysis": "This plot demonstrates the fine-tuning loss for pretraining epochs set to 8. The loss curves show a consistent pattern of rapid convergence to near-zero values, with validation loss remaining below training loss. The results suggest that increasing pretraining epochs further enhances initialization quality, as evidenced by the slightly reduced starting loss values.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/loss_curve_ep8.png"
+        },
+        {
+          "analysis": "This plot presents the fine-tuning loss for pretraining epochs set to 10. The trends remain consistent with previous plots, showing rapid convergence of both training and validation losses to near-zero values. The results indicate that while increasing pretraining epochs improves initialization, the marginal gains in loss reduction diminish beyond 8 epochs.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/loss_curve_ep10.png"
+        },
+        {
+          "analysis": "This plot compares pretraining loss across different pretraining epochs (2, 4, 6, 8, and 10). The loss decreases consistently with more pretraining epochs, but the rate of improvement diminishes after 6 epochs. The slight oscillations in loss values for higher epochs might indicate diminishing returns or overfitting during pretraining.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/SPR_BENCH_pretrain_loss.png"
+        },
+        {
+          "analysis": "This plot compares fine-tuning loss for training and validation data across different pretraining epochs. Loss values decrease consistently for both training and validation sets as pretraining epochs increase. The validation loss remains consistently lower than the training loss, suggesting no overfitting. However, the marginal improvement in loss reduction diminishes for pretraining epochs beyond 8.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/SPR_BENCH_finetune_loss.png"
+        },
+        {
+          "analysis": "This plot illustrates the Shape-Weighted Accuracy (SWA) across fine-tuning epochs for different pretraining epochs. SWA improves consistently with more pretraining epochs, with pretraining epochs of 8 and 10 yielding the highest accuracies. The results indicate that extended pretraining enhances the model's ability to capture shape-related features.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/SPR_BENCH_SWA_curve.png"
+        },
+        {
+          "analysis": "This plot shows the Color-Weighted Accuracy (CWA) across fine-tuning epochs for different pretraining epochs. Similar to SWA, CWA improves with more pretraining epochs, with the highest accuracies observed for 8 and 10 pretraining epochs. The results suggest that extended pretraining improves the model's ability to capture color-related features.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/SPR_BENCH_CWA_curve.png"
+        },
+        {
+          "analysis": "This plot depicts the Schema Score (SCHM) across fine-tuning epochs for different pretraining epochs. The SCHM metric follows a trend similar to SWA and CWA, with higher pretraining epochs (8 and 10) achieving the best scores. This indicates that extended pretraining enhances the model's ability to generalize to schema-related tasks.",
+          "plot_path": "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/SPR_BENCH_SCHM_curve.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/loss_curve_ep2.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/loss_curve_ep4.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/loss_curve_ep6.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/loss_curve_ep8.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/loss_curve_ep10.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/SPR_BENCH_pretrain_loss.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/SPR_BENCH_finetune_loss.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/SPR_BENCH_SWA_curve.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/SPR_BENCH_CWA_curve.png",
+        "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/SPR_BENCH_SCHM_curve.png"
+      ],
+      "vlm_feedback_summary": "The plots provide valuable insights into the impact of pretraining epochs on fine-tuning performance. Extended pretraining improves initialization, leading to better generalization and higher accuracy metrics (SWA, CWA, SCHM). However, the marginal gains diminish beyond 8 pretraining epochs, suggesting a saturation point for pretraining benefits.",
+      "exp_results_dir": "experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/experiment_data.npy"
+      ]
+    }
+  ],
+  "aggregated results of nodes with different seeds": {
+    "overall_plan": "The overall plan involves a comprehensive hyperparameter tuning process focused on the 'pretrain_epochs' variable, experimenting with values 2, 4, 6, 8, and 10. For each setting, the encoder and classifier are re-initialized, and the model undergoes contrastive pre-training for the chosen number of epochs, followed by fine-tuning for three epochs. Results, including all losses and metrics, are stored in a structured dictionary and saved to a file, with visual loss curves generated for each run. The current plan adds to this by aggregating results from multiple seeds, thus ensuring the robustness and reliability of the findings. This integration of systematic hyperparameter tuning with multi-seed aggregation aims to provide a statistically sound understanding of model performance across different configurations.",
+    "metric": {
+      "value": null,
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# plotting aggregation code",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ---------- basic setup ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- list of experiment files ----------\nexperiment_data_path_list = [\n    \"experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_f8d17a8453644807b6265ed7a71263a1_proc_2989518/experiment_data.npy\",\n    \"experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_6f8aa4ef9909408695ee9fcd5dde0c78_proc_2989519/experiment_data.npy\",\n    \"experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_df5bbf6cd848448fa6cc106d80343911_proc_2989517/experiment_data.npy\",\n]\n\n# ---------- load all experiments ----------\nall_experiment_data = []\ntry:\n    for p in experiment_data_path_list:\n        full_path = os.path.join(os.getenv(\"AI_SCIENTIST_ROOT\", \"\"), p)\n        exp_data = np.load(full_path, allow_pickle=True).item()\n        all_experiment_data.append(exp_data)\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n\ndataset_name = \"SPR_BENCH\"\n\n\n# ---------- helper functions ----------\ndef _style(idx):\n    colors = plt.rcParams[\"axes.prop_cycle\"].by_key()[\"color\"]\n    return colors[idx % len(colors)], \"-\" if idx < len(colors) else \"--\"\n\n\ndef _collect_across_runs(key_level_3, subsection):\n    \"\"\"\n    key_level_3 : e.g. 'losses' or 'metrics'\n    subsection  : e.g. 'pretrain', 'train', 'val', 'SWA'...\n    returns dict: {PT_k : [run1_arr, run2_arr, ...]}\n    \"\"\"\n    out = {}\n    for exp in all_experiment_data:\n        try:\n            pt_dict = exp.get(\"pretrain_epochs\", {}).get(dataset_name, {})\n            for k, info in pt_dict.items():\n                arr = info.get(key_level_3, {}).get(subsection, [])\n                if arr:\n                    out.setdefault(k, []).append(np.asarray(arr))\n        except Exception:\n            continue\n    return out\n\n\ndef _mean_sem(list_of_arrays):\n    # cut to shortest run length\n    min_len = min(len(a) for a in list_of_arrays)\n    arr = np.stack([a[:min_len] for a in list_of_arrays], axis=0)  # (n_runs, T)\n    mean = arr.mean(axis=0)\n    sem = arr.std(axis=0, ddof=1) / np.sqrt(arr.shape[0])\n    return mean, sem\n\n\n# ---------- aggregated plots ----------\n# 1. Pre-training loss\ntry:\n    plt.figure()\n    data_dict = _collect_across_runs(\"losses\", \"pretrain\")\n    for i, k in enumerate(sorted(data_dict.keys(), key=lambda x: int(x))):\n        mean, sem = _mean_sem(data_dict[k])\n        xs = np.arange(1, len(mean) + 1)\n        c, ls = _style(i)\n        plt.plot(xs, mean, color=c, linestyle=ls, label=f\"PT={k} mean\")\n        plt.fill_between(xs, mean - sem, mean + sem, color=c, alpha=0.25)\n    plt.title(\"SPR_BENCH: Pre-training Loss (mean \u00b1 SEM)\")\n    plt.xlabel(\"Pre-training Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.legend(fontsize=\"small\")\n    fname = os.path.join(working_dir, \"SPR_BENCH_pretrain_loss_aggregated.png\")\n    plt.savefig(fname)\n    print(f\"Saved {fname}\")\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating aggregated pre-training loss plot: {e}\")\n    plt.close()\n\n# 2. Fine-tuning loss (train+val)\ntry:\n    plt.figure()\n    train_dict = _collect_across_runs(\"losses\", \"train\")\n    val_dict = _collect_across_runs(\"losses\", \"val\")\n    for i, k in enumerate(sorted(train_dict.keys(), key=lambda x: int(x))):\n        if k not in val_dict:\n            continue\n        # train\n        mean_t, sem_t = _mean_sem(train_dict[k])\n        xs = np.arange(1, len(mean_t) + 1)\n        c, _ = _style(i)\n        plt.plot(xs, mean_t, color=c, linestyle=\"-\", label=f\"Train PT={k}\")\n        plt.fill_between(xs, mean_t - sem_t, mean_t + sem_t, color=c, alpha=0.20)\n        # val\n        mean_v, sem_v = _mean_sem(val_dict[k])\n        plt.plot(xs, mean_v, color=c, linestyle=\"--\", label=f\"Val PT={k}\")\n        plt.fill_between(xs, mean_v - sem_v, mean_v + sem_v, color=c, alpha=0.10)\n    plt.title(\"SPR_BENCH: Fine-tuning Loss (mean \u00b1 SEM)\")\n    plt.xlabel(\"Fine-tuning Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.legend(fontsize=\"small\", ncol=2)\n    fname = os.path.join(working_dir, \"SPR_BENCH_finetune_loss_aggregated.png\")\n    plt.savefig(fname)\n    print(f\"Saved {fname}\")\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating aggregated fine-tuning loss plot: {e}\")\n    plt.close()\n\n# 3-5. Metrics\nfor metric in [\"SWA\", \"CWA\", \"SCHM\"]:\n    try:\n        plt.figure()\n        m_dict = _collect_across_runs(\"metrics\", metric)\n        for i, k in enumerate(sorted(m_dict.keys(), key=lambda x: int(x))):\n            mean, sem = _mean_sem(m_dict[k])\n            xs = np.arange(1, len(mean) + 1)\n            c, ls = _style(i)\n            plt.plot(xs, mean, color=c, linestyle=ls, label=f\"PT={k} mean\")\n            plt.fill_between(xs, mean - sem, mean + sem, color=c, alpha=0.25)\n            # record final value for console\n            if xs[-1] == len(mean):\n                print(f\"{metric} final mean PT={k}: {mean[-1]:.4f} \u00b1 {sem[-1]:.4f}\")\n        plt.title(f\"SPR_BENCH: {metric} (mean \u00b1 SEM)\")\n        plt.xlabel(\"Fine-tuning Epoch\")\n        plt.ylabel(metric)\n        plt.legend(fontsize=\"small\")\n        fname = os.path.join(working_dir, f\"SPR_BENCH_{metric}_aggregated.png\")\n        plt.savefig(fname)\n        print(f\"Saved {fname}\")\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating aggregated {metric} plot: {e}\")\n        plt.close()\n",
+    "plot_analyses": [],
+    "plot_paths": [
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/seed_aggregation_0b0be907f2b340c4a6548459c40a7465/SPR_BENCH_pretrain_loss_aggregated.png",
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/seed_aggregation_0b0be907f2b340c4a6548459c40a7465/SPR_BENCH_finetune_loss_aggregated.png",
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/seed_aggregation_0b0be907f2b340c4a6548459c40a7465/SPR_BENCH_SWA_aggregated.png",
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/seed_aggregation_0b0be907f2b340c4a6548459c40a7465/SPR_BENCH_CWA_aggregated.png",
+      "experiments/2025-08-15_22-24-43_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/seed_aggregation_0b0be907f2b340c4a6548459c40a7465/SPR_BENCH_SCHM_aggregated.png"
+    ],
+    "vlm_feedback_summary": [],
+    "exp_results_dir": "experiment_results/seed_aggregation_0b0be907f2b340c4a6548459c40a7465",
+    "exp_results_npy_files": []
+  }
+}

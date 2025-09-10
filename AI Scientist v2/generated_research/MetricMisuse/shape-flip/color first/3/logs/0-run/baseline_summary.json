@@ -1,0 +1,960 @@
+{
+  "best node": {
+    "overall_plan": "Hyperparam tuning name: num_epochs.\nWe reload the dataset once, then loop over a list of candidate maximum-epoch budgets (10-50).  \nFor every budget we (1) create a fresh GCN model, (2) train up to that many epochs while using early-stopping on dev-set BWA with a patience of five, (3) keep the best model weights, (4) evaluate on the test set, and (5) store all curves, predictions, etc. in the required experiment_data structure.  \nAt the end we save experiment_data.npy and write one BWA curve png per run.",
+    "analysis": "The training script executed successfully without any errors. The hyperparameter tuning process was carried out for different epoch values (10, 20, 30, 40, 50), and the results were logged for each configuration. The early stopping mechanism worked as intended, and the best models were saved for evaluation. The metrics, including Balanced Weighted Accuracy (BWA), Color-Weighted Accuracy (CWA), and Shape-Weighted Accuracy (SWA), were calculated and logged for train, validation, and test sets. Experiment data was saved, and visual plots of BWA curves for each run were generated and stored. Overall, the script functioned as expected and met its objectives.",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "balanced weighted accuracy",
+            "lower_is_better": false,
+            "description": "Balanced weighted accuracy measures the mean accuracy per class, weighted by class importance. Higher values are better.",
+            "data": [
+              {
+                "dataset_name": "Training",
+                "final_value": 0.9456,
+                "best_value": 0.9478
+              },
+              {
+                "dataset_name": "Validation",
+                "final_value": 0.9394,
+                "best_value": 0.9423
+              },
+              {
+                "dataset_name": "Test",
+                "final_value": 0.6534,
+                "best_value": 0.6552
+              }
+            ]
+          },
+          {
+            "metric_name": "lowest loss",
+            "lower_is_better": true,
+            "description": "The lowest loss achieved during training or evaluation. Lower values indicate better model performance.",
+            "data": [
+              {
+                "dataset_name": "Training",
+                "final_value": 0.2232,
+                "best_value": 0.2111
+              },
+              {
+                "dataset_name": "Validation",
+                "final_value": 0.2158,
+                "best_value": 0.2071
+              },
+              {
+                "dataset_name": "Test",
+                "final_value": 1.1268,
+                "best_value": 0.9122
+              }
+            ]
+          },
+          {
+            "metric_name": "color-weighted accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy weighted by the color attribute. Higher values are better.",
+            "data": [
+              {
+                "dataset_name": "Test",
+                "final_value": 0.6751,
+                "best_value": 0.6766
+              }
+            ]
+          },
+          {
+            "metric_name": "shape-weighted accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy weighted by the shape attribute. Higher values are better.",
+            "data": [
+              {
+                "dataset_name": "Test",
+                "final_value": 0.6318,
+                "best_value": 0.6339
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, pathlib, time, copy, numpy as np, torch, torch.nn as nn, matplotlib.pyplot as plt\nfrom torch_geometric.data import Data\nfrom torch_geometric.loader import DataLoader\nfrom torch_geometric.nn import GCNConv, global_mean_pool\nfrom typing import List\nfrom datasets import DatasetDict, load_dataset\n\n# ---------------------------------------------------------------------\n# mandatory working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ---------------------------------------------------------------------\n# ---------- Helper to locate the dataset -----------------------------\ndef locate_spr_bench() -> pathlib.Path:\n    candidates = [\n        pathlib.Path(\"./SPR_BENCH\"),\n        pathlib.Path(\"../SPR_BENCH\"),\n        pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\"),\n        pathlib.Path(os.getenv(\"SPR_DATA_PATH\", \"\")),\n    ]\n    for p in candidates:\n        if p and (p / \"train.csv\").exists() and (p / \"dev.csv\").exists():\n            print(f\"Found SPR_BENCH at: {p.resolve()}\")\n            return p.resolve()\n    raise FileNotFoundError(\n        \"SPR_BENCH dataset not found. Place the folder appropriately or set SPR_DATA_PATH.\"\n    )\n\n\n# ---------------------------------------------------------------------\n# ---------- Provided helpers -----------------------------------------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(split_csv: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / split_csv),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    dset = DatasetDict()\n    for sp in [\"train\", \"dev\", \"test\"]:\n        dset[sp] = _load(f\"{sp}.csv\")\n    return dset\n\n\ndef count_color_variety(sequence: str) -> int:\n    return len(set(t[1] for t in sequence.strip().split() if len(t) > 1))\n\n\ndef count_shape_variety(sequence: str) -> int:\n    return len(set(t[0] for t in sequence.strip().split() if t))\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    corr = [wt if yt == yp else 0 for wt, yt, yp in zip(w, y_true, y_pred)]\n    return sum(corr) / (sum(w) if sum(w) > 0 else 1)\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    corr = [wt if yt == yp else 0 for wt, yt, yp in zip(w, y_true, y_pred)]\n    return sum(corr) / (sum(w) if sum(w) > 0 else 1)\n\n\n# ---------------------------------------------------------------------\n# ---------- Load and preprocess dataset ------------------------------\nDATA_PATH = locate_spr_bench()\nspr = load_spr_bench(DATA_PATH)\n\n\ndef extract_tokens(seq: str) -> List[str]:\n    return seq.strip().split()\n\n\ntoken_set, label_set = set(), set()\nfor ex in spr[\"train\"]:\n    token_set.update(extract_tokens(ex[\"sequence\"]))\n    label_set.add(ex[\"label\"])\n\ntoken2idx = {tok: i + 1 for i, tok in enumerate(sorted(token_set))}\nlabel2idx = {lab: i for i, lab in enumerate(sorted(label_set))}\nidx2label = {i: lab for lab, i in label2idx.items()}\n\n\ndef seq_to_data(example):\n    seq = example[\"sequence\"]\n    tokens = extract_tokens(seq)\n    node_indices = [token2idx.get(tok, 0) for tok in tokens]\n    x = torch.tensor(node_indices, dtype=torch.long).unsqueeze(-1)\n\n    if len(tokens) > 1:\n        src = torch.arange(0, len(tokens) - 1, dtype=torch.long)\n        dst = src + 1\n        edge_index = torch.stack([torch.cat([src, dst]), torch.cat([dst, src])], dim=0)\n    else:\n        edge_index = torch.zeros((2, 0), dtype=torch.long)\n\n    y = torch.tensor([label2idx[example[\"label\"]]], dtype=torch.long)\n    data = Data(x=x, edge_index=edge_index, y=y)\n    data.seq = seq\n    return data\n\n\ntrain_graphs = [seq_to_data(ex) for ex in spr[\"train\"]]\ndev_graphs = [seq_to_data(ex) for ex in spr[\"dev\"]]\ntest_graphs = [seq_to_data(ex) for ex in spr[\"test\"]]\n\nbatch_size = 64\ntrain_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)\ndev_loader = DataLoader(dev_graphs, batch_size=batch_size, shuffle=False)\ntest_loader = DataLoader(test_graphs, batch_size=batch_size, shuffle=False)\n\n\n# ---------------------------------------------------------------------\n# ---------- Model Definition -----------------------------------------\nclass SPR_GCN(nn.Module):\n    def __init__(self, vocab_size: int, embed_dim: int, num_classes: int):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size + 1, embed_dim, padding_idx=0)\n        self.gcn1 = GCNConv(embed_dim, 64)\n        self.gcn2 = GCNConv(64, 64)\n        self.lin = nn.Linear(64, num_classes)\n        self.dropout = nn.Dropout(0.2)\n\n    def forward(self, x, edge_index, batch):\n        x = self.embed(x.squeeze(-1))\n        x = self.gcn1(x, edge_index).relu()\n        x = self.gcn2(x, edge_index).relu()\n        x = global_mean_pool(x, batch)\n        x = self.dropout(x)\n        return self.lin(x)\n\n\n# ---------------------------------------------------------------------\n# ---------- Evaluation helper ----------------------------------------\ncriterion = nn.CrossEntropyLoss()\n\n\ndef evaluate(model, loader):\n    model.eval()\n    total_loss, all_preds, all_labels, all_seqs = 0.0, [], [], []\n    with torch.no_grad():\n        for batch in loader:\n            batch = batch.to(device)\n            out = model(batch.x, batch.edge_index, batch.batch)\n            loss = criterion(out, batch.y.view(-1))\n            total_loss += loss.item() * batch.num_graphs\n            preds = out.argmax(dim=-1).cpu().tolist()\n            labels = batch.y.view(-1).cpu().tolist()\n            seqs = batch.seq\n            all_preds.extend(preds)\n            all_labels.extend(labels)\n            all_seqs.extend(seqs)\n    cwa = color_weighted_accuracy(all_seqs, all_labels, all_preds)\n    swa = shape_weighted_accuracy(all_seqs, all_labels, all_preds)\n    bwa = (cwa + swa) / 2.0\n    return total_loss / len(loader.dataset), bwa, cwa, swa, all_preds, all_labels\n\n\n# ---------------------------------------------------------------------\n# ---------- Hyperparameter tuning over num_epochs --------------------\ncandidate_max_epochs = [10, 20, 30, 40, 50]\npatience = 5\n\nexperiment_data = {\"num_epochs\": {}}\n\nfor max_ep in candidate_max_epochs:\n    run_key = f\"max_{max_ep}\"\n    experiment_data[\"num_epochs\"][run_key] = {\n        \"metrics\": {\"train\": [], \"val\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n        \"timestamps\": [],\n    }\n\n    model = SPR_GCN(len(token2idx), 32, len(label2idx)).to(device)\n    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n    best_bwa, best_state, wait = -1.0, None, 0\n\n    for epoch in range(1, max_ep + 1):\n        model.train()\n        epoch_loss = 0.0\n        for batch in train_loader:\n            batch = batch.to(device)\n            optimizer.zero_grad()\n            out = model(batch.x, batch.edge_index, batch.batch)\n            loss = criterion(out, batch.y.view(-1))\n            loss.backward()\n            optimizer.step()\n            epoch_loss += loss.item() * batch.num_graphs\n        train_loss = epoch_loss / len(train_loader.dataset)\n\n        val_loss, val_bwa, val_cwa, val_swa, _, _ = evaluate(model, dev_loader)\n        _, train_bwa, _, _, _, _ = evaluate(model, train_loader)\n\n        # log\n        exd = experiment_data[\"num_epochs\"][run_key]\n        exd[\"losses\"][\"train\"].append(train_loss)\n        exd[\"losses\"][\"val\"].append(val_loss)\n        exd[\"metrics\"][\"train\"].append(train_bwa)\n        exd[\"metrics\"][\"val\"].append(val_bwa)\n        exd[\"timestamps\"].append(time.time())\n\n        print(\n            f\"[{run_key}] Epoch {epoch:3d}/{max_ep}: \"\n            f\"train_loss={train_loss:.4f} val_loss={val_loss:.4f} \"\n            f\"BWA={val_bwa:.4f} (CWA={val_cwa:.4f}, SWA={val_swa:.4f})\"\n        )\n\n        # early stopping\n        if val_bwa > best_bwa:\n            best_bwa, best_state, wait = val_bwa, copy.deepcopy(model.state_dict()), 0\n        else:\n            wait += 1\n            if wait >= patience:\n                print(f\"[{run_key}] Early stopping triggered at epoch {epoch}.\")\n                break\n\n    # restore best model\n    if best_state is not None:\n        model.load_state_dict(best_state)\n\n    # final test evaluation\n    test_loss, test_bwa, test_cwa, test_swa, test_preds, test_labels = evaluate(\n        model, test_loader\n    )\n    exd[\"predictions\"] = test_preds\n    exd[\"ground_truth\"] = test_labels\n    exd[\"test_metrics\"] = {\n        \"loss\": test_loss,\n        \"BWA\": test_bwa,\n        \"CWA\": test_cwa,\n        \"SWA\": test_swa,\n    }\n    print(\n        f\"[{run_key}] Test -> loss: {test_loss:.4f}  \"\n        f\"BWA: {test_bwa:.4f} (CWA={test_cwa:.4f} SWA={test_swa:.4f})\"\n    )\n\n    # -----------------------------------------------------------------\n    # plotting for this run\n    epochs_arr = np.arange(1, len(exd[\"metrics\"][\"train\"]) + 1)\n    plt.figure()\n    plt.plot(epochs_arr, exd[\"metrics\"][\"train\"], label=\"Train BWA\")\n    plt.plot(epochs_arr, exd[\"metrics\"][\"val\"], label=\"Dev BWA\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"BWA\")\n    plt.title(f\"BWA curve ({run_key})\")\n    plt.legend()\n    plt.tight_layout()\n    plot_path = os.path.join(working_dir, f\"bwa_curve_{run_key}.png\")\n    plt.savefig(plot_path)\n    plt.close()\n    print(f\"[{run_key}] Curve saved to {plot_path}\")\n\n    # free gpu memory between runs\n    del model\n    torch.cuda.empty_cache()\n\n# ---------------------------------------------------------------------\n# ---------- Save experiment data -------------------------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"All experiment data saved to working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ---------------------------------------------------------------------\n# mandatory working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------------------------------------------------------------------\n# load experiment data\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\n    runs = experiment_data.get(\"num_epochs\", {})\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    runs = {}\n\n# ---------------------------------------------------------------------\n# 1) Per\u2013run train/val BWA curves  (<=5 similar figures)\nfor i, (run_key, run_dict) in enumerate(runs.items()):\n    if i >= 5:  # obey \u201cat most 5 similar figures\u201d\n        break\n    try:\n        epochs = np.arange(1, len(run_dict[\"metrics\"][\"train\"]) + 1)\n        train_bwa = run_dict[\"metrics\"][\"train\"]\n        val_bwa = run_dict[\"metrics\"][\"val\"]\n\n        plt.figure()\n        plt.plot(epochs, train_bwa, label=\"Train BWA\")\n        plt.plot(epochs, val_bwa, label=\"Validation BWA\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"BWA\")\n        plt.title(f\"SPR-BENCH BWA Learning Curve \u2013 {run_key}\")\n        plt.legend()\n        plt.tight_layout()\n        fname = f\"spr_bench_bwa_curve_{run_key}.png\"\n        path = os.path.join(working_dir, fname)\n        plt.savefig(path)\n        plt.close()\n        print(f\"Saved {path}\")\n    except Exception as e:\n        print(f\"Error creating BWA curve for {run_key}: {e}\")\n        plt.close()\n\n# ---------------------------------------------------------------------\n# 2) Bar chart comparing test BWA across runs\ntry:\n    run_names = []\n    test_bwa_values = []\n    for rk, rd in runs.items():\n        if \"test_metrics\" in rd and \"BWA\" in rd[\"test_metrics\"]:\n            run_names.append(rk)\n            test_bwa_values.append(rd[\"test_metrics\"][\"BWA\"])\n\n    plt.figure()\n    x_pos = np.arange(len(run_names))\n    plt.bar(x_pos, test_bwa_values, color=\"skyblue\")\n    plt.xticks(x_pos, run_names, rotation=45, ha=\"right\")\n    plt.ylabel(\"Test BWA\")\n    plt.title(\"SPR-BENCH: Test BWA for Different max_epoch Settings\")\n    plt.tight_layout()\n    fname = \"spr_bench_test_bwa_comparison.png\"\n    path = os.path.join(working_dir, fname)\n    plt.savefig(path)\n    plt.close()\n    print(f\"Saved {path}\")\nexcept Exception as e:\n    print(f\"Error creating test BWA comparison bar chart: {e}\")\n    plt.close()\n\n# ---------------------------------------------------------------------\n# 3) Confusion matrix of best run (highest test BWA)\ntry:\n    # locate best run\n    best_run = max(\n        runs.items(),\n        key=lambda item: item[1].get(\"test_metrics\", {}).get(\"BWA\", -np.inf),\n    )[0]\n    preds = np.array(runs[best_run][\"predictions\"])\n    gts = np.array(runs[best_run][\"ground_truth\"])\n    num_classes = int(max(preds.max(), gts.max()) + 1)\n    conf_mat = np.zeros((num_classes, num_classes), dtype=int)\n    for gt, pr in zip(gts, preds):\n        conf_mat[gt, pr] += 1\n\n    plt.figure(figsize=(6, 5))\n    im = plt.imshow(conf_mat, cmap=\"Blues\")\n    plt.colorbar(im, fraction=0.046, pad=0.04)\n    plt.xlabel(\"Predicted label\")\n    plt.ylabel(\"True label\")\n    plt.title(f\"SPR-BENCH Confusion Matrix \u2013 Best Run: {best_run}\")\n    for (i, j), v in np.ndenumerate(conf_mat):\n        plt.text(j, i, str(v), ha=\"center\", va=\"center\", color=\"black\", fontsize=8)\n    plt.tight_layout()\n    fname = f\"spr_bench_confusion_matrix_{best_run}.png\"\n    path = os.path.join(working_dir, fname)\n    plt.savefig(path)\n    plt.close()\n    print(f\"Saved {path}\")\nexcept Exception as e:\n    print(f\"Error creating confusion matrix: {e}\")\n    plt.close()\n",
+    "plot_plan": "We will first load the saved experiment_data.npy, detect every run stored under experiment_data['num_epochs'], and iterate through them. For each run we will pull the logged train/validation BWA sequences and plot them in a line chart so that learning dynamics are visible (one plot per run \u2013 there are at most five). After looping through runs we will aggregate the test\u2010set BWA scores and create a bar chart that compares generalisation quality across all hyper-parameter settings. To give a deeper look into a single model we will find the run with the highest test BWA, build a confusion-matrix style heat-map (counts only, no percentages) from its ground-truth and prediction arrays, and plot it. Each of the three plot types (curves, bar chart, confusion matrix) is wrapped in its own try-except so that failure in one plot does not affect the others; every figure is titled clearly and is saved to working_dir with descriptive file names that include the dataset and plot type. All figures are closed explicitly to avoid memory leakage. The code uses only numpy and matplotlib, assumes no missing keys, and never fabricates data. Finally, the script prints the paths of all successfully written images.",
+    "plot_analyses": [
+      {
+        "analysis": "The plot indicates consistent improvement in both train and dev Balanced Weighted Accuracy (BWA) over epochs. The curves for train and dev BWA are closely aligned, suggesting minimal overfitting. The performance appears to plateau after epoch 8, indicating that further training beyond this point may yield diminishing returns.",
+        "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/bwa_curve_max_10.png"
+      },
+      {
+        "analysis": "The plot demonstrates steady improvement in both train and dev BWA as the number of epochs increases. The alignment of the two curves shows that the model generalizes well to the dev set. However, a slight divergence is observed towards the later epochs, which may indicate the early onset of overfitting.",
+        "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/bwa_curve_max_20.png"
+      },
+      {
+        "analysis": "The train and dev BWA curves continue to show improvement over 30 epochs. The alignment between train and dev BWA remains strong, with minimal divergence. However, the rate of improvement slows significantly after epoch 20, suggesting that additional training may not lead to substantial gains in performance.",
+        "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/bwa_curve_max_30.png"
+      },
+      {
+        "analysis": "The plot shows that train and dev BWA improve steadily up to around epoch 30, after which the performance appears to plateau. The alignment between the train and dev curves remains strong, indicating good generalization. There is no significant overfitting observed, even at higher epochs.",
+        "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/bwa_curve_max_40.png"
+      },
+      {
+        "analysis": "The plot shows steady improvement in train and dev BWA up to around epoch 20. Beyond this point, the curves exhibit minor fluctuations, and the dev BWA starts to diverge slightly from the train BWA, indicating potential overfitting. The performance appears to plateau after epoch 25.",
+        "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/bwa_curve_max_50.png"
+      },
+      {
+        "analysis": "This plot shows consistent improvement in both train and validation BWA over the first 10 epochs. The close alignment of the curves suggests good generalization, with minimal signs of overfitting. The performance appears to plateau after epoch 8, indicating that additional training may not yield significant improvements.",
+        "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/spr_bench_bwa_curve_max_10.png"
+      },
+      {
+        "analysis": "The plot demonstrates steady improvement in train and validation BWA over 20 epochs. The curves are closely aligned, suggesting strong generalization. However, a slight divergence is observed towards the later epochs, which may indicate the early onset of overfitting.",
+        "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/spr_bench_bwa_curve_max_20.png"
+      },
+      {
+        "analysis": "The train and validation BWA curves show consistent improvement over 30 epochs. The alignment between the two curves remains strong, with minimal divergence. However, the rate of improvement slows significantly after epoch 20, indicating that further training may have diminishing returns.",
+        "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/spr_bench_bwa_curve_max_30.png"
+      },
+      {
+        "analysis": "The plot shows steady improvement in train and validation BWA up to around epoch 30, after which the performance appears to plateau. The alignment between the train and validation curves remains strong, indicating good generalization. There is no significant overfitting observed, even at higher epochs.",
+        "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/spr_bench_bwa_curve_max_40.png"
+      },
+      {
+        "analysis": "The plot shows steady improvement in train and validation BWA up to around epoch 20. Beyond this point, the curves exhibit minor fluctuations, and the validation BWA starts to diverge slightly from the train BWA, indicating potential overfitting. The performance appears to plateau after epoch 25.",
+        "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/spr_bench_bwa_curve_max_50.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/bwa_curve_max_10.png",
+      "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/bwa_curve_max_20.png",
+      "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/bwa_curve_max_30.png",
+      "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/bwa_curve_max_40.png",
+      "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/bwa_curve_max_50.png",
+      "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/spr_bench_bwa_curve_max_10.png",
+      "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/spr_bench_bwa_curve_max_20.png",
+      "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/spr_bench_bwa_curve_max_30.png",
+      "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/spr_bench_bwa_curve_max_40.png",
+      "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/spr_bench_bwa_curve_max_50.png",
+      "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/spr_bench_test_bwa_comparison.png",
+      "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/spr_bench_confusion_matrix_max_20.png"
+    ],
+    "vlm_feedback_summary": "The plots demonstrate consistent improvement in Balanced Weighted Accuracy (BWA) across training and validation sets, with minimal overfitting observed. The alignment between training and validation curves indicates strong generalization, although slight divergence is observed at higher epochs in some cases. Performance tends to plateau after a certain number of epochs, suggesting that additional training may not yield significant gains.",
+    "exp_results_dir": "experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_b396019dcf9b4785902e93538f226955_proc_1445250/experiment_data.npy"
+    ]
+  },
+  "best node with different seeds": [
+    {
+      "overall_plan": "The plan involves hyperparameter tuning of the num_epochs parameter in a graph convolutional network (GCN) model. The approach includes reloading the dataset once and iterating over maximum-epoch budgets ranging from 10 to 50. For each budget, a fresh GCN model is created, trained with early stopping based on the best weighted average (BWA) on a development set with a patience of five, and evaluated on a test set. The best model weights are retained, and all experimental data, including curves and predictions, are stored in a structured format. The results are saved as an experiment_data.npy file, and BWA curve visualizations are generated for each run. The current mention of 'Seed node' suggests a potential setup or initiation phase but does not alter the core experimental approach outlined in the previous plan.",
+      "analysis": "",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "balanced weighted accuracy",
+              "lower_is_better": false,
+              "description": "A metric that measures the overall accuracy of predictions, weighted to account for imbalanced datasets.",
+              "data": [
+                {
+                  "dataset_name": "Training dataset",
+                  "final_value": 0.9514,
+                  "best_value": 0.9514
+                },
+                {
+                  "dataset_name": "Validation dataset",
+                  "final_value": 0.9448,
+                  "best_value": 0.9448
+                },
+                {
+                  "dataset_name": "Test dataset",
+                  "final_value": 0.6603,
+                  "best_value": 0.6603
+                }
+              ]
+            },
+            {
+              "metric_name": "lowest loss",
+              "lower_is_better": true,
+              "description": "A metric that measures the smallest loss achieved during training, which indicates better model performance.",
+              "data": [
+                {
+                  "dataset_name": "Training dataset",
+                  "final_value": 0.2052,
+                  "best_value": 0.2026
+                },
+                {
+                  "dataset_name": "Validation dataset",
+                  "final_value": 0.2034,
+                  "best_value": 0.1982
+                },
+                {
+                  "dataset_name": "Test dataset",
+                  "final_value": 1.2331,
+                  "best_value": 0.9065
+                }
+              ]
+            },
+            {
+              "metric_name": "color-weighted accuracy",
+              "lower_is_better": false,
+              "description": "A metric that measures the accuracy of color predictions, weighted for importance.",
+              "data": [
+                {
+                  "dataset_name": "Test dataset",
+                  "final_value": 0.6821,
+                  "best_value": 0.6821
+                }
+              ]
+            },
+            {
+              "metric_name": "shape-weighted accuracy",
+              "lower_is_better": false,
+              "description": "A metric that measures the accuracy of shape predictions, weighted for importance.",
+              "data": [
+                {
+                  "dataset_name": "Test dataset",
+                  "final_value": 0.6385,
+                  "best_value": 0.6385
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 2\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os, pathlib, time, copy, numpy as np, torch, torch.nn as nn, matplotlib.pyplot as plt\nfrom torch_geometric.data import Data\nfrom torch_geometric.loader import DataLoader\nfrom torch_geometric.nn import GCNConv, global_mean_pool\nfrom typing import List\nfrom datasets import DatasetDict, load_dataset\n\n# ---------------------------------------------------------------------\n# mandatory working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ---------------------------------------------------------------------\n# ---------- Helper to locate the dataset -----------------------------\ndef locate_spr_bench() -> pathlib.Path:\n    candidates = [\n        pathlib.Path(\"./SPR_BENCH\"),\n        pathlib.Path(\"../SPR_BENCH\"),\n        pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\"),\n        pathlib.Path(os.getenv(\"SPR_DATA_PATH\", \"\")),\n    ]\n    for p in candidates:\n        if p and (p / \"train.csv\").exists() and (p / \"dev.csv\").exists():\n            print(f\"Found SPR_BENCH at: {p.resolve()}\")\n            return p.resolve()\n    raise FileNotFoundError(\n        \"SPR_BENCH dataset not found. Place the folder appropriately or set SPR_DATA_PATH.\"\n    )\n\n\n# ---------------------------------------------------------------------\n# ---------- Provided helpers -----------------------------------------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(split_csv: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / split_csv),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    dset = DatasetDict()\n    for sp in [\"train\", \"dev\", \"test\"]:\n        dset[sp] = _load(f\"{sp}.csv\")\n    return dset\n\n\ndef count_color_variety(sequence: str) -> int:\n    return len(set(t[1] for t in sequence.strip().split() if len(t) > 1))\n\n\ndef count_shape_variety(sequence: str) -> int:\n    return len(set(t[0] for t in sequence.strip().split() if t))\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    corr = [wt if yt == yp else 0 for wt, yt, yp in zip(w, y_true, y_pred)]\n    return sum(corr) / (sum(w) if sum(w) > 0 else 1)\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    corr = [wt if yt == yp else 0 for wt, yt, yp in zip(w, y_true, y_pred)]\n    return sum(corr) / (sum(w) if sum(w) > 0 else 1)\n\n\n# ---------------------------------------------------------------------\n# ---------- Load and preprocess dataset ------------------------------\nDATA_PATH = locate_spr_bench()\nspr = load_spr_bench(DATA_PATH)\n\n\ndef extract_tokens(seq: str) -> List[str]:\n    return seq.strip().split()\n\n\ntoken_set, label_set = set(), set()\nfor ex in spr[\"train\"]:\n    token_set.update(extract_tokens(ex[\"sequence\"]))\n    label_set.add(ex[\"label\"])\n\ntoken2idx = {tok: i + 1 for i, tok in enumerate(sorted(token_set))}\nlabel2idx = {lab: i for i, lab in enumerate(sorted(label_set))}\nidx2label = {i: lab for lab, i in label2idx.items()}\n\n\ndef seq_to_data(example):\n    seq = example[\"sequence\"]\n    tokens = extract_tokens(seq)\n    node_indices = [token2idx.get(tok, 0) for tok in tokens]\n    x = torch.tensor(node_indices, dtype=torch.long).unsqueeze(-1)\n\n    if len(tokens) > 1:\n        src = torch.arange(0, len(tokens) - 1, dtype=torch.long)\n        dst = src + 1\n        edge_index = torch.stack([torch.cat([src, dst]), torch.cat([dst, src])], dim=0)\n    else:\n        edge_index = torch.zeros((2, 0), dtype=torch.long)\n\n    y = torch.tensor([label2idx[example[\"label\"]]], dtype=torch.long)\n    data = Data(x=x, edge_index=edge_index, y=y)\n    data.seq = seq\n    return data\n\n\ntrain_graphs = [seq_to_data(ex) for ex in spr[\"train\"]]\ndev_graphs = [seq_to_data(ex) for ex in spr[\"dev\"]]\ntest_graphs = [seq_to_data(ex) for ex in spr[\"test\"]]\n\nbatch_size = 64\ntrain_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)\ndev_loader = DataLoader(dev_graphs, batch_size=batch_size, shuffle=False)\ntest_loader = DataLoader(test_graphs, batch_size=batch_size, shuffle=False)\n\n\n# ---------------------------------------------------------------------\n# ---------- Model Definition -----------------------------------------\nclass SPR_GCN(nn.Module):\n    def __init__(self, vocab_size: int, embed_dim: int, num_classes: int):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size + 1, embed_dim, padding_idx=0)\n        self.gcn1 = GCNConv(embed_dim, 64)\n        self.gcn2 = GCNConv(64, 64)\n        self.lin = nn.Linear(64, num_classes)\n        self.dropout = nn.Dropout(0.2)\n\n    def forward(self, x, edge_index, batch):\n        x = self.embed(x.squeeze(-1))\n        x = self.gcn1(x, edge_index).relu()\n        x = self.gcn2(x, edge_index).relu()\n        x = global_mean_pool(x, batch)\n        x = self.dropout(x)\n        return self.lin(x)\n\n\n# ---------------------------------------------------------------------\n# ---------- Evaluation helper ----------------------------------------\ncriterion = nn.CrossEntropyLoss()\n\n\ndef evaluate(model, loader):\n    model.eval()\n    total_loss, all_preds, all_labels, all_seqs = 0.0, [], [], []\n    with torch.no_grad():\n        for batch in loader:\n            batch = batch.to(device)\n            out = model(batch.x, batch.edge_index, batch.batch)\n            loss = criterion(out, batch.y.view(-1))\n            total_loss += loss.item() * batch.num_graphs\n            preds = out.argmax(dim=-1).cpu().tolist()\n            labels = batch.y.view(-1).cpu().tolist()\n            seqs = batch.seq\n            all_preds.extend(preds)\n            all_labels.extend(labels)\n            all_seqs.extend(seqs)\n    cwa = color_weighted_accuracy(all_seqs, all_labels, all_preds)\n    swa = shape_weighted_accuracy(all_seqs, all_labels, all_preds)\n    bwa = (cwa + swa) / 2.0\n    return total_loss / len(loader.dataset), bwa, cwa, swa, all_preds, all_labels\n\n\n# ---------------------------------------------------------------------\n# ---------- Hyperparameter tuning over num_epochs --------------------\ncandidate_max_epochs = [10, 20, 30, 40, 50]\npatience = 5\n\nexperiment_data = {\"num_epochs\": {}}\n\nfor max_ep in candidate_max_epochs:\n    run_key = f\"max_{max_ep}\"\n    experiment_data[\"num_epochs\"][run_key] = {\n        \"metrics\": {\"train\": [], \"val\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n        \"timestamps\": [],\n    }\n\n    model = SPR_GCN(len(token2idx), 32, len(label2idx)).to(device)\n    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n    best_bwa, best_state, wait = -1.0, None, 0\n\n    for epoch in range(1, max_ep + 1):\n        model.train()\n        epoch_loss = 0.0\n        for batch in train_loader:\n            batch = batch.to(device)\n            optimizer.zero_grad()\n            out = model(batch.x, batch.edge_index, batch.batch)\n            loss = criterion(out, batch.y.view(-1))\n            loss.backward()\n            optimizer.step()\n            epoch_loss += loss.item() * batch.num_graphs\n        train_loss = epoch_loss / len(train_loader.dataset)\n\n        val_loss, val_bwa, val_cwa, val_swa, _, _ = evaluate(model, dev_loader)\n        _, train_bwa, _, _, _, _ = evaluate(model, train_loader)\n\n        # log\n        exd = experiment_data[\"num_epochs\"][run_key]\n        exd[\"losses\"][\"train\"].append(train_loss)\n        exd[\"losses\"][\"val\"].append(val_loss)\n        exd[\"metrics\"][\"train\"].append(train_bwa)\n        exd[\"metrics\"][\"val\"].append(val_bwa)\n        exd[\"timestamps\"].append(time.time())\n\n        print(\n            f\"[{run_key}] Epoch {epoch:3d}/{max_ep}: \"\n            f\"train_loss={train_loss:.4f} val_loss={val_loss:.4f} \"\n            f\"BWA={val_bwa:.4f} (CWA={val_cwa:.4f}, SWA={val_swa:.4f})\"\n        )\n\n        # early stopping\n        if val_bwa > best_bwa:\n            best_bwa, best_state, wait = val_bwa, copy.deepcopy(model.state_dict()), 0\n        else:\n            wait += 1\n            if wait >= patience:\n                print(f\"[{run_key}] Early stopping triggered at epoch {epoch}.\")\n                break\n\n    # restore best model\n    if best_state is not None:\n        model.load_state_dict(best_state)\n\n    # final test evaluation\n    test_loss, test_bwa, test_cwa, test_swa, test_preds, test_labels = evaluate(\n        model, test_loader\n    )\n    exd[\"predictions\"] = test_preds\n    exd[\"ground_truth\"] = test_labels\n    exd[\"test_metrics\"] = {\n        \"loss\": test_loss,\n        \"BWA\": test_bwa,\n        \"CWA\": test_cwa,\n        \"SWA\": test_swa,\n    }\n    print(\n        f\"[{run_key}] Test -> loss: {test_loss:.4f}  \"\n        f\"BWA: {test_bwa:.4f} (CWA={test_cwa:.4f} SWA={test_swa:.4f})\"\n    )\n\n    # -----------------------------------------------------------------\n    # plotting for this run\n    epochs_arr = np.arange(1, len(exd[\"metrics\"][\"train\"]) + 1)\n    plt.figure()\n    plt.plot(epochs_arr, exd[\"metrics\"][\"train\"], label=\"Train BWA\")\n    plt.plot(epochs_arr, exd[\"metrics\"][\"val\"], label=\"Dev BWA\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"BWA\")\n    plt.title(f\"BWA curve ({run_key})\")\n    plt.legend()\n    plt.tight_layout()\n    plot_path = os.path.join(working_dir, f\"bwa_curve_{run_key}.png\")\n    plt.savefig(plot_path)\n    plt.close()\n    print(f\"[{run_key}] Curve saved to {plot_path}\")\n\n    # free gpu memory between runs\n    del model\n    torch.cuda.empty_cache()\n\n# ---------------------------------------------------------------------\n# ---------- Save experiment data -------------------------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"All experiment data saved to working/experiment_data.npy\")\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ---------------------------------------------------------------------\n# mandatory working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------------------------------------------------------------------\n# load experiment data\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\n    runs = experiment_data.get(\"num_epochs\", {})\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    runs = {}\n\n# ---------------------------------------------------------------------\n# 1) Per\u2013run train/val BWA curves  (<=5 similar figures)\nfor i, (run_key, run_dict) in enumerate(runs.items()):\n    if i >= 5:  # obey \u201cat most 5 similar figures\u201d\n        break\n    try:\n        epochs = np.arange(1, len(run_dict[\"metrics\"][\"train\"]) + 1)\n        train_bwa = run_dict[\"metrics\"][\"train\"]\n        val_bwa = run_dict[\"metrics\"][\"val\"]\n\n        plt.figure()\n        plt.plot(epochs, train_bwa, label=\"Train BWA\")\n        plt.plot(epochs, val_bwa, label=\"Validation BWA\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"BWA\")\n        plt.title(f\"SPR-BENCH BWA Learning Curve \u2013 {run_key}\")\n        plt.legend()\n        plt.tight_layout()\n        fname = f\"spr_bench_bwa_curve_{run_key}.png\"\n        path = os.path.join(working_dir, fname)\n        plt.savefig(path)\n        plt.close()\n        print(f\"Saved {path}\")\n    except Exception as e:\n        print(f\"Error creating BWA curve for {run_key}: {e}\")\n        plt.close()\n\n# ---------------------------------------------------------------------\n# 2) Bar chart comparing test BWA across runs\ntry:\n    run_names = []\n    test_bwa_values = []\n    for rk, rd in runs.items():\n        if \"test_metrics\" in rd and \"BWA\" in rd[\"test_metrics\"]:\n            run_names.append(rk)\n            test_bwa_values.append(rd[\"test_metrics\"][\"BWA\"])\n\n    plt.figure()\n    x_pos = np.arange(len(run_names))\n    plt.bar(x_pos, test_bwa_values, color=\"skyblue\")\n    plt.xticks(x_pos, run_names, rotation=45, ha=\"right\")\n    plt.ylabel(\"Test BWA\")\n    plt.title(\"SPR-BENCH: Test BWA for Different max_epoch Settings\")\n    plt.tight_layout()\n    fname = \"spr_bench_test_bwa_comparison.png\"\n    path = os.path.join(working_dir, fname)\n    plt.savefig(path)\n    plt.close()\n    print(f\"Saved {path}\")\nexcept Exception as e:\n    print(f\"Error creating test BWA comparison bar chart: {e}\")\n    plt.close()\n\n# ---------------------------------------------------------------------\n# 3) Confusion matrix of best run (highest test BWA)\ntry:\n    # locate best run\n    best_run = max(\n        runs.items(),\n        key=lambda item: item[1].get(\"test_metrics\", {}).get(\"BWA\", -np.inf),\n    )[0]\n    preds = np.array(runs[best_run][\"predictions\"])\n    gts = np.array(runs[best_run][\"ground_truth\"])\n    num_classes = int(max(preds.max(), gts.max()) + 1)\n    conf_mat = np.zeros((num_classes, num_classes), dtype=int)\n    for gt, pr in zip(gts, preds):\n        conf_mat[gt, pr] += 1\n\n    plt.figure(figsize=(6, 5))\n    im = plt.imshow(conf_mat, cmap=\"Blues\")\n    plt.colorbar(im, fraction=0.046, pad=0.04)\n    plt.xlabel(\"Predicted label\")\n    plt.ylabel(\"True label\")\n    plt.title(f\"SPR-BENCH Confusion Matrix \u2013 Best Run: {best_run}\")\n    for (i, j), v in np.ndenumerate(conf_mat):\n        plt.text(j, i, str(v), ha=\"center\", va=\"center\", color=\"black\", fontsize=8)\n    plt.tight_layout()\n    fname = f\"spr_bench_confusion_matrix_{best_run}.png\"\n    path = os.path.join(working_dir, fname)\n    plt.savefig(path)\n    plt.close()\n    print(f\"Saved {path}\")\nexcept Exception as e:\n    print(f\"Error creating confusion matrix: {e}\")\n    plt.close()\n",
+      "plot_analyses": [
+        {
+          "analysis": "This plot shows the Balanced Weighted Accuracy (BWA) for both the training and development datasets over 10 epochs. The BWA for both datasets improves consistently with each epoch, with a slight convergence observed by the 10th epoch. The training and development curves are closely aligned, indicating minimal overfitting at this stage. The steady improvement suggests that the model is learning effectively.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/bwa_curve_max_10.png"
+        },
+        {
+          "analysis": "The plot extends the analysis to 20 epochs, showing continued improvement in BWA for both training and development datasets. The alignment of the curves remains close, which is a positive sign that overfitting is still under control. The BWA appears to plateau slightly after 15 epochs, suggesting diminishing returns with additional epochs.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/bwa_curve_max_20.png"
+        },
+        {
+          "analysis": "This plot examines the performance over 30 epochs. Both training and development BWA continue to show improvement, though the rate of increase slows down significantly after 20 epochs. The alignment between the two curves persists, which is a good indicator of generalization. However, the plateauing trend becomes more pronounced, raising questions about the utility of further increasing the number of epochs.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/bwa_curve_max_30.png"
+        },
+        {
+          "analysis": "With 40 epochs, the BWA for both training and development datasets shows minor fluctuations but remains largely stable, with the training BWA slightly higher than the development BWA. These fluctuations may indicate the onset of overfitting, though the overall performance remains strong. The plateau observed earlier persists, reinforcing the diminishing returns of additional training epochs.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/bwa_curve_max_40.png"
+        },
+        {
+          "analysis": "This plot is similar to the previous one but extends the analysis to 50 epochs. The fluctuations in BWA become more noticeable, particularly for the development dataset, which suggests overfitting may be becoming more pronounced. The training BWA continues to increase slightly, but the development BWA does not show significant improvement, confirming the plateauing trend.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/bwa_curve_max_50.png"
+        },
+        {
+          "analysis": "This plot mirrors the first plot but focuses on validation BWA instead of development BWA. The trends are similar, with consistent improvement over 10 epochs and close alignment between training and validation curves. This supports the earlier conclusion that the model is learning effectively without significant overfitting at this stage.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/spr_bench_bwa_curve_max_10.png"
+        },
+        {
+          "analysis": "This plot extends the validation BWA analysis to 20 epochs. The trends are consistent with earlier observations: steady improvement, close alignment between training and validation curves, and a slight plateau after 15 epochs. The results continue to indicate good generalization and learning efficiency.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/spr_bench_bwa_curve_max_20.png"
+        },
+        {
+          "analysis": "The plot for 30 epochs shows a continuation of earlier trends, with both training and validation BWA improving steadily but at a slower rate. The curves remain closely aligned, suggesting minimal overfitting. However, the plateauing trend is evident, indicating the model's capacity might be nearing its limit for this dataset.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/spr_bench_bwa_curve_max_30.png"
+        },
+        {
+          "analysis": "This plot for 40 epochs shows minor fluctuations in both training and validation BWA, with the validation curve showing slight instability compared to earlier stages. This could indicate the beginning stages of overfitting. The plateauing trend persists, and the added epochs provide limited performance gains.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/spr_bench_bwa_curve_max_40.png"
+        },
+        {
+          "analysis": "This bar plot summarizes the test BWA for different maximum epoch settings. The test BWA remains consistent across all settings, suggesting that increasing the number of epochs beyond 10 does not significantly impact test performance. This reinforces the earlier observation that the model's capacity is limited, and additional training epochs yield diminishing returns.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/spr_bench_bwa_curve_max_50.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/bwa_curve_max_10.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/bwa_curve_max_20.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/bwa_curve_max_30.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/bwa_curve_max_40.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/bwa_curve_max_50.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/spr_bench_bwa_curve_max_10.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/spr_bench_bwa_curve_max_20.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/spr_bench_bwa_curve_max_30.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/spr_bench_bwa_curve_max_40.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/spr_bench_bwa_curve_max_50.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/spr_bench_test_bwa_comparison.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/spr_bench_confusion_matrix_max_50.png"
+      ],
+      "vlm_feedback_summary": "The plots indicate that the model achieves steady performance improvements in Balanced Weighted Accuracy (BWA) during training and validation up to 20 epochs, after which the gains plateau. Overfitting becomes more noticeable as the number of epochs increases beyond 30, with fluctuations in development and validation BWA. The test BWA remains consistent across different epoch settings, suggesting limited benefits from extended training. Overall, the model demonstrates effective learning and generalization up to 20 epochs, but further optimization should focus on reducing overfitting and exploring alternative regularization techniques.",
+      "exp_results_dir": "experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/experiment_data.npy"
+      ]
+    },
+    {
+      "overall_plan": "The overall plan involves a two-pronged approach. Previously, the focus was on hyperparameter tuning of the 'num_epochs' for a GCN model. This involved exploring various epoch budgets, using early stopping for optimization, and thoroughly documenting the results, including saving the best model weights and generating performance visualizations. The current plan, labeled as a 'Seed node,' suggests initiating a new foundational or baseline aspect of the research. This dual strategy emphasizes both the refinement of existing model parameters and laying the groundwork for future experiments.",
+      "analysis": "",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "training balanced weighted accuracy",
+              "lower_is_better": false,
+              "description": "The best balanced weighted accuracy achieved during training.",
+              "data": [
+                {
+                  "dataset_name": "max_10",
+                  "final_value": 0.9132,
+                  "best_value": 0.9132
+                },
+                {
+                  "dataset_name": "max_20",
+                  "final_value": 0.9367,
+                  "best_value": 0.9367
+                },
+                {
+                  "dataset_name": "max_30",
+                  "final_value": 0.9428,
+                  "best_value": 0.9428
+                },
+                {
+                  "dataset_name": "max_40",
+                  "final_value": 0.9449,
+                  "best_value": 0.9449
+                },
+                {
+                  "dataset_name": "max_50",
+                  "final_value": 0.949,
+                  "best_value": 0.949
+                }
+              ]
+            },
+            {
+              "metric_name": "training loss",
+              "lower_is_better": true,
+              "description": "The lowest loss achieved during training.",
+              "data": [
+                {
+                  "dataset_name": "max_10",
+                  "final_value": 0.2932,
+                  "best_value": 0.2932
+                },
+                {
+                  "dataset_name": "max_20",
+                  "final_value": 0.2418,
+                  "best_value": 0.2418
+                },
+                {
+                  "dataset_name": "max_30",
+                  "final_value": 0.2187,
+                  "best_value": 0.2187
+                },
+                {
+                  "dataset_name": "max_40",
+                  "final_value": 0.2201,
+                  "best_value": 0.2201
+                },
+                {
+                  "dataset_name": "max_50",
+                  "final_value": 0.2084,
+                  "best_value": 0.2084
+                }
+              ]
+            },
+            {
+              "metric_name": "validation balanced weighted accuracy",
+              "lower_is_better": false,
+              "description": "The best balanced weighted accuracy achieved during validation.",
+              "data": [
+                {
+                  "dataset_name": "max_10",
+                  "final_value": 0.9127,
+                  "best_value": 0.9127
+                },
+                {
+                  "dataset_name": "max_20",
+                  "final_value": 0.9291,
+                  "best_value": 0.9291
+                },
+                {
+                  "dataset_name": "max_30",
+                  "final_value": 0.9362,
+                  "best_value": 0.9362
+                },
+                {
+                  "dataset_name": "max_40",
+                  "final_value": 0.937,
+                  "best_value": 0.937
+                },
+                {
+                  "dataset_name": "max_50",
+                  "final_value": 0.9414,
+                  "best_value": 0.9414
+                }
+              ]
+            },
+            {
+              "metric_name": "validation loss",
+              "lower_is_better": true,
+              "description": "The lowest loss achieved during validation.",
+              "data": [
+                {
+                  "dataset_name": "max_10",
+                  "final_value": 0.2856,
+                  "best_value": 0.2856
+                },
+                {
+                  "dataset_name": "max_20",
+                  "final_value": 0.2398,
+                  "best_value": 0.2398
+                },
+                {
+                  "dataset_name": "max_30",
+                  "final_value": 0.2142,
+                  "best_value": 0.2142
+                },
+                {
+                  "dataset_name": "max_40",
+                  "final_value": 0.2128,
+                  "best_value": 0.2128
+                },
+                {
+                  "dataset_name": "max_50",
+                  "final_value": 0.2044,
+                  "best_value": 0.2044
+                }
+              ]
+            },
+            {
+              "metric_name": "test balanced weighted accuracy",
+              "lower_is_better": false,
+              "description": "The balanced weighted accuracy achieved on the test dataset.",
+              "data": [
+                {
+                  "dataset_name": "max_10",
+                  "final_value": 0.6403,
+                  "best_value": 0.6403
+                },
+                {
+                  "dataset_name": "max_20",
+                  "final_value": 0.651,
+                  "best_value": 0.651
+                },
+                {
+                  "dataset_name": "max_30",
+                  "final_value": 0.6511,
+                  "best_value": 0.6511
+                },
+                {
+                  "dataset_name": "max_40",
+                  "final_value": 0.6525,
+                  "best_value": 0.6525
+                },
+                {
+                  "dataset_name": "max_50",
+                  "final_value": 0.6556,
+                  "best_value": 0.6556
+                }
+              ]
+            },
+            {
+              "metric_name": "test color-weighted accuracy",
+              "lower_is_better": false,
+              "description": "The color-weighted accuracy achieved on the test dataset.",
+              "data": [
+                {
+                  "dataset_name": "max_10",
+                  "final_value": 0.6605,
+                  "best_value": 0.6605
+                },
+                {
+                  "dataset_name": "max_20",
+                  "final_value": 0.6722,
+                  "best_value": 0.6722
+                },
+                {
+                  "dataset_name": "max_30",
+                  "final_value": 0.6723,
+                  "best_value": 0.6723
+                },
+                {
+                  "dataset_name": "max_40",
+                  "final_value": 0.6738,
+                  "best_value": 0.6738
+                },
+                {
+                  "dataset_name": "max_50",
+                  "final_value": 0.6771,
+                  "best_value": 0.6771
+                }
+              ]
+            },
+            {
+              "metric_name": "test shape-weighted accuracy",
+              "lower_is_better": false,
+              "description": "The shape-weighted accuracy achieved on the test dataset.",
+              "data": [
+                {
+                  "dataset_name": "max_10",
+                  "final_value": 0.6201,
+                  "best_value": 0.6201
+                },
+                {
+                  "dataset_name": "max_20",
+                  "final_value": 0.6298,
+                  "best_value": 0.6298
+                },
+                {
+                  "dataset_name": "max_30",
+                  "final_value": 0.6299,
+                  "best_value": 0.6299
+                },
+                {
+                  "dataset_name": "max_40",
+                  "final_value": 0.6312,
+                  "best_value": 0.6312
+                },
+                {
+                  "dataset_name": "max_50",
+                  "final_value": 0.6341,
+                  "best_value": 0.6341
+                }
+              ]
+            },
+            {
+              "metric_name": "test loss",
+              "lower_is_better": true,
+              "description": "The loss achieved on the test dataset.",
+              "data": [
+                {
+                  "dataset_name": "max_10",
+                  "final_value": 0.9275,
+                  "best_value": 0.9275
+                },
+                {
+                  "dataset_name": "max_20",
+                  "final_value": 1.1019,
+                  "best_value": 1.1019
+                },
+                {
+                  "dataset_name": "max_30",
+                  "final_value": 1.1984,
+                  "best_value": 1.1984
+                },
+                {
+                  "dataset_name": "max_40",
+                  "final_value": 1.1653,
+                  "best_value": 1.1653
+                },
+                {
+                  "dataset_name": "max_50",
+                  "final_value": 1.206,
+                  "best_value": 1.206
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 1\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os, pathlib, time, copy, numpy as np, torch, torch.nn as nn, matplotlib.pyplot as plt\nfrom torch_geometric.data import Data\nfrom torch_geometric.loader import DataLoader\nfrom torch_geometric.nn import GCNConv, global_mean_pool\nfrom typing import List\nfrom datasets import DatasetDict, load_dataset\n\n# ---------------------------------------------------------------------\n# mandatory working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ---------------------------------------------------------------------\n# ---------- Helper to locate the dataset -----------------------------\ndef locate_spr_bench() -> pathlib.Path:\n    candidates = [\n        pathlib.Path(\"./SPR_BENCH\"),\n        pathlib.Path(\"../SPR_BENCH\"),\n        pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\"),\n        pathlib.Path(os.getenv(\"SPR_DATA_PATH\", \"\")),\n    ]\n    for p in candidates:\n        if p and (p / \"train.csv\").exists() and (p / \"dev.csv\").exists():\n            print(f\"Found SPR_BENCH at: {p.resolve()}\")\n            return p.resolve()\n    raise FileNotFoundError(\n        \"SPR_BENCH dataset not found. Place the folder appropriately or set SPR_DATA_PATH.\"\n    )\n\n\n# ---------------------------------------------------------------------\n# ---------- Provided helpers -----------------------------------------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(split_csv: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / split_csv),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    dset = DatasetDict()\n    for sp in [\"train\", \"dev\", \"test\"]:\n        dset[sp] = _load(f\"{sp}.csv\")\n    return dset\n\n\ndef count_color_variety(sequence: str) -> int:\n    return len(set(t[1] for t in sequence.strip().split() if len(t) > 1))\n\n\ndef count_shape_variety(sequence: str) -> int:\n    return len(set(t[0] for t in sequence.strip().split() if t))\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    corr = [wt if yt == yp else 0 for wt, yt, yp in zip(w, y_true, y_pred)]\n    return sum(corr) / (sum(w) if sum(w) > 0 else 1)\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    corr = [wt if yt == yp else 0 for wt, yt, yp in zip(w, y_true, y_pred)]\n    return sum(corr) / (sum(w) if sum(w) > 0 else 1)\n\n\n# ---------------------------------------------------------------------\n# ---------- Load and preprocess dataset ------------------------------\nDATA_PATH = locate_spr_bench()\nspr = load_spr_bench(DATA_PATH)\n\n\ndef extract_tokens(seq: str) -> List[str]:\n    return seq.strip().split()\n\n\ntoken_set, label_set = set(), set()\nfor ex in spr[\"train\"]:\n    token_set.update(extract_tokens(ex[\"sequence\"]))\n    label_set.add(ex[\"label\"])\n\ntoken2idx = {tok: i + 1 for i, tok in enumerate(sorted(token_set))}\nlabel2idx = {lab: i for i, lab in enumerate(sorted(label_set))}\nidx2label = {i: lab for lab, i in label2idx.items()}\n\n\ndef seq_to_data(example):\n    seq = example[\"sequence\"]\n    tokens = extract_tokens(seq)\n    node_indices = [token2idx.get(tok, 0) for tok in tokens]\n    x = torch.tensor(node_indices, dtype=torch.long).unsqueeze(-1)\n\n    if len(tokens) > 1:\n        src = torch.arange(0, len(tokens) - 1, dtype=torch.long)\n        dst = src + 1\n        edge_index = torch.stack([torch.cat([src, dst]), torch.cat([dst, src])], dim=0)\n    else:\n        edge_index = torch.zeros((2, 0), dtype=torch.long)\n\n    y = torch.tensor([label2idx[example[\"label\"]]], dtype=torch.long)\n    data = Data(x=x, edge_index=edge_index, y=y)\n    data.seq = seq\n    return data\n\n\ntrain_graphs = [seq_to_data(ex) for ex in spr[\"train\"]]\ndev_graphs = [seq_to_data(ex) for ex in spr[\"dev\"]]\ntest_graphs = [seq_to_data(ex) for ex in spr[\"test\"]]\n\nbatch_size = 64\ntrain_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)\ndev_loader = DataLoader(dev_graphs, batch_size=batch_size, shuffle=False)\ntest_loader = DataLoader(test_graphs, batch_size=batch_size, shuffle=False)\n\n\n# ---------------------------------------------------------------------\n# ---------- Model Definition -----------------------------------------\nclass SPR_GCN(nn.Module):\n    def __init__(self, vocab_size: int, embed_dim: int, num_classes: int):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size + 1, embed_dim, padding_idx=0)\n        self.gcn1 = GCNConv(embed_dim, 64)\n        self.gcn2 = GCNConv(64, 64)\n        self.lin = nn.Linear(64, num_classes)\n        self.dropout = nn.Dropout(0.2)\n\n    def forward(self, x, edge_index, batch):\n        x = self.embed(x.squeeze(-1))\n        x = self.gcn1(x, edge_index).relu()\n        x = self.gcn2(x, edge_index).relu()\n        x = global_mean_pool(x, batch)\n        x = self.dropout(x)\n        return self.lin(x)\n\n\n# ---------------------------------------------------------------------\n# ---------- Evaluation helper ----------------------------------------\ncriterion = nn.CrossEntropyLoss()\n\n\ndef evaluate(model, loader):\n    model.eval()\n    total_loss, all_preds, all_labels, all_seqs = 0.0, [], [], []\n    with torch.no_grad():\n        for batch in loader:\n            batch = batch.to(device)\n            out = model(batch.x, batch.edge_index, batch.batch)\n            loss = criterion(out, batch.y.view(-1))\n            total_loss += loss.item() * batch.num_graphs\n            preds = out.argmax(dim=-1).cpu().tolist()\n            labels = batch.y.view(-1).cpu().tolist()\n            seqs = batch.seq\n            all_preds.extend(preds)\n            all_labels.extend(labels)\n            all_seqs.extend(seqs)\n    cwa = color_weighted_accuracy(all_seqs, all_labels, all_preds)\n    swa = shape_weighted_accuracy(all_seqs, all_labels, all_preds)\n    bwa = (cwa + swa) / 2.0\n    return total_loss / len(loader.dataset), bwa, cwa, swa, all_preds, all_labels\n\n\n# ---------------------------------------------------------------------\n# ---------- Hyperparameter tuning over num_epochs --------------------\ncandidate_max_epochs = [10, 20, 30, 40, 50]\npatience = 5\n\nexperiment_data = {\"num_epochs\": {}}\n\nfor max_ep in candidate_max_epochs:\n    run_key = f\"max_{max_ep}\"\n    experiment_data[\"num_epochs\"][run_key] = {\n        \"metrics\": {\"train\": [], \"val\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n        \"timestamps\": [],\n    }\n\n    model = SPR_GCN(len(token2idx), 32, len(label2idx)).to(device)\n    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n    best_bwa, best_state, wait = -1.0, None, 0\n\n    for epoch in range(1, max_ep + 1):\n        model.train()\n        epoch_loss = 0.0\n        for batch in train_loader:\n            batch = batch.to(device)\n            optimizer.zero_grad()\n            out = model(batch.x, batch.edge_index, batch.batch)\n            loss = criterion(out, batch.y.view(-1))\n            loss.backward()\n            optimizer.step()\n            epoch_loss += loss.item() * batch.num_graphs\n        train_loss = epoch_loss / len(train_loader.dataset)\n\n        val_loss, val_bwa, val_cwa, val_swa, _, _ = evaluate(model, dev_loader)\n        _, train_bwa, _, _, _, _ = evaluate(model, train_loader)\n\n        # log\n        exd = experiment_data[\"num_epochs\"][run_key]\n        exd[\"losses\"][\"train\"].append(train_loss)\n        exd[\"losses\"][\"val\"].append(val_loss)\n        exd[\"metrics\"][\"train\"].append(train_bwa)\n        exd[\"metrics\"][\"val\"].append(val_bwa)\n        exd[\"timestamps\"].append(time.time())\n\n        print(\n            f\"[{run_key}] Epoch {epoch:3d}/{max_ep}: \"\n            f\"train_loss={train_loss:.4f} val_loss={val_loss:.4f} \"\n            f\"BWA={val_bwa:.4f} (CWA={val_cwa:.4f}, SWA={val_swa:.4f})\"\n        )\n\n        # early stopping\n        if val_bwa > best_bwa:\n            best_bwa, best_state, wait = val_bwa, copy.deepcopy(model.state_dict()), 0\n        else:\n            wait += 1\n            if wait >= patience:\n                print(f\"[{run_key}] Early stopping triggered at epoch {epoch}.\")\n                break\n\n    # restore best model\n    if best_state is not None:\n        model.load_state_dict(best_state)\n\n    # final test evaluation\n    test_loss, test_bwa, test_cwa, test_swa, test_preds, test_labels = evaluate(\n        model, test_loader\n    )\n    exd[\"predictions\"] = test_preds\n    exd[\"ground_truth\"] = test_labels\n    exd[\"test_metrics\"] = {\n        \"loss\": test_loss,\n        \"BWA\": test_bwa,\n        \"CWA\": test_cwa,\n        \"SWA\": test_swa,\n    }\n    print(\n        f\"[{run_key}] Test -> loss: {test_loss:.4f}  \"\n        f\"BWA: {test_bwa:.4f} (CWA={test_cwa:.4f} SWA={test_swa:.4f})\"\n    )\n\n    # -----------------------------------------------------------------\n    # plotting for this run\n    epochs_arr = np.arange(1, len(exd[\"metrics\"][\"train\"]) + 1)\n    plt.figure()\n    plt.plot(epochs_arr, exd[\"metrics\"][\"train\"], label=\"Train BWA\")\n    plt.plot(epochs_arr, exd[\"metrics\"][\"val\"], label=\"Dev BWA\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"BWA\")\n    plt.title(f\"BWA curve ({run_key})\")\n    plt.legend()\n    plt.tight_layout()\n    plot_path = os.path.join(working_dir, f\"bwa_curve_{run_key}.png\")\n    plt.savefig(plot_path)\n    plt.close()\n    print(f\"[{run_key}] Curve saved to {plot_path}\")\n\n    # free gpu memory between runs\n    del model\n    torch.cuda.empty_cache()\n\n# ---------------------------------------------------------------------\n# ---------- Save experiment data -------------------------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"All experiment data saved to working/experiment_data.npy\")\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ---------------------------------------------------------------------\n# mandatory working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------------------------------------------------------------------\n# load experiment data\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\n    runs = experiment_data.get(\"num_epochs\", {})\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    runs = {}\n\n# ---------------------------------------------------------------------\n# 1) Per\u2013run train/val BWA curves  (<=5 similar figures)\nfor i, (run_key, run_dict) in enumerate(runs.items()):\n    if i >= 5:  # obey \u201cat most 5 similar figures\u201d\n        break\n    try:\n        epochs = np.arange(1, len(run_dict[\"metrics\"][\"train\"]) + 1)\n        train_bwa = run_dict[\"metrics\"][\"train\"]\n        val_bwa = run_dict[\"metrics\"][\"val\"]\n\n        plt.figure()\n        plt.plot(epochs, train_bwa, label=\"Train BWA\")\n        plt.plot(epochs, val_bwa, label=\"Validation BWA\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"BWA\")\n        plt.title(f\"SPR-BENCH BWA Learning Curve \u2013 {run_key}\")\n        plt.legend()\n        plt.tight_layout()\n        fname = f\"spr_bench_bwa_curve_{run_key}.png\"\n        path = os.path.join(working_dir, fname)\n        plt.savefig(path)\n        plt.close()\n        print(f\"Saved {path}\")\n    except Exception as e:\n        print(f\"Error creating BWA curve for {run_key}: {e}\")\n        plt.close()\n\n# ---------------------------------------------------------------------\n# 2) Bar chart comparing test BWA across runs\ntry:\n    run_names = []\n    test_bwa_values = []\n    for rk, rd in runs.items():\n        if \"test_metrics\" in rd and \"BWA\" in rd[\"test_metrics\"]:\n            run_names.append(rk)\n            test_bwa_values.append(rd[\"test_metrics\"][\"BWA\"])\n\n    plt.figure()\n    x_pos = np.arange(len(run_names))\n    plt.bar(x_pos, test_bwa_values, color=\"skyblue\")\n    plt.xticks(x_pos, run_names, rotation=45, ha=\"right\")\n    plt.ylabel(\"Test BWA\")\n    plt.title(\"SPR-BENCH: Test BWA for Different max_epoch Settings\")\n    plt.tight_layout()\n    fname = \"spr_bench_test_bwa_comparison.png\"\n    path = os.path.join(working_dir, fname)\n    plt.savefig(path)\n    plt.close()\n    print(f\"Saved {path}\")\nexcept Exception as e:\n    print(f\"Error creating test BWA comparison bar chart: {e}\")\n    plt.close()\n\n# ---------------------------------------------------------------------\n# 3) Confusion matrix of best run (highest test BWA)\ntry:\n    # locate best run\n    best_run = max(\n        runs.items(),\n        key=lambda item: item[1].get(\"test_metrics\", {}).get(\"BWA\", -np.inf),\n    )[0]\n    preds = np.array(runs[best_run][\"predictions\"])\n    gts = np.array(runs[best_run][\"ground_truth\"])\n    num_classes = int(max(preds.max(), gts.max()) + 1)\n    conf_mat = np.zeros((num_classes, num_classes), dtype=int)\n    for gt, pr in zip(gts, preds):\n        conf_mat[gt, pr] += 1\n\n    plt.figure(figsize=(6, 5))\n    im = plt.imshow(conf_mat, cmap=\"Blues\")\n    plt.colorbar(im, fraction=0.046, pad=0.04)\n    plt.xlabel(\"Predicted label\")\n    plt.ylabel(\"True label\")\n    plt.title(f\"SPR-BENCH Confusion Matrix \u2013 Best Run: {best_run}\")\n    for (i, j), v in np.ndenumerate(conf_mat):\n        plt.text(j, i, str(v), ha=\"center\", va=\"center\", color=\"black\", fontsize=8)\n    plt.tight_layout()\n    fname = f\"spr_bench_confusion_matrix_{best_run}.png\"\n    path = os.path.join(working_dir, fname)\n    plt.savefig(path)\n    plt.close()\n    print(f\"Saved {path}\")\nexcept Exception as e:\n    print(f\"Error creating confusion matrix: {e}\")\n    plt.close()\n",
+      "plot_analyses": [
+        {
+          "analysis": "The plot shows the Balanced Weighted Accuracy (BWA) for training and development datasets over a maximum of 10 epochs. Both curves increase steadily, indicating that the model is learning effectively without overfitting. The training and development BWA values closely track each other, suggesting good generalization in this range of epochs.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/bwa_curve_max_10.png"
+        },
+        {
+          "analysis": "This plot extends the observation to 20 epochs. The training and development BWA continue to improve and remain closely aligned. There is no significant divergence between the two curves, which suggests that the model is not overfitting even with a higher number of epochs.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/bwa_curve_max_20.png"
+        },
+        {
+          "analysis": "The plot for 30 epochs shows a slight increase in variability in the training BWA curve while the development curve remains relatively stable. This could indicate the beginning of overfitting, as the model starts to perform slightly better on the training data than on the development data.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/bwa_curve_max_30.png"
+        },
+        {
+          "analysis": "In this plot for 40 epochs, the training BWA shows more pronounced fluctuations, while the development BWA remains stable but slightly lower. This suggests that overfitting is becoming more apparent as the model continues to train for more epochs.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/bwa_curve_max_40.png"
+        },
+        {
+          "analysis": "The plot for 50 epochs reveals further divergence between the training and development BWA curves. The training BWA fluctuates more significantly, while the development BWA stabilizes at a slightly lower value. This indicates that overfitting is now evident, and further training does not improve generalization.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/bwa_curve_max_50.png"
+        },
+        {
+          "analysis": "This plot shows the training and validation BWA curves for a maximum of 10 epochs. Both curves increase steadily and remain closely aligned, indicating effective learning and good generalization within this range of epochs.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/spr_bench_bwa_curve_max_10.png"
+        },
+        {
+          "analysis": "The plot for a maximum of 20 epochs shows that both training and validation BWA curves continue to improve and remain closely aligned, confirming that the model is still generalizing well without signs of overfitting.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/spr_bench_bwa_curve_max_20.png"
+        },
+        {
+          "analysis": "For a maximum of 30 epochs, the training BWA curve shows slightly more variability compared to the validation curve, which remains stable. This suggests that the model is starting to overfit to the training data as the number of epochs increases.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/spr_bench_bwa_curve_max_30.png"
+        },
+        {
+          "analysis": "The plot for 40 epochs shows that the training BWA curve fluctuates more significantly, while the validation BWA curve stabilizes at a slightly lower value. This indicates that overfitting is becoming more pronounced as the model trains for more epochs.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/spr_bench_bwa_curve_max_40.png"
+        },
+        {
+          "analysis": "This bar chart summarizes the test BWA for different maximum epoch settings. The test BWA remains consistent across different epoch settings, suggesting that the model's generalization to unseen data is not significantly impacted by the number of training epochs.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/spr_bench_bwa_curve_max_50.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/bwa_curve_max_10.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/bwa_curve_max_20.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/bwa_curve_max_30.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/bwa_curve_max_40.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/bwa_curve_max_50.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/spr_bench_bwa_curve_max_10.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/spr_bench_bwa_curve_max_20.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/spr_bench_bwa_curve_max_30.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/spr_bench_bwa_curve_max_40.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/spr_bench_bwa_curve_max_50.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/spr_bench_test_bwa_comparison.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/spr_bench_confusion_matrix_max_50.png"
+      ],
+      "vlm_feedback_summary": "The plots indicate that the model learns effectively up to around 20 epochs, beyond which overfitting starts to become apparent. The test BWA remains consistent across different maximum epoch settings, suggesting that the model's generalization to unseen data is stable regardless of the number of training epochs. To further improve performance, focus on regularization techniques and avoid excessive training epochs.",
+      "exp_results_dir": "experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/experiment_data.npy"
+      ]
+    },
+    {
+      "overall_plan": "The overall plan involves a systematic approach to hyperparameter tuning, specifically focusing on optimizing the number of epochs for training a Graph Convolutional Network (GCN) model. This process includes reloading the dataset once, iterating over a range of candidate epoch budgets (10-50), and employing early stopping based on development set performance with a patience of five. Best model weights are saved, and performance is evaluated on a test set, with all relevant data stored for analysis. The introduction of a 'seed node' in the current plan suggests an exploration into initialization strategies or novel components in the model architecture, indicating a potential new direction in the experimentation framework. Together, these plans represent a thorough and adaptable strategy for model development and evaluation.",
+      "analysis": "The execution successfully completed the hyperparameter tuning experiments across various epoch settings (10, 20, 30, 40, and 50 epochs). The training, validation, and test results were computed and logged appropriately. Early stopping was triggered as expected for some configurations, and the results were saved, including BWA curves and experiment data. However, while the training and validation BWA improved with increased epochs, the test BWA remained significantly lower, indicating potential overfitting or a need for additional regularization. This is not a bug but a challenge in model generalization that can be addressed in future iterations.",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "training best balanced weighted accuracy",
+              "lower_is_better": false,
+              "description": "The best balanced weighted accuracy achieved during training.",
+              "data": [
+                {
+                  "dataset_name": "max_10",
+                  "final_value": 0.9048,
+                  "best_value": 0.9048
+                },
+                {
+                  "dataset_name": "max_20",
+                  "final_value": 0.9387,
+                  "best_value": 0.9387
+                },
+                {
+                  "dataset_name": "max_30",
+                  "final_value": 0.9394,
+                  "best_value": 0.9394
+                },
+                {
+                  "dataset_name": "max_40",
+                  "final_value": 0.9354,
+                  "best_value": 0.9354
+                },
+                {
+                  "dataset_name": "max_50",
+                  "final_value": 0.9561,
+                  "best_value": 0.9561
+                }
+              ]
+            },
+            {
+              "metric_name": "training lowest loss",
+              "lower_is_better": true,
+              "description": "The lowest loss achieved during training.",
+              "data": [
+                {
+                  "dataset_name": "max_10",
+                  "final_value": 0.2992,
+                  "best_value": 0.2992
+                },
+                {
+                  "dataset_name": "max_20",
+                  "final_value": 0.2384,
+                  "best_value": 0.2384
+                },
+                {
+                  "dataset_name": "max_30",
+                  "final_value": 0.2298,
+                  "best_value": 0.2298
+                },
+                {
+                  "dataset_name": "max_40",
+                  "final_value": 0.2303,
+                  "best_value": 0.2303
+                },
+                {
+                  "dataset_name": "max_50",
+                  "final_value": 0.1919,
+                  "best_value": 0.1919
+                }
+              ]
+            },
+            {
+              "metric_name": "validation best balanced weighted accuracy",
+              "lower_is_better": false,
+              "description": "The best balanced weighted accuracy achieved during validation.",
+              "data": [
+                {
+                  "dataset_name": "max_10",
+                  "final_value": 0.9043,
+                  "best_value": 0.9043
+                },
+                {
+                  "dataset_name": "max_20",
+                  "final_value": 0.9318,
+                  "best_value": 0.9318
+                },
+                {
+                  "dataset_name": "max_30",
+                  "final_value": 0.933,
+                  "best_value": 0.933
+                },
+                {
+                  "dataset_name": "max_40",
+                  "final_value": 0.9327,
+                  "best_value": 0.9327
+                },
+                {
+                  "dataset_name": "max_50",
+                  "final_value": 0.9504,
+                  "best_value": 0.9504
+                }
+              ]
+            },
+            {
+              "metric_name": "validation lowest loss",
+              "lower_is_better": true,
+              "description": "The lowest loss achieved during validation.",
+              "data": [
+                {
+                  "dataset_name": "max_10",
+                  "final_value": 0.2865,
+                  "best_value": 0.2865
+                },
+                {
+                  "dataset_name": "max_20",
+                  "final_value": 0.2259,
+                  "best_value": 0.2259
+                },
+                {
+                  "dataset_name": "max_30",
+                  "final_value": 0.2234,
+                  "best_value": 0.2234
+                },
+                {
+                  "dataset_name": "max_40",
+                  "final_value": 0.2218,
+                  "best_value": 0.2218
+                },
+                {
+                  "dataset_name": "max_50",
+                  "final_value": 0.1887,
+                  "best_value": 0.1887
+                }
+              ]
+            },
+            {
+              "metric_name": "test balanced weighted accuracy",
+              "lower_is_better": false,
+              "description": "The balanced weighted accuracy achieved on the test dataset.",
+              "data": [
+                {
+                  "dataset_name": "max_10",
+                  "final_value": 0.6434,
+                  "best_value": 0.6434
+                },
+                {
+                  "dataset_name": "max_20",
+                  "final_value": 0.65,
+                  "best_value": 0.65
+                },
+                {
+                  "dataset_name": "max_30",
+                  "final_value": 0.6505,
+                  "best_value": 0.6505
+                },
+                {
+                  "dataset_name": "max_40",
+                  "final_value": 0.6508,
+                  "best_value": 0.6508
+                },
+                {
+                  "dataset_name": "max_50",
+                  "final_value": 0.6595,
+                  "best_value": 0.6595
+                }
+              ]
+            },
+            {
+              "metric_name": "test color-weighted accuracy",
+              "lower_is_better": false,
+              "description": "The color-weighted accuracy achieved on the test dataset.",
+              "data": [
+                {
+                  "dataset_name": "max_10",
+                  "final_value": 0.664,
+                  "best_value": 0.664
+                },
+                {
+                  "dataset_name": "max_20",
+                  "final_value": 0.671,
+                  "best_value": 0.671
+                },
+                {
+                  "dataset_name": "max_30",
+                  "final_value": 0.6715,
+                  "best_value": 0.6715
+                },
+                {
+                  "dataset_name": "max_40",
+                  "final_value": 0.672,
+                  "best_value": 0.672
+                },
+                {
+                  "dataset_name": "max_50",
+                  "final_value": 0.6814,
+                  "best_value": 0.6814
+                }
+              ]
+            },
+            {
+              "metric_name": "test shape-weighted accuracy",
+              "lower_is_better": false,
+              "description": "The shape-weighted accuracy achieved on the test dataset.",
+              "data": [
+                {
+                  "dataset_name": "max_10",
+                  "final_value": 0.6229,
+                  "best_value": 0.6229
+                },
+                {
+                  "dataset_name": "max_20",
+                  "final_value": 0.629,
+                  "best_value": 0.629
+                },
+                {
+                  "dataset_name": "max_30",
+                  "final_value": 0.6294,
+                  "best_value": 0.6294
+                },
+                {
+                  "dataset_name": "max_40",
+                  "final_value": 0.6297,
+                  "best_value": 0.6297
+                },
+                {
+                  "dataset_name": "max_50",
+                  "final_value": 0.6375,
+                  "best_value": 0.6375
+                }
+              ]
+            },
+            {
+              "metric_name": "test loss",
+              "lower_is_better": true,
+              "description": "The loss achieved on the test dataset.",
+              "data": [
+                {
+                  "dataset_name": "max_10",
+                  "final_value": 0.9288,
+                  "best_value": 0.9288
+                },
+                {
+                  "dataset_name": "max_20",
+                  "final_value": 1.1425,
+                  "best_value": 1.1425
+                },
+                {
+                  "dataset_name": "max_30",
+                  "final_value": 1.0788,
+                  "best_value": 1.0788
+                },
+                {
+                  "dataset_name": "max_40",
+                  "final_value": 1.048,
+                  "best_value": 1.048
+                },
+                {
+                  "dataset_name": "max_50",
+                  "final_value": 1.4175,
+                  "best_value": 1.4175
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 0\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os, pathlib, time, copy, numpy as np, torch, torch.nn as nn, matplotlib.pyplot as plt\nfrom torch_geometric.data import Data\nfrom torch_geometric.loader import DataLoader\nfrom torch_geometric.nn import GCNConv, global_mean_pool\nfrom typing import List\nfrom datasets import DatasetDict, load_dataset\n\n# ---------------------------------------------------------------------\n# mandatory working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ---------------------------------------------------------------------\n# ---------- Helper to locate the dataset -----------------------------\ndef locate_spr_bench() -> pathlib.Path:\n    candidates = [\n        pathlib.Path(\"./SPR_BENCH\"),\n        pathlib.Path(\"../SPR_BENCH\"),\n        pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\"),\n        pathlib.Path(os.getenv(\"SPR_DATA_PATH\", \"\")),\n    ]\n    for p in candidates:\n        if p and (p / \"train.csv\").exists() and (p / \"dev.csv\").exists():\n            print(f\"Found SPR_BENCH at: {p.resolve()}\")\n            return p.resolve()\n    raise FileNotFoundError(\n        \"SPR_BENCH dataset not found. Place the folder appropriately or set SPR_DATA_PATH.\"\n    )\n\n\n# ---------------------------------------------------------------------\n# ---------- Provided helpers -----------------------------------------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(split_csv: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / split_csv),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    dset = DatasetDict()\n    for sp in [\"train\", \"dev\", \"test\"]:\n        dset[sp] = _load(f\"{sp}.csv\")\n    return dset\n\n\ndef count_color_variety(sequence: str) -> int:\n    return len(set(t[1] for t in sequence.strip().split() if len(t) > 1))\n\n\ndef count_shape_variety(sequence: str) -> int:\n    return len(set(t[0] for t in sequence.strip().split() if t))\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    corr = [wt if yt == yp else 0 for wt, yt, yp in zip(w, y_true, y_pred)]\n    return sum(corr) / (sum(w) if sum(w) > 0 else 1)\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    corr = [wt if yt == yp else 0 for wt, yt, yp in zip(w, y_true, y_pred)]\n    return sum(corr) / (sum(w) if sum(w) > 0 else 1)\n\n\n# ---------------------------------------------------------------------\n# ---------- Load and preprocess dataset ------------------------------\nDATA_PATH = locate_spr_bench()\nspr = load_spr_bench(DATA_PATH)\n\n\ndef extract_tokens(seq: str) -> List[str]:\n    return seq.strip().split()\n\n\ntoken_set, label_set = set(), set()\nfor ex in spr[\"train\"]:\n    token_set.update(extract_tokens(ex[\"sequence\"]))\n    label_set.add(ex[\"label\"])\n\ntoken2idx = {tok: i + 1 for i, tok in enumerate(sorted(token_set))}\nlabel2idx = {lab: i for i, lab in enumerate(sorted(label_set))}\nidx2label = {i: lab for lab, i in label2idx.items()}\n\n\ndef seq_to_data(example):\n    seq = example[\"sequence\"]\n    tokens = extract_tokens(seq)\n    node_indices = [token2idx.get(tok, 0) for tok in tokens]\n    x = torch.tensor(node_indices, dtype=torch.long).unsqueeze(-1)\n\n    if len(tokens) > 1:\n        src = torch.arange(0, len(tokens) - 1, dtype=torch.long)\n        dst = src + 1\n        edge_index = torch.stack([torch.cat([src, dst]), torch.cat([dst, src])], dim=0)\n    else:\n        edge_index = torch.zeros((2, 0), dtype=torch.long)\n\n    y = torch.tensor([label2idx[example[\"label\"]]], dtype=torch.long)\n    data = Data(x=x, edge_index=edge_index, y=y)\n    data.seq = seq\n    return data\n\n\ntrain_graphs = [seq_to_data(ex) for ex in spr[\"train\"]]\ndev_graphs = [seq_to_data(ex) for ex in spr[\"dev\"]]\ntest_graphs = [seq_to_data(ex) for ex in spr[\"test\"]]\n\nbatch_size = 64\ntrain_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)\ndev_loader = DataLoader(dev_graphs, batch_size=batch_size, shuffle=False)\ntest_loader = DataLoader(test_graphs, batch_size=batch_size, shuffle=False)\n\n\n# ---------------------------------------------------------------------\n# ---------- Model Definition -----------------------------------------\nclass SPR_GCN(nn.Module):\n    def __init__(self, vocab_size: int, embed_dim: int, num_classes: int):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size + 1, embed_dim, padding_idx=0)\n        self.gcn1 = GCNConv(embed_dim, 64)\n        self.gcn2 = GCNConv(64, 64)\n        self.lin = nn.Linear(64, num_classes)\n        self.dropout = nn.Dropout(0.2)\n\n    def forward(self, x, edge_index, batch):\n        x = self.embed(x.squeeze(-1))\n        x = self.gcn1(x, edge_index).relu()\n        x = self.gcn2(x, edge_index).relu()\n        x = global_mean_pool(x, batch)\n        x = self.dropout(x)\n        return self.lin(x)\n\n\n# ---------------------------------------------------------------------\n# ---------- Evaluation helper ----------------------------------------\ncriterion = nn.CrossEntropyLoss()\n\n\ndef evaluate(model, loader):\n    model.eval()\n    total_loss, all_preds, all_labels, all_seqs = 0.0, [], [], []\n    with torch.no_grad():\n        for batch in loader:\n            batch = batch.to(device)\n            out = model(batch.x, batch.edge_index, batch.batch)\n            loss = criterion(out, batch.y.view(-1))\n            total_loss += loss.item() * batch.num_graphs\n            preds = out.argmax(dim=-1).cpu().tolist()\n            labels = batch.y.view(-1).cpu().tolist()\n            seqs = batch.seq\n            all_preds.extend(preds)\n            all_labels.extend(labels)\n            all_seqs.extend(seqs)\n    cwa = color_weighted_accuracy(all_seqs, all_labels, all_preds)\n    swa = shape_weighted_accuracy(all_seqs, all_labels, all_preds)\n    bwa = (cwa + swa) / 2.0\n    return total_loss / len(loader.dataset), bwa, cwa, swa, all_preds, all_labels\n\n\n# ---------------------------------------------------------------------\n# ---------- Hyperparameter tuning over num_epochs --------------------\ncandidate_max_epochs = [10, 20, 30, 40, 50]\npatience = 5\n\nexperiment_data = {\"num_epochs\": {}}\n\nfor max_ep in candidate_max_epochs:\n    run_key = f\"max_{max_ep}\"\n    experiment_data[\"num_epochs\"][run_key] = {\n        \"metrics\": {\"train\": [], \"val\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n        \"timestamps\": [],\n    }\n\n    model = SPR_GCN(len(token2idx), 32, len(label2idx)).to(device)\n    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n    best_bwa, best_state, wait = -1.0, None, 0\n\n    for epoch in range(1, max_ep + 1):\n        model.train()\n        epoch_loss = 0.0\n        for batch in train_loader:\n            batch = batch.to(device)\n            optimizer.zero_grad()\n            out = model(batch.x, batch.edge_index, batch.batch)\n            loss = criterion(out, batch.y.view(-1))\n            loss.backward()\n            optimizer.step()\n            epoch_loss += loss.item() * batch.num_graphs\n        train_loss = epoch_loss / len(train_loader.dataset)\n\n        val_loss, val_bwa, val_cwa, val_swa, _, _ = evaluate(model, dev_loader)\n        _, train_bwa, _, _, _, _ = evaluate(model, train_loader)\n\n        # log\n        exd = experiment_data[\"num_epochs\"][run_key]\n        exd[\"losses\"][\"train\"].append(train_loss)\n        exd[\"losses\"][\"val\"].append(val_loss)\n        exd[\"metrics\"][\"train\"].append(train_bwa)\n        exd[\"metrics\"][\"val\"].append(val_bwa)\n        exd[\"timestamps\"].append(time.time())\n\n        print(\n            f\"[{run_key}] Epoch {epoch:3d}/{max_ep}: \"\n            f\"train_loss={train_loss:.4f} val_loss={val_loss:.4f} \"\n            f\"BWA={val_bwa:.4f} (CWA={val_cwa:.4f}, SWA={val_swa:.4f})\"\n        )\n\n        # early stopping\n        if val_bwa > best_bwa:\n            best_bwa, best_state, wait = val_bwa, copy.deepcopy(model.state_dict()), 0\n        else:\n            wait += 1\n            if wait >= patience:\n                print(f\"[{run_key}] Early stopping triggered at epoch {epoch}.\")\n                break\n\n    # restore best model\n    if best_state is not None:\n        model.load_state_dict(best_state)\n\n    # final test evaluation\n    test_loss, test_bwa, test_cwa, test_swa, test_preds, test_labels = evaluate(\n        model, test_loader\n    )\n    exd[\"predictions\"] = test_preds\n    exd[\"ground_truth\"] = test_labels\n    exd[\"test_metrics\"] = {\n        \"loss\": test_loss,\n        \"BWA\": test_bwa,\n        \"CWA\": test_cwa,\n        \"SWA\": test_swa,\n    }\n    print(\n        f\"[{run_key}] Test -> loss: {test_loss:.4f}  \"\n        f\"BWA: {test_bwa:.4f} (CWA={test_cwa:.4f} SWA={test_swa:.4f})\"\n    )\n\n    # -----------------------------------------------------------------\n    # plotting for this run\n    epochs_arr = np.arange(1, len(exd[\"metrics\"][\"train\"]) + 1)\n    plt.figure()\n    plt.plot(epochs_arr, exd[\"metrics\"][\"train\"], label=\"Train BWA\")\n    plt.plot(epochs_arr, exd[\"metrics\"][\"val\"], label=\"Dev BWA\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"BWA\")\n    plt.title(f\"BWA curve ({run_key})\")\n    plt.legend()\n    plt.tight_layout()\n    plot_path = os.path.join(working_dir, f\"bwa_curve_{run_key}.png\")\n    plt.savefig(plot_path)\n    plt.close()\n    print(f\"[{run_key}] Curve saved to {plot_path}\")\n\n    # free gpu memory between runs\n    del model\n    torch.cuda.empty_cache()\n\n# ---------------------------------------------------------------------\n# ---------- Save experiment data -------------------------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"All experiment data saved to working/experiment_data.npy\")\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ---------------------------------------------------------------------\n# mandatory working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------------------------------------------------------------------\n# load experiment data\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\n    runs = experiment_data.get(\"num_epochs\", {})\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    runs = {}\n\n# ---------------------------------------------------------------------\n# 1) Per\u2013run train/val BWA curves  (<=5 similar figures)\nfor i, (run_key, run_dict) in enumerate(runs.items()):\n    if i >= 5:  # obey \u201cat most 5 similar figures\u201d\n        break\n    try:\n        epochs = np.arange(1, len(run_dict[\"metrics\"][\"train\"]) + 1)\n        train_bwa = run_dict[\"metrics\"][\"train\"]\n        val_bwa = run_dict[\"metrics\"][\"val\"]\n\n        plt.figure()\n        plt.plot(epochs, train_bwa, label=\"Train BWA\")\n        plt.plot(epochs, val_bwa, label=\"Validation BWA\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"BWA\")\n        plt.title(f\"SPR-BENCH BWA Learning Curve \u2013 {run_key}\")\n        plt.legend()\n        plt.tight_layout()\n        fname = f\"spr_bench_bwa_curve_{run_key}.png\"\n        path = os.path.join(working_dir, fname)\n        plt.savefig(path)\n        plt.close()\n        print(f\"Saved {path}\")\n    except Exception as e:\n        print(f\"Error creating BWA curve for {run_key}: {e}\")\n        plt.close()\n\n# ---------------------------------------------------------------------\n# 2) Bar chart comparing test BWA across runs\ntry:\n    run_names = []\n    test_bwa_values = []\n    for rk, rd in runs.items():\n        if \"test_metrics\" in rd and \"BWA\" in rd[\"test_metrics\"]:\n            run_names.append(rk)\n            test_bwa_values.append(rd[\"test_metrics\"][\"BWA\"])\n\n    plt.figure()\n    x_pos = np.arange(len(run_names))\n    plt.bar(x_pos, test_bwa_values, color=\"skyblue\")\n    plt.xticks(x_pos, run_names, rotation=45, ha=\"right\")\n    plt.ylabel(\"Test BWA\")\n    plt.title(\"SPR-BENCH: Test BWA for Different max_epoch Settings\")\n    plt.tight_layout()\n    fname = \"spr_bench_test_bwa_comparison.png\"\n    path = os.path.join(working_dir, fname)\n    plt.savefig(path)\n    plt.close()\n    print(f\"Saved {path}\")\nexcept Exception as e:\n    print(f\"Error creating test BWA comparison bar chart: {e}\")\n    plt.close()\n\n# ---------------------------------------------------------------------\n# 3) Confusion matrix of best run (highest test BWA)\ntry:\n    # locate best run\n    best_run = max(\n        runs.items(),\n        key=lambda item: item[1].get(\"test_metrics\", {}).get(\"BWA\", -np.inf),\n    )[0]\n    preds = np.array(runs[best_run][\"predictions\"])\n    gts = np.array(runs[best_run][\"ground_truth\"])\n    num_classes = int(max(preds.max(), gts.max()) + 1)\n    conf_mat = np.zeros((num_classes, num_classes), dtype=int)\n    for gt, pr in zip(gts, preds):\n        conf_mat[gt, pr] += 1\n\n    plt.figure(figsize=(6, 5))\n    im = plt.imshow(conf_mat, cmap=\"Blues\")\n    plt.colorbar(im, fraction=0.046, pad=0.04)\n    plt.xlabel(\"Predicted label\")\n    plt.ylabel(\"True label\")\n    plt.title(f\"SPR-BENCH Confusion Matrix \u2013 Best Run: {best_run}\")\n    for (i, j), v in np.ndenumerate(conf_mat):\n        plt.text(j, i, str(v), ha=\"center\", va=\"center\", color=\"black\", fontsize=8)\n    plt.tight_layout()\n    fname = f\"spr_bench_confusion_matrix_{best_run}.png\"\n    path = os.path.join(working_dir, fname)\n    plt.savefig(path)\n    plt.close()\n    print(f\"Saved {path}\")\nexcept Exception as e:\n    print(f\"Error creating confusion matrix: {e}\")\n    plt.close()\n",
+      "plot_analyses": [
+        {
+          "analysis": "The plot shows the Balanced Weighted Accuracy (BWA) for the training and development sets over 10 epochs. Both curves exhibit steady improvements with increasing epochs, converging towards 0.9. The close alignment between the two curves suggests minimal overfitting and good generalization performance for this epoch range.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/bwa_curve_max_10.png"
+        },
+        {
+          "analysis": "This plot extends the training and development BWA evaluation to 20 epochs. The BWA continues to improve, reaching around 0.94 for training and slightly lower for development. The development curve starts to plateau around epoch 15, with minor deviations from the training curve indicating a slight overfitting tendency.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/bwa_curve_max_20.png"
+        },
+        {
+          "analysis": "With 30 epochs, the BWA for training reaches around 0.94, while development BWA slightly lags behind. The gap between the two curves becomes more noticeable after epoch 20, indicating the onset of overfitting. The development curve shows minor fluctuations, suggesting that the model's performance on unseen data is less stable.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/bwa_curve_max_30.png"
+        },
+        {
+          "analysis": "At 40 epochs, the training BWA maintains around 0.94, and development BWA also stabilizes but remains slightly lower. The gap between the two curves persists, with some fluctuations in the development curve. This indicates that further training may not significantly improve generalization and could exacerbate overfitting.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/bwa_curve_max_40.png"
+        },
+        {
+          "analysis": "The training BWA continues to improve slightly with more epochs, reaching around 0.96 at 50 epochs. However, the development BWA plateaus earlier and shows more pronounced fluctuations, highlighting diminishing returns from additional training and increased overfitting.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/bwa_curve_max_50.png"
+        },
+        {
+          "analysis": "This plot evaluates the effect of different maximum epoch settings on the test BWA. All configurations achieve a similar test BWA of approximately 0.60, indicating limited sensitivity to the number of epochs for the test performance. This suggests that factors other than epoch count may be more critical for improving test BWA, such as regularization or hyperparameter tuning.",
+          "plot_path": "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/spr_bench_bwa_curve_max_10.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/bwa_curve_max_10.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/bwa_curve_max_20.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/bwa_curve_max_30.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/bwa_curve_max_40.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/bwa_curve_max_50.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/spr_bench_bwa_curve_max_10.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/spr_bench_bwa_curve_max_20.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/spr_bench_bwa_curve_max_30.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/spr_bench_bwa_curve_max_40.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/spr_bench_bwa_curve_max_50.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/spr_bench_test_bwa_comparison.png",
+        "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/spr_bench_confusion_matrix_max_50.png"
+      ],
+      "vlm_feedback_summary": "The plots demonstrate the progression of Balanced Weighted Accuracy (BWA) over different epoch ranges for training, development, and test sets. The training and development BWA curves show steady improvements initially but plateau and diverge with more epochs, indicating overfitting. The test BWA remains consistent across different epoch settings, suggesting that further optimization should focus on regularization or other hyperparameters rather than merely increasing the number of epochs.",
+      "exp_results_dir": "experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/experiment_data.npy"
+      ]
+    }
+  ],
+  "aggregated results of nodes with different seeds": {
+    "overall_plan": "The overall plan involves a two-stage process. Initially, hyperparameter tuning is conducted with a focus on the 'num_epochs' parameter, using a range of maximum-epoch budgets from 10 to 50. For each budget, a new GCN model is created and trained with early stopping based on the development set's Best Weighted Accuracy (BWA), maintaining the best model weights. This process concludes with evaluation on the test set and storage of all relevant data in 'experiment_data.npy', along with generating BWA curve PNGs for each run. The current plan complements this by aggregating results from multiple seeds, enhancing the evaluation's robustness and reliability by accounting for variability across different random initializations. This integrated approach ensures a thorough and reliable assessment of the model's performance.",
+    "metric": {
+      "value": null,
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# plotting aggregation code",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ---------------------------------------------------------------------\n# mandatory working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------------------------------------------------------------------\n# Load all experiment_data dictionaries that actually exist -------------\nexperiment_data_path_list = [\n    \"experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_321ca94d4f414dc380718c6085100112_proc_1445253/experiment_data.npy\",\n    \"experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_21405c4999084797a998eac2c2647f5a_proc_1445251/experiment_data.npy\",\n    \"experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_999c6ddfd2c74187bb7d585669a2248a_proc_1445252/experiment_data.npy\",\n]\nall_experiment_data = []\n\n# try to load from the provided absolute paths first\nfor experiment_data_path in experiment_data_path_list:\n    try:\n        root = os.getenv(\"AI_SCIENTIST_ROOT\", \"\")\n        full_path = os.path.join(root, experiment_data_path)\n        if os.path.isfile(full_path):\n            ed = np.load(full_path, allow_pickle=True).item()\n            all_experiment_data.append(ed)\n            print(f\"Loaded {full_path}\")\n        else:\n            print(f\"File not found: {full_path}\")\n    except Exception as e:\n        print(f\"Error loading {experiment_data_path}: {e}\")\n\n# fallback: local copy dropped into working_dir\nfallback_path = os.path.join(working_dir, \"experiment_data.npy\")\nif os.path.isfile(fallback_path):\n    try:\n        ed = np.load(fallback_path, allow_pickle=True).item()\n        all_experiment_data.append(ed)\n        print(f\"Loaded fallback {fallback_path}\")\n    except Exception as e:\n        print(f\"Error loading fallback experiment_data: {e}\")\n\nif len(all_experiment_data) == 0:\n    print(\"No experiment data found, terminating plotting script.\")\nelse:\n    # -----------------------------------------------------------------\n    # Gather per-epoch train/val curves across ALL runs ---------------\n    all_train_curves, all_val_curves = [], []\n    min_common_len = None\n    for ed in all_experiment_data:\n        runs = ed.get(\"num_epochs\", {})\n        for run_key, run_dict in runs.items():\n            train = np.asarray(run_dict[\"metrics\"].get(\"train\", []), dtype=float)\n            val = np.asarray(run_dict[\"metrics\"].get(\"val\", []), dtype=float)\n            # Only keep runs that have both curves of the same length\n            if train.size == 0 or val.size == 0 or train.size != val.size:\n                continue\n            all_train_curves.append(train)\n            all_val_curves.append(val)\n            min_common_len = (\n                train.size\n                if min_common_len is None\n                else min(min_common_len, train.size)\n            )\n\n    # Trim all curves to the shortest common length so epochs align\n    if min_common_len is not None and len(all_train_curves) > 0:\n        all_train_curves = np.stack(\n            [c[:min_common_len] for c in all_train_curves], axis=0\n        )\n        all_val_curves = np.stack([c[:min_common_len] for c in all_val_curves], axis=0)\n        epochs = np.arange(1, min_common_len + 1)\n\n        train_mean = all_train_curves.mean(axis=0)\n        val_mean = all_val_curves.mean(axis=0)\n        train_sem = all_train_curves.std(axis=0, ddof=1) / np.sqrt(\n            all_train_curves.shape[0]\n        )\n        val_sem = all_val_curves.std(axis=0, ddof=1) / np.sqrt(all_val_curves.shape[0])\n    else:\n        train_mean = val_mean = train_sem = val_sem = epochs = None\n\n    # -----------------------------------------------------------------\n    # 1) Aggregated learning curve with SEM bands ---------------------\n    try:\n        if epochs is not None:\n            plt.figure()\n            plt.plot(epochs, train_mean, label=\"Train BWA \u2013 mean\", color=\"tab:blue\")\n            plt.fill_between(\n                epochs,\n                train_mean - train_sem,\n                train_mean + train_sem,\n                color=\"tab:blue\",\n                alpha=0.2,\n                label=\"Train SEM\",\n            )\n            plt.plot(epochs, val_mean, label=\"Val BWA \u2013 mean\", color=\"tab:orange\")\n            plt.fill_between(\n                epochs,\n                val_mean - val_sem,\n                val_mean + val_sem,\n                color=\"tab:orange\",\n                alpha=0.2,\n                label=\"Val SEM\",\n            )\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"BWA\")\n            plt.title(\n                \"SPR-BENCH Mean \u00b1 SEM Train/Val BWA Learning Curve\\n(Aggregated over all runs)\"\n            )\n            plt.legend()\n            plt.tight_layout()\n            fname = \"spr_bench_bwa_mean_sem_curve.png\"\n            path = os.path.join(working_dir, fname)\n            plt.savefig(path)\n            plt.close()\n            print(f\"Saved {path}\")\n        else:\n            print(\"Skipping aggregated learning curve \u2013 insufficient aligned data.\")\n    except Exception as e:\n        print(f\"Error creating aggregated learning-curve plot: {e}\")\n        plt.close()\n\n    # -----------------------------------------------------------------\n    # 2) Bar plot of test-set BWA for each run with overall mean+SEM ---\n    try:\n        run_names, test_bwa_values = [], []\n        for ed in all_experiment_data:\n            runs = ed.get(\"num_epochs\", {})\n            for rk, rd in runs.items():\n                if \"test_metrics\" in rd and \"BWA\" in rd[\"test_metrics\"]:\n                    run_names.append(rk)\n                    test_bwa_values.append(rd[\"test_metrics\"][\"BWA\"])\n\n        if len(test_bwa_values) > 0:\n            test_bwa_values = np.asarray(test_bwa_values, dtype=float)\n            overall_mean = test_bwa_values.mean()\n            overall_sem = test_bwa_values.std(ddof=1) / np.sqrt(test_bwa_values.size)\n\n            x_pos = np.arange(len(run_names))\n            plt.figure(figsize=(max(6, len(run_names) * 0.8), 4))\n            plt.bar(x_pos, test_bwa_values, color=\"skyblue\", label=\"Individual runs\")\n            plt.errorbar(\n                len(run_names) + 0.5,\n                overall_mean,\n                yerr=overall_sem,\n                fmt=\"o\",\n                color=\"red\",\n                label=\"Mean \u00b1 SEM\",\n            )\n            plt.axhline(overall_mean, color=\"red\", linestyle=\"--\", alpha=0.6)\n            plt.xticks(\n                list(x_pos) + [len(run_names) + 0.5],\n                run_names + [\"Mean\"],\n                rotation=45,\n                ha=\"right\",\n            )\n            plt.ylabel(\"Test BWA\")\n            plt.title(\"SPR-BENCH Test BWA Across Runs (Mean \u00b1 SEM)\")\n            plt.legend()\n            plt.tight_layout()\n            fname = \"spr_bench_test_bwa_runs_and_mean.png\"\n            path = os.path.join(working_dir, fname)\n            plt.savefig(path)\n            plt.close()\n            print(f\"Saved {path}\")\n        else:\n            print(\"Skipping test BWA bar chart \u2013 no test metrics available.\")\n    except Exception as e:\n        print(f\"Error creating test-BWA aggregated bar chart: {e}\")\n        plt.close()\n",
+    "plot_analyses": [],
+    "plot_paths": [
+      "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/seed_aggregation_42818b1f38854f4a99f6d05f37aefa6b/spr_bench_bwa_mean_sem_curve.png",
+      "experiments/2025-08-30_17-49-45_gnn_for_spr_attempt_0/logs/0-run/experiment_results/seed_aggregation_42818b1f38854f4a99f6d05f37aefa6b/spr_bench_test_bwa_runs_and_mean.png"
+    ],
+    "vlm_feedback_summary": [],
+    "exp_results_dir": "experiment_results/seed_aggregation_42818b1f38854f4a99f6d05f37aefa6b",
+    "exp_results_npy_files": []
+  }
+}

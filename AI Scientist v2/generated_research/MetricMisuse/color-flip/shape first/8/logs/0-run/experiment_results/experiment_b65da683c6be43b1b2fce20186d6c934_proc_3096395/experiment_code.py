@@ -1,0 +1,332 @@
+# Set random seed
+import random
+import numpy as np
+import torch
+
+seed = 1
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(seed)
+
+import os, random, math, time, pathlib, itertools, datetime, numpy as np, torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from typing import List
+
+# ----------------- working dir -----------------
+working_dir = os.path.join(os.getcwd(), "working")
+os.makedirs(working_dir, exist_ok=True)
+# ----------------- device -----------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+
+# ----------------- try loading SPR_BENCH -----------------
+def try_load_real_dataset():
+    try:
+        from SPR import load_spr_bench  # local util provided by task
+
+        DATA_PATH = pathlib.Path("./SPR_BENCH")
+        if not DATA_PATH.exists():
+            DATA_PATH = pathlib.Path("/home/zxl240011/AI-Scientist-v2/SPR_BENCH/")
+        dset = load_spr_bench(DATA_PATH)
+        print("Loaded real SPR_BENCH.")
+        return dset
+    except Exception as e:
+        print("Could not load real SPR_BENCH: ", e)
+        return None
+
+
+real_dset = try_load_real_dataset()
+
+
+# ----------------- synthetic fallback -----------------
+def make_random_token():
+    shapes = ["R", "S", "T", "U", "V"]
+    colors = ["A", "B", "C", "D", "E"]
+    return random.choice(shapes) + random.choice(colors)
+
+
+def generate_sequence(min_len=3, max_len=10):
+    return " ".join(
+        make_random_token() for _ in range(random.randint(min_len, max_len))
+    )
+
+
+def generate_synthetic_split(n_rows: int):
+    data = []
+    for i in range(n_rows):
+        seq = generate_sequence()
+        label = random.randint(0, 3)
+        data.append({"id": i, "sequence": seq, "label": label})
+    return data
+
+
+if real_dset is None:
+    print("Generating synthetic data …")
+    real_dset = {
+        "train": generate_synthetic_split(1000),
+        "dev": generate_synthetic_split(200),
+        "test": generate_synthetic_split(200),
+    }
+
+
+# ----------------- SCWA metric helpers -----------------
+def count_shape_variety(sequence: str) -> int:
+    return len(set(tok[0] for tok in sequence.split()))
+
+
+def count_color_variety(sequence: str) -> int:
+    return len(set(tok[1] for tok in sequence.split()))
+
+
+def scwa_metric(sequences: List[str], y_true: List[int], y_pred: List[int]) -> float:
+    weights = [count_shape_variety(s) * count_color_variety(s) for s in sequences]
+    correct = [w if t == p else 0 for w, t, p in zip(weights, y_true, y_pred)]
+    return sum(correct) / sum(weights) if sum(weights) > 0 else 0.0
+
+
+# ----------------- vocab & encoding -----------------
+PAD, TUNK, TMASK = "<PAD>", "<UNK>", "<MASK>"
+
+
+def build_vocab(dataset):
+    vocab = set()
+    for row in dataset:
+        vocab.update(row["sequence"].split())
+    vocab_list = [PAD, TUNK, TMASK] + sorted(vocab)
+    stoi = {tok: i for i, tok in enumerate(vocab_list)}
+    itos = {i: t for t, i in stoi.items()}
+    return stoi, itos
+
+
+stoi, itos = build_vocab(real_dset["train"])
+vocab_size = len(stoi)
+print("vocab size:", vocab_size)
+
+
+def encode(seq: str, max_len: int):
+    ids = [stoi.get(tok, stoi[TUNK]) for tok in seq.split()][:max_len]
+    if len(ids) < max_len:
+        ids += [stoi[PAD]] * (max_len - len(ids))
+    return ids
+
+
+MAX_LEN = 20
+
+
+# ----------------- datasets -----------------
+class SPRContrastiveDataset(Dataset):
+    def __init__(self, rows, max_len=MAX_LEN, supervised=False):
+        self.rows = rows
+        self.max_len = max_len
+        self.supervised = supervised
+
+    # augmentations
+    def augment(self, tokens: List[int]):
+        toks = tokens.copy()
+        # random deletion
+        toks = [t for t in toks if t != stoi[PAD]]
+        if len(toks) == 0:
+            toks = [stoi[PAD]]
+        if random.random() < 0.3:
+            del_idx = random.randint(0, len(toks) - 1)
+            del toks[del_idx]
+        # random swap
+        if len(toks) > 1 and random.random() < 0.3:
+            i, j = random.sample(range(len(toks)), 2)
+            toks[i], toks[j] = toks[j], toks[i]
+        # random mask
+        toks = [stoi[TMASK] if random.random() < 0.15 else t for t in toks]
+        return encode(" ".join(itos[t] for t in toks), self.max_len)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, idx):
+        row = self.rows[idx]
+        ids = encode(row["sequence"], self.max_len)
+        view1 = torch.tensor(self.augment(ids), dtype=torch.long)
+        view2 = torch.tensor(self.augment(ids), dtype=torch.long)
+        if self.supervised:
+            label = torch.tensor(row["label"], dtype=torch.long)
+            return {
+                "view1": view1,
+                "view2": view2,
+                "label": label,
+                "seq": row["sequence"],
+            }
+        return {"view1": view1, "view2": view2, "seq": row["sequence"]}
+
+
+class SPRSupervisedDataset(Dataset):
+    def __init__(self, rows, max_len=MAX_LEN):
+        self.rows = rows
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, idx):
+        row = self.rows[idx]
+        ids = torch.tensor(encode(row["sequence"], self.max_len), dtype=torch.long)
+        label = torch.tensor(row["label"], dtype=torch.long)
+        return {"ids": ids, "label": label, "seq": row["sequence"]}
+
+
+# ----------------- model -----------------
+class Encoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim=64, hidden=128):
+        super().__init__()
+        self.emb = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.lstm = nn.LSTM(embed_dim, hidden, batch_first=True, bidirectional=True)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.proj = nn.Linear(hidden * 2, 128)
+
+    def forward(self, x):
+        emb = self.emb(x)  # B,L,E
+        h, _ = self.lstm(emb)  # B,L,2H
+        h = h.transpose(1, 2)  # B,2H,L
+        h = self.pool(h).squeeze(-1)  # B,2H
+        z = torch.tanh(self.proj(h))  # B,128
+        return z
+
+
+class Classifier(nn.Module):
+    def __init__(self, encoder, num_classes):
+        super().__init__()
+        self.encoder = encoder
+        self.head = nn.Linear(128, num_classes)
+
+    def forward(self, x):  # x: B,L
+        z = self.encoder(x)  # B,128
+        out = self.head(z)  # B,C
+        return out
+
+
+# ----------------- contrastive loss -----------------
+def simclr_loss(z1, z2, temperature=0.5):
+    z1 = nn.functional.normalize(z1, dim=1)
+    z2 = nn.functional.normalize(z2, dim=1)
+    B = z1.size(0)
+    representations = torch.cat([z1, z2], dim=0)  # 2B,D
+    sim_matrix = torch.matmul(representations, representations.T) / temperature
+    mask = torch.eye(2 * B, dtype=torch.bool, device=z1.device)
+    sim_matrix.masked_fill_(mask, -9e15)
+    positives = torch.cat([torch.arange(B, 2 * B), torch.arange(0, B)], dim=0).to(
+        z1.device
+    )
+    loss = nn.functional.cross_entropy(sim_matrix, positives)
+    return loss
+
+
+# ----------------- training params -----------------
+BATCH = 128
+PRE_EPOCHS = 3
+FT_EPOCHS = 5
+NUM_CLASSES = len(set(r["label"] for r in real_dset["train"]))
+print("num classes:", NUM_CLASSES)
+random.seed(0)
+np.random.seed(0)
+torch.manual_seed(0)
+
+# ----------------- dataloaders -----------------
+pretrain_ds = SPRContrastiveDataset(real_dset["train"])
+pretrain_dl = DataLoader(pretrain_ds, batch_size=BATCH, shuffle=True, drop_last=True)
+train_ds_sup = SPRSupervisedDataset(real_dset["train"])
+dev_ds_sup = SPRSupervisedDataset(real_dset["dev"])
+train_dl_sup = DataLoader(train_ds_sup, batch_size=BATCH, shuffle=True)
+dev_dl_sup = DataLoader(dev_ds_sup, batch_size=BATCH, shuffle=False)
+
+# ----------------- experiment data dict -----------------
+experiment_data = {
+    "SPR_BENCH": {
+        "metrics": {"train_SCWA": [], "val_SCWA": []},
+        "losses": {"train": [], "val": []},
+        "predictions": [],
+        "ground_truth": [],
+        "timestamps": [],
+    }
+}
+
+# ----------------- pretraining -----------------
+encoder = Encoder(vocab_size).to(device)
+opt = torch.optim.Adam(encoder.parameters(), lr=1e-3)
+for epoch in range(1, PRE_EPOCHS + 1):
+    encoder.train()
+    tot_loss = 0
+    batches = 0
+    for batch in pretrain_dl:
+        v1 = batch["view1"].to(device)
+        v2 = batch["view2"].to(device)
+        z1 = encoder(v1)
+        z2 = encoder(v2)
+        loss = simclr_loss(z1, z2)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        tot_loss += loss.item()
+        batches += 1
+    print(f"PreEpoch {epoch}: contrastive_loss = {tot_loss/batches:.4f}")
+
+# ----------------- fine-tuning -----------------
+clf = Classifier(encoder, NUM_CLASSES).to(device)
+ft_opt = torch.optim.Adam(clf.parameters(), lr=2e-3)
+criterion = nn.CrossEntropyLoss()
+
+
+def evaluate(model, dataloader):
+    model.eval()
+    all_preds = []
+    all_labels = []
+    all_seqs = []
+    val_loss = 0
+    batches = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            ids = batch["ids"].to(device)
+            labels = batch["label"].to(device)
+            logits = model(ids)
+            loss = criterion(logits, labels)
+            val_loss += loss.item()
+            batches += 1
+            preds = logits.argmax(1).cpu().tolist()
+            all_preds.extend(preds)
+            all_labels.extend(labels.cpu().tolist())
+            all_seqs.extend(batch["seq"])
+    scwa = scwa_metric(all_seqs, all_labels, all_preds)
+    return val_loss / batches, scwa, all_preds, all_labels, all_seqs
+
+
+for epoch in range(1, FT_EPOCHS + 1):
+    clf.train()
+    total_loss = 0
+    batches = 0
+    for batch in train_dl_sup:
+        ids = batch["ids"].to(device)
+        labels = batch["label"].to(device)
+        logits = clf(ids)
+        loss = criterion(logits, labels)
+        ft_opt.zero_grad()
+        loss.backward()
+        ft_opt.step()
+        total_loss += loss.item()
+        batches += 1
+    train_loss = total_loss / batches
+    val_loss, val_scwa, preds, labels_true, seqs = evaluate(clf, dev_dl_sup)
+    print(f"Epoch {epoch}: validation_loss = {val_loss:.4f} | SCWA = {val_scwa:.4f}")
+    # log
+    ts = datetime.datetime.now().isoformat()
+    experiment_data["SPR_BENCH"]["losses"]["train"].append(train_loss)
+    experiment_data["SPR_BENCH"]["losses"]["val"].append(val_loss)
+    experiment_data["SPR_BENCH"]["metrics"]["train_SCWA"].append(None)
+    experiment_data["SPR_BENCH"]["metrics"]["val_SCWA"].append(val_scwa)
+    experiment_data["SPR_BENCH"]["predictions"] = preds
+    experiment_data["SPR_BENCH"]["ground_truth"] = labels_true
+    experiment_data["SPR_BENCH"]["timestamps"].append(ts)
+
+# ----------------- save experiment data -----------------
+np.save(os.path.join(working_dir, "experiment_data.npy"), experiment_data)
+print("Saved experiment data to working/experiment_data.npy")

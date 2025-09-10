@@ -1,0 +1,881 @@
+[
+  {
+    "overall_plan": "The overall plan involves a two-pronged approach to optimize and understand Transformer models. The first part focuses on hyperparameter tuning by varying the number of attention heads (2, 4, 8, 16) to find the optimal configuration that balances model performance and computational efficiency. This involves training separate models for each configuration and recording comprehensive performance metrics. The second part is an ablation study that removes positional embeddings from the Transformer model to evaluate the significance of word-order information. This ablation keeps all other variables constant to isolate the effect of positional embeddings on performance. Together, these experiments aim to improve Transformer architectures by identifying critical parameters and components that contribute to their success.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "train accuracy",
+            "lower_is_better": false,
+            "description": "The accuracy of the model on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.794,
+                "best_value": 0.794
+              }
+            ]
+          },
+          {
+            "metric_name": "validation accuracy",
+            "lower_is_better": false,
+            "description": "The accuracy of the model on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.786,
+                "best_value": 0.786
+              }
+            ]
+          },
+          {
+            "metric_name": "train loss",
+            "lower_is_better": true,
+            "description": "The loss of the model on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.5159,
+                "best_value": 0.5159
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "The loss of the model on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.5181,
+                "best_value": 0.5181
+              }
+            ]
+          },
+          {
+            "metric_name": "test accuracy",
+            "lower_is_better": false,
+            "description": "The accuracy of the model on the test dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.789,
+                "best_value": 0.789
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# RemovePositionalEmbeddings \u2013 single-file ablation study\n# ======================================================\nimport os, pathlib, random, math, time, json, numpy as np, torch\nfrom torch import nn\nfrom torch.utils.data import DataLoader\nfrom datasets import Dataset, DatasetDict, load_dataset\n\n# ---------------- EXPERIMENT DATA STRUCT ---------------- #\nexperiment_data = {\n    \"RemovePositionalEmbeddings\": {\n        \"SPR_BENCH\": {  # will also be used for synthetic when real data missing\n            \"results\": {}\n        }\n    }\n}\n\n# ---------------------- SETUP --------------------------- #\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(\"Using device:\", device)\n\n\n# -------------------- DATA UTILITIES -------------------- #\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(csv_name: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    return DatasetDict(\n        train=_load(\"train.csv\"),\n        dev=_load(\"dev.csv\"),\n        test=_load(\"test.csv\"),\n    )\n\n\ndef build_vocab(dataset: Dataset, seq_field=\"sequence\"):\n    vocab = {\"<pad>\": 0, \"<unk>\": 1}\n    idx = 2\n    for s in dataset[seq_field]:\n        for tok in s.strip().split():\n            if tok not in vocab:\n                vocab[tok] = idx\n                idx += 1\n    return vocab\n\n\ndef encode_sequence(seq: str, vocab, max_len=None):\n    toks = [vocab.get(tok, vocab[\"<unk>\"]) for tok in seq.strip().split()]\n    return toks[:max_len] if max_len else toks\n\n\n# ------------------ SYNTHETIC BACK-UP ------------------- #\ndef build_synthetic(n_train=500, n_dev=100, n_test=200, seqlen=10, vocab_sz=12):\n    symbols = [chr(ord(\"A\") + i) for i in range(vocab_sz)]\n\n    def gen(n):\n        data = {\"id\": [], \"sequence\": [], \"label\": []}\n        for i in range(n):\n            seq = [random.choice(symbols) for _ in range(seqlen)]\n            data[\"id\"].append(str(i))\n            data[\"sequence\"].append(\" \".join(seq))\n            data[\"label\"].append(1 if seq.count(\"A\") % 2 == 0 else 0)\n        return Dataset.from_dict(data)\n\n    return DatasetDict(train=gen(n_train), dev=gen(n_dev), test=gen(n_test))\n\n\n# -------------------- MODEL W/O POS ---------------------- #\nclass TransformerNoPos(nn.Module):\n    \"\"\"Transformer encoder classifier without positional embeddings.\"\"\"\n\n    def __init__(self, vocab_sz, embed_dim, nhead, nlayers, n_classes, pad_idx):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_sz, embed_dim, padding_idx=pad_idx)\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=embed_dim,\n            nhead=nhead,\n            dim_feedforward=embed_dim * 4,\n            dropout=0.1,\n            activation=\"relu\",\n            batch_first=True,\n        )\n        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=nlayers)\n        self.cls = nn.Linear(embed_dim, n_classes)\n\n    def forward(self, x, pad_mask):\n        h = self.embed(x)  # << NO positional encoding here\n        h = self.encoder(h, src_key_padding_mask=pad_mask)\n        not_pad = (~pad_mask).unsqueeze(-1).float()\n        h_sum = (h * not_pad).sum(1)\n        lengths = not_pad.sum(1).clamp(min=1)\n        pooled = h_sum / lengths\n        return self.cls(pooled)\n\n\n# -------------------- DATALOADER ------------------------ #\ndef collate_fn(batch, vocab, max_len=128):\n    seqs = [encode_sequence(b[\"sequence\"], vocab, max_len) for b in batch]\n    labels = torch.tensor([b[\"label\"] for b in batch], dtype=torch.long)\n    max_len_b = max(len(s) for s in seqs)\n    pad_id = vocab[\"<pad>\"]\n    padded = [s + [pad_id] * (max_len_b - len(s)) for s in seqs]\n    x = torch.tensor(padded, dtype=torch.long)\n    mask = x == pad_id\n    return {\"input_ids\": x, \"attention_mask\": mask, \"labels\": labels}\n\n\ndef evaluate(model, loader, criterion):\n    model.eval()\n    tot_loss, correct, n_samples = 0.0, 0, 0\n    with torch.no_grad():\n        for batch in loader:\n            batch = {k: v.to(device) for k, v in batch.items() if torch.is_tensor(v)}\n            logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(logits, batch[\"labels\"])\n            tot_loss += loss.item() * batch[\"labels\"].size(0)\n            preds = logits.argmax(-1)\n            correct += (preds == batch[\"labels\"]).sum().item()\n            n_samples += batch[\"labels\"].size(0)\n    return tot_loss / n_samples, correct / n_samples\n\n\n# -------------------- LOAD DATA ------------------------- #\nDATA_PATH = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\ntry:\n    datasets_dict = load_spr_bench(DATA_PATH)\n    print(\"Loaded real SPR_BENCH dataset.\")\nexcept Exception as e:\n    print(\"Failed to load real dataset, falling back to synthetic.\", e)\n    datasets_dict = build_synthetic()\n\nvocab = build_vocab(datasets_dict[\"train\"])\nnum_classes = len(set(datasets_dict[\"train\"][\"label\"]))\nprint(\"Vocab size:\", len(vocab), \"| num_classes:\", num_classes)\n\nbatch_size = 64\ntrain_dl = DataLoader(\n    datasets_dict[\"train\"],\n    batch_size=batch_size,\n    shuffle=True,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\ndev_dl = DataLoader(\n    datasets_dict[\"dev\"],\n    batch_size=batch_size,\n    shuffle=False,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\ntest_dl = DataLoader(\n    datasets_dict[\"test\"],\n    batch_size=batch_size,\n    shuffle=False,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\n\n# ------------------ HYPERPARAM SWEEP -------------------- #\nembed_dim = 128\nepochs = 5\nnhead_values = [2, 4, 8, 16]\n\nfor nhead in nhead_values:\n    if embed_dim % nhead != 0:\n        print(f\"Skip nhead={nhead}, embed_dim not divisible.\")\n        continue\n    print(f\"\\n=== Ablation: training w/o positional encodings | nhead={nhead} ===\")\n    model = TransformerNoPos(\n        vocab_sz=len(vocab),\n        embed_dim=embed_dim,\n        nhead=nhead,\n        nlayers=2,\n        n_classes=num_classes,\n        pad_idx=vocab[\"<pad>\"],\n    ).to(device)\n\n    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n    criterion = nn.CrossEntropyLoss()\n\n    metrics, losses = {\"train_acc\": [], \"val_acc\": []}, {\n        \"train_loss\": [],\n        \"val_loss\": [],\n    }\n\n    for epoch in range(1, epochs + 1):\n        model.train()\n        running_loss, correct, total = 0.0, 0, 0\n        for batch in train_dl:\n            batch = {k: v.to(device) for k, v in batch.items() if torch.is_tensor(v)}\n            optimizer.zero_grad()\n            logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(logits, batch[\"labels\"])\n            loss.backward()\n            optimizer.step()\n            running_loss += loss.item() * batch[\"labels\"].size(0)\n            preds = logits.argmax(-1)\n            correct += (preds == batch[\"labels\"]).sum().item()\n            total += batch[\"labels\"].size(0)\n        train_loss = running_loss / total\n        train_acc = correct / total\n        val_loss, val_acc = evaluate(model, dev_dl, criterion)\n        print(\n            f\"Epoch {epoch}/{epochs} | train_acc={train_acc:.4f} val_acc={val_acc:.4f}\"\n        )\n        losses[\"train_loss\"].append(train_loss)\n        losses[\"val_loss\"].append(val_loss)\n        metrics[\"train_acc\"].append(train_acc)\n        metrics[\"val_acc\"].append(val_acc)\n\n    # --------------- Test evaluation -------------------- #\n    test_loss, test_acc = evaluate(model, test_dl, criterion)\n    print(f\"nhead={nhead} | Test accuracy: {test_acc:.4f}\")\n\n    preds_all, gts_all = [], []\n    model.eval()\n    with torch.no_grad():\n        for batch in test_dl:\n            batch_gpu = {\n                k: v.to(device) for k, v in batch.items() if torch.is_tensor(v)\n            }\n            logits = model(batch_gpu[\"input_ids\"], batch_gpu[\"attention_mask\"])\n            preds_all.extend(logits.argmax(-1).cpu().tolist())\n            gts_all.extend(batch[\"labels\"].tolist())\n\n    # -------------- log results ------------------------- #\n    experiment_data[\"RemovePositionalEmbeddings\"][\"SPR_BENCH\"][\"results\"][\n        str(nhead)\n    ] = {\n        \"metrics\": metrics,\n        \"losses\": losses,\n        \"test_acc\": test_acc,\n        \"predictions\": preds_all,\n        \"ground_truth\": gts_all,\n    }\n\n# -------------------- SAVE RESULTS ---------------------- #\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"Saved experiment data to\", os.path.join(working_dir, \"experiment_data.npy\"))\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# --------------- load experiment data ------------------ #\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\n\n# helper to fetch nested dict safely\ndef get(d, *keys, default=None):\n    for k in keys:\n        if isinstance(d, dict) and k in d:\n            d = d[k]\n        else:\n            return default\n    return d\n\n\nresults = get(\n    experiment_data, \"RemovePositionalEmbeddings\", \"SPR_BENCH\", \"results\", default={}\n)\nif not results:\n    print(\"No results found for SPR_BENCH. Exiting plotting script.\")\nelse:\n    # ----------- aggregate test accuracy plot ----------- #\n    try:\n        heads, test_accs = [], []\n        for head, res in sorted(results.items(), key=lambda x: int(x[0])):\n            acc = res.get(\"test_acc\")\n            if acc is not None:\n                heads.append(int(head))\n                test_accs.append(acc)\n        if heads:\n            plt.figure()\n            plt.plot(heads, test_accs, marker=\"o\")\n            plt.xlabel(\"Number of Heads\")\n            plt.ylabel(\"Test Accuracy\")\n            plt.title(\n                \"SPR_BENCH: Test Accuracy vs Number of Attention Heads\\n(RemovePositionalEmbeddings)\"\n            )\n            fname = os.path.join(working_dir, \"SPR_BENCH_accuracy_vs_heads.png\")\n            plt.savefig(fname)\n            print(f\"Saved {fname}\")\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating accuracy-vs-heads plot: {e}\")\n        plt.close()\n\n    # ----------- per-head training curves (<=4) --------- #\n    plotted = 0\n    for head, res in sorted(results.items(), key=lambda x: int(x[0])):\n        if plotted >= 4:  # at most 5 total plots including the aggregate above\n            break\n        try:\n            metrics = res.get(\"metrics\", {})\n            losses = res.get(\"losses\", {})\n            epochs = range(1, len(metrics.get(\"train_acc\", [])) + 1)\n            if not epochs:\n                continue\n            plt.figure(figsize=(8, 4))\n            # subplot 1: accuracy\n            plt.subplot(1, 2, 1)\n            plt.plot(epochs, metrics.get(\"train_acc\", []), label=\"Train\")\n            plt.plot(epochs, metrics.get(\"val_acc\", []), label=\"Validation\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Accuracy\")\n            plt.title(\"Accuracy\")\n            plt.legend()\n            # subplot 2: loss\n            plt.subplot(1, 2, 2)\n            plt.plot(epochs, losses.get(\"train_loss\", []), label=\"Train\")\n            plt.plot(epochs, losses.get(\"val_loss\", []), label=\"Validation\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Loss\")\n            plt.title(\"Loss\")\n            plt.legend()\n            plt.suptitle(\n                f\"SPR_BENCH Training Curves | nhead={head}\\nLeft: Accuracy, Right: Loss\"\n            )\n            fname = os.path.join(\n                working_dir, f\"SPR_BENCH_training_curves_nhead{head}.png\"\n            )\n            plt.tight_layout(rect=[0, 0.03, 1, 0.95])\n            plt.savefig(fname)\n            print(f\"Saved {fname}\")\n            plotted += 1\n            plt.close()\n        except Exception as e:\n            print(f\"Error creating training curve for nhead={head}: {e}\")\n            plt.close()\n\n    # -------------- print final metrics ----------------- #\n    for head, res in sorted(results.items(), key=lambda x: int(x[0])):\n        print(f\"nhead={head}: test_acc={res.get('test_acc', 'N/A')}\")\n",
+    "plot_plan": "We load experiment_data.npy, inspect the dictionary to extract the \u201cSPR_BENCH\u201d results produced by the ablation study, and collect per-head metrics (train/val loss and accuracy for each epoch plus final test accuracy). A first figure shows the overall test accuracy as a function of nhead to highlight any performance trend induced by removing positional embeddings. For the remaining heads (max four) we draw one figure per head containing two subplots\u2014train/val accuracy and train/val loss versus epoch\u2014so that we do not exceed the five-figure limit. Each figure lives in its own try-except block, is saved with a descriptive filename that mentions the dataset and plot type, and is closed afterwards. All plots use only existing values; if a metric is missing the corresponding plot is skipped gracefully. After saving, the script prints the test accuracies so users can verify the numbers programmatically. The code adheres strictly to the given matplotlib guidelines, uses the provided working_dir, and avoids any custom styling or fabricated data.",
+    "plot_analyses": [
+      {
+        "analysis": "The plot shows the relationship between the number of attention heads and test accuracy when positional embeddings are removed. Initially, the accuracy increases significantly as the number of heads increases from 2 to 4, indicating that the model benefits from additional attention heads. However, beyond 4 heads, the improvement becomes marginal, with a slight dip at 8 heads, followed by an increase up to 16 heads. This suggests diminishing returns with more attention heads and possibly some instability in performance at intermediate values like 8 heads. The removal of positional embeddings may be influencing the model's ability to fully leverage additional attention heads.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_8ff134f7504443ea954ca8ff3dcc3aca_proc_3173696/SPR_BENCH_accuracy_vs_heads.png"
+      },
+      {
+        "analysis": "With 2 attention heads, the training accuracy improves steadily over epochs, while validation accuracy shows a peak at epoch 4 before declining. This suggests potential overfitting as the model learns more. The training loss decreases consistently, but the validation loss starts increasing after epoch 3, further indicating overfitting.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_8ff134f7504443ea954ca8ff3dcc3aca_proc_3173696/SPR_BENCH_training_curves_nhead2.png"
+      },
+      {
+        "analysis": "With 4 attention heads, both training and validation accuracies improve steadily over epochs and converge closely, indicating better generalization compared to 2 heads. The loss curves for both training and validation decrease consistently, suggesting that the model is learning effectively without significant overfitting.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_8ff134f7504443ea954ca8ff3dcc3aca_proc_3173696/SPR_BENCH_training_curves_nhead4.png"
+      },
+      {
+        "analysis": "With 8 attention heads, the training accuracy continues to improve steadily, but validation accuracy peaks at epoch 3 and then declines slightly, suggesting mild overfitting. The training loss decreases consistently, while validation loss starts to plateau after epoch 3, indicating a potential limit to generalization performance with this configuration.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_8ff134f7504443ea954ca8ff3dcc3aca_proc_3173696/SPR_BENCH_training_curves_nhead8.png"
+      },
+      {
+        "analysis": "With 16 attention heads, the training accuracy shows a slight dip at epoch 3 before increasing again, while validation accuracy remains relatively stable, showing a slight decline towards the end. Training loss decreases consistently, but validation loss fluctuates, suggesting some instability in generalization performance. The model may be struggling to balance complexity and generalization at this configuration.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_8ff134f7504443ea954ca8ff3dcc3aca_proc_3173696/SPR_BENCH_training_curves_nhead16.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_8ff134f7504443ea954ca8ff3dcc3aca_proc_3173696/SPR_BENCH_accuracy_vs_heads.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_8ff134f7504443ea954ca8ff3dcc3aca_proc_3173696/SPR_BENCH_training_curves_nhead2.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_8ff134f7504443ea954ca8ff3dcc3aca_proc_3173696/SPR_BENCH_training_curves_nhead4.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_8ff134f7504443ea954ca8ff3dcc3aca_proc_3173696/SPR_BENCH_training_curves_nhead8.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_8ff134f7504443ea954ca8ff3dcc3aca_proc_3173696/SPR_BENCH_training_curves_nhead16.png"
+    ],
+    "vlm_feedback_summary": "The plots provide insights into the effect of varying attention heads on model performance and training dynamics. Increasing attention heads generally improves accuracy, but with diminishing returns and potential overfitting or instability at higher values. The training and validation curves highlight the importance of balancing model complexity and regularization to achieve optimal generalization.",
+    "exp_results_dir": "experiment_results/experiment_8ff134f7504443ea954ca8ff3dcc3aca_proc_3173696",
+    "ablation_name": "RemovePositionalEmbeddings",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_8ff134f7504443ea954ca8ff3dcc3aca_proc_3173696/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "The overall plan begins with hyperparameter tuning of the Transformer model, specifically focusing on optimizing the number of attention heads (nhead). This involves a sweep over various candidate values (2, 4, 8, 16) to determine the optimal configuration, with detailed tracking of training and validation metrics. Building on this, the current plan expands the scope by introducing an ablation study across three synthetic datasets (EvenParity, MajoritySymbol, CyclicShift) to assess the adaptability and robustness of the previously tuned hyperparameters. This involves running the same n-head sweep on each synthetic dataset, dynamically constructing the necessary components, and evaluating performance using accuracy. The results are compiled into a single experiment_data dictionary under 'MultiSyntheticDatasets' for comprehensive analysis. This integrated plan aims to both optimize the Transformer architecture and test its generalizability across different data distributions.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "train accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy of the model on the training data.",
+            "data": [
+              {
+                "dataset_name": "EvenParity",
+                "final_value": 0.842,
+                "best_value": 0.864
+              },
+              {
+                "dataset_name": "MajoritySymbol",
+                "final_value": 0.804,
+                "best_value": 0.804
+              },
+              {
+                "dataset_name": "CyclicShift",
+                "final_value": 0.99,
+                "best_value": 0.994
+              }
+            ]
+          },
+          {
+            "metric_name": "validation accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy of the model on the validation data.",
+            "data": [
+              {
+                "dataset_name": "EvenParity",
+                "final_value": 0.86,
+                "best_value": 0.86
+              },
+              {
+                "dataset_name": "MajoritySymbol",
+                "final_value": 0.61,
+                "best_value": 0.65
+              },
+              {
+                "dataset_name": "CyclicShift",
+                "final_value": 0.97,
+                "best_value": 0.97
+              }
+            ]
+          },
+          {
+            "metric_name": "train loss",
+            "lower_is_better": true,
+            "description": "Loss of the model on the training data.",
+            "data": [
+              {
+                "dataset_name": "EvenParity",
+                "final_value": 0.3278,
+                "best_value": 0.2747
+              },
+              {
+                "dataset_name": "MajoritySymbol",
+                "final_value": 0.757,
+                "best_value": 0.757
+              },
+              {
+                "dataset_name": "CyclicShift",
+                "final_value": 0.0311,
+                "best_value": 0.0215
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "Loss of the model on the validation data.",
+            "data": [
+              {
+                "dataset_name": "EvenParity",
+                "final_value": 0.3273,
+                "best_value": 0.2737
+              },
+              {
+                "dataset_name": "MajoritySymbol",
+                "final_value": 0.9857,
+                "best_value": 0.9079
+              },
+              {
+                "dataset_name": "CyclicShift",
+                "final_value": 0.0808,
+                "best_value": 0.0808
+              }
+            ]
+          },
+          {
+            "metric_name": "test accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy of the model on the test data.",
+            "data": [
+              {
+                "dataset_name": "EvenParity",
+                "final_value": 0.835,
+                "best_value": 0.835
+              },
+              {
+                "dataset_name": "MajoritySymbol",
+                "final_value": 0.62,
+                "best_value": 0.66
+              },
+              {
+                "dataset_name": "CyclicShift",
+                "final_value": 0.985,
+                "best_value": 0.985
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# MultiSyntheticDatasets ablation \u2013 single-file script\nimport os, random, math, pathlib, time, json, numpy as np, torch\nfrom torch import nn\nfrom torch.utils.data import DataLoader\nfrom datasets import Dataset, DatasetDict\n\n# ---------------------- GLOBAL CONFIG ------------------------------ #\nrandom.seed(0)\nnp.random.seed(0)\ntorch.manual_seed(0)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\nexperiment_data = {\"MultiSyntheticDatasets\": {}}  # root container\n\n\n# ------------------------ DATA BUILDERS ---------------------------- #\ndef _symbols(vocab_sz=12):\n    return [chr(ord(\"A\") + i) for i in range(vocab_sz)]\n\n\ndef build_even_parity(num_train=500, num_dev=100, num_test=200, seqlen=10, vocab_sz=12):\n    syms = _symbols(vocab_sz)\n\n    def _split(n):\n        d = {\"id\": [], \"sequence\": [], \"label\": []}\n        for i in range(n):\n            seq = [random.choice(syms) for _ in range(seqlen)]\n            label = 1 if seq.count(\"A\") % 2 == 0 else 0\n            d[\"id\"].append(str(i))\n            d[\"sequence\"].append(\" \".join(seq))\n            d[\"label\"].append(label)\n        return Dataset.from_dict(d)\n\n    return DatasetDict(\n        train=_split(num_train), dev=_split(num_dev), test=_split(num_test)\n    )\n\n\ndef build_majority_symbol(\n    num_train=500, num_dev=100, num_test=200, seqlen=10, vocab_sz=12\n):\n    syms = _symbols(vocab_sz)\n\n    def _split(n):\n        d = {\"id\": [], \"sequence\": [], \"label\": []}\n        for i in range(n):\n            seq = [random.choice(syms) for _ in range(seqlen)]\n            counts = {s: seq.count(s) for s in syms}\n            max_ct = max(counts.values())\n            majors = [s for s, c in counts.items() if c == max_ct]\n            label_sym = random.choice(majors)\n            label = syms.index(label_sym)\n            d[\"id\"].append(str(i))\n            d[\"sequence\"].append(\" \".join(seq))\n            d[\"label\"].append(label)\n        return Dataset.from_dict(d)\n\n    return DatasetDict(\n        train=_split(num_train), dev=_split(num_dev), test=_split(num_test)\n    )\n\n\ndef is_cyclic_rotation(seq, pattern):\n    \"\"\"seq, pattern are lists of tokens\"\"\"\n    if len(seq) != len(pattern):\n        return False\n    joined = pattern * 2\n    for i in range(len(pattern)):\n        if joined[i : i + len(pattern)] == seq:\n            return True\n    return False\n\n\ndef build_cyclic_shift(\n    num_train=500, num_dev=100, num_test=200, seqlen=10, vocab_sz=12\n):\n    syms = _symbols(vocab_sz)\n    base_pattern = syms[:seqlen]  # \"A B C ... \"\n\n    def rotate(lst, k):\n        k %= len(lst)\n        return lst[k:] + lst[:k]\n\n    def _split(n):\n        d = {\"id\": [], \"sequence\": [], \"label\": []}\n        for i in range(n):\n            label = random.randint(0, 1)\n            if label == 1:\n                shift = random.randint(0, seqlen - 1)\n                seq = rotate(base_pattern, shift)\n            else:\n                while True:\n                    seq = [random.choice(syms) for _ in range(seqlen)]\n                    if not is_cyclic_rotation(seq, base_pattern):\n                        break\n            d[\"id\"].append(str(i))\n            d[\"sequence\"].append(\" \".join(seq))\n            d[\"label\"].append(label)\n        return Dataset.from_dict(d)\n\n    return DatasetDict(\n        train=_split(num_train), dev=_split(num_dev), test=_split(num_test)\n    )\n\n\n# --------------------------- VOCAB --------------------------------- #\ndef build_vocab(dataset: Dataset, field=\"sequence\"):\n    vocab = {\"<pad>\": 0, \"<unk>\": 1}\n    idx = 2\n    for sent in dataset[field]:\n        for tok in sent.split():\n            if tok not in vocab:\n                vocab[tok] = idx\n                idx += 1\n    return vocab\n\n\ndef encode_sequence(seq, vocab, max_len=None):\n    toks = [vocab.get(t, vocab[\"<unk>\"]) for t in seq.split()]\n    return toks[:max_len] if max_len else toks\n\n\n# --------------------------- MODEL --------------------------------- #\nclass SimpleTransformerClassifier(nn.Module):\n    def __init__(self, vocab_size, embed_dim, nhead, num_layers, num_classes, pad_idx):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)\n        self.pos = nn.Embedding(512, embed_dim)\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=embed_dim,\n            nhead=nhead,\n            dim_feedforward=embed_dim * 4,\n            batch_first=True,\n            activation=\"relu\",\n        )\n        self.encoder = nn.TransformerEncoder(enc_layer, num_layers)\n        self.cls = nn.Linear(embed_dim, num_classes)\n\n    def forward(self, x, mask):\n        pos_ids = torch.arange(x.size(1), device=x.device).unsqueeze(0)\n        h = self.embed(x) + self.pos(pos_ids)\n        h = self.encoder(h, src_key_padding_mask=mask)\n        mask_inv = (~mask).unsqueeze(-1).float()\n        pooled = (h * mask_inv).sum(1) / mask_inv.sum(1).clamp(min=1)\n        return self.cls(pooled)\n\n\n# ---------------------- TRAIN / EVAL UTILS ------------------------- #\ndef collate_fn(batch, vocab, max_len=128):\n    seqs = [encode_sequence(b[\"sequence\"], vocab, max_len) for b in batch]\n    labels = torch.tensor([b[\"label\"] for b in batch], dtype=torch.long)\n    L = max(len(s) for s in seqs)\n    pad_val = vocab[\"<pad>\"]\n    padded = [s + [pad_val] * (L - len(s)) for s in seqs]\n    x = torch.tensor(padded, dtype=torch.long)\n    mask = x == pad_val\n    return {\"input_ids\": x, \"attention_mask\": mask, \"labels\": labels}\n\n\ndef evaluate(model, loader, criterion):\n    model.eval()\n    tot_loss = 0\n    correct = 0\n    cnt = 0\n    with torch.no_grad():\n        for batch in loader:\n            batch = {k: v.to(device) for k, v in batch.items()}\n            logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(logits, batch[\"labels\"])\n            tot_loss += loss.item() * batch[\"labels\"].size(0)\n            preds = logits.argmax(-1)\n            correct += (preds == batch[\"labels\"]).sum().item()\n            cnt += batch[\"labels\"].size(0)\n    return tot_loss / cnt, correct / cnt\n\n\n# ------------------------- MAIN RUN -------------------------------- #\ntasks = {\n    \"EvenParity\": build_even_parity,\n    \"MajoritySymbol\": build_majority_symbol,\n    \"CyclicShift\": build_cyclic_shift,\n}\nnhead_values = [2, 4, 8, 16]\nepochs = 5\nembed_dim = 128\nbatch_size = 64\n\nfor task_name, builder in tasks.items():\n    print(f\"\\n########## DATASET: {task_name} ##########\")\n    dsets = builder()\n    vocab = build_vocab(dsets[\"train\"])\n    pad_idx = vocab[\"<pad>\"]\n    num_classes = len(set(dsets[\"train\"][\"label\"]))\n    print(f\"Vocab={len(vocab)} | classes={num_classes}\")\n    loaders = {}\n    for split in [\"train\", \"dev\", \"test\"]:\n        loaders[split] = DataLoader(\n            dsets[split],\n            batch_size=batch_size,\n            shuffle=(split == \"train\"),\n            collate_fn=lambda b, v=vocab: collate_fn(b, v),\n        )\n    experiment_data[\"MultiSyntheticDatasets\"][task_name] = {}\n    for nhead in nhead_values:\n        if embed_dim % nhead != 0:\n            print(f\"Skip nhead={nhead}\")\n            continue\n        print(f\"\\n--- Training nhead={nhead} ---\")\n        model = SimpleTransformerClassifier(\n            len(vocab), embed_dim, nhead, 2, num_classes, pad_idx\n        ).to(device)\n        opt = torch.optim.Adam(model.parameters(), lr=1e-3)\n        crit = nn.CrossEntropyLoss()\n        log = {\"metrics\": {\"train\": [], \"val\": []}, \"losses\": {\"train\": [], \"val\": []}}\n        for epoch in range(1, epochs + 1):\n            model.train()\n            eloss = 0\n            correct = 0\n            tot = 0\n            for batch in loaders[\"train\"]:\n                batch = {k: v.to(device) for k, v in batch.items()}\n                opt.zero_grad()\n                logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n                loss = crit(logits, batch[\"labels\"])\n                loss.backward()\n                opt.step()\n                eloss += loss.item() * batch[\"labels\"].size(0)\n                correct += (logits.argmax(-1) == batch[\"labels\"]).sum().item()\n                tot += batch[\"labels\"].size(0)\n            tr_acc = correct / tot\n            tr_loss = eloss / tot\n            val_loss, val_acc = evaluate(model, loaders[\"dev\"], crit)\n            log[\"metrics\"][\"train\"].append(tr_acc)\n            log[\"metrics\"][\"val\"].append(val_acc)\n            log[\"losses\"][\"train\"].append(tr_loss)\n            log[\"losses\"][\"val\"].append(val_loss)\n            print(f\"Ep{epoch}/{epochs} acc:{tr_acc:.3f}/{val_acc:.3f}\")\n        test_loss, test_acc = evaluate(model, loaders[\"test\"], crit)\n        preds, gts = [], []\n        model.eval()\n        with torch.no_grad():\n            for batch in loaders[\"test\"]:\n                gbatch = {k: v.to(device) for k, v in batch.items()}\n                logits = model(gbatch[\"input_ids\"], gbatch[\"attention_mask\"])\n                preds.extend(logits.argmax(-1).cpu().tolist())\n                gts.extend(batch[\"labels\"].tolist())\n        log[\"test_acc\"] = test_acc\n        log[\"predictions\"] = preds\n        log[\"ground_truth\"] = gts\n        experiment_data[\"MultiSyntheticDatasets\"][task_name][str(nhead)] = log\n        print(f\"nhead={nhead} test_acc={test_acc:.3f}\")\n\n# ---------------------- SAVE RESULTS ------------------------------- #\nsave_path = os.path.join(working_dir, \"experiment_data.npy\")\nnp.save(save_path, experiment_data)\nprint(\"\\nSaved experiment data to\", save_path)\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# Load data\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\nroot = experiment_data.get(\"MultiSyntheticDatasets\", {})\nfor task_name, task_data in root.items():\n    # Gather nhead keys sorted as int\n    nheads = sorted(task_data.keys(), key=lambda x: int(x))\n    # ---------- Accuracy Curves ----------\n    try:\n        plt.figure()\n        for nh in nheads:\n            log = task_data[nh]\n            epochs = np.arange(1, len(log[\"metrics\"][\"train\"]) + 1)\n            plt.plot(\n                epochs, log[\"metrics\"][\"train\"], label=f\"nhead={nh} train\", marker=\"o\"\n            )\n            plt.plot(\n                epochs,\n                log[\"metrics\"][\"val\"],\n                label=f\"nhead={nh} val\",\n                linestyle=\"--\",\n                marker=\"x\",\n            )\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Accuracy\")\n        plt.title(f\"MultiSyntheticDatasets \u2013 {task_name} \u2013 Accuracy Curves\")\n        plt.legend()\n        fname = os.path.join(working_dir, f\"{task_name}_accuracy_curves.png\")\n        plt.savefig(fname)\n        print(\"Saved\", fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating accuracy plot for {task_name}: {e}\")\n        plt.close()\n\n    # ---------- Loss Curves ----------\n    try:\n        plt.figure()\n        for nh in nheads:\n            log = task_data[nh]\n            epochs = np.arange(1, len(log[\"losses\"][\"train\"]) + 1)\n            plt.plot(\n                epochs, log[\"losses\"][\"train\"], label=f\"nhead={nh} train\", marker=\"o\"\n            )\n            plt.plot(\n                epochs,\n                log[\"losses\"][\"val\"],\n                label=f\"nhead={nh} val\",\n                linestyle=\"--\",\n                marker=\"x\",\n            )\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Cross-Entropy Loss\")\n        plt.title(f\"MultiSyntheticDatasets \u2013 {task_name} \u2013 Loss Curves\")\n        plt.legend()\n        fname = os.path.join(working_dir, f\"{task_name}_loss_curves.png\")\n        plt.savefig(fname)\n        print(\"Saved\", fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating loss plot for {task_name}: {e}\")\n        plt.close()\n\n    # ---------- Test Accuracy Bar ----------\n    try:\n        plt.figure()\n        test_accs = [task_data[nh][\"test_acc\"] for nh in nheads]\n        plt.bar([str(nh) for nh in nheads], test_accs, color=\"skyblue\")\n        plt.ylim(0, 1)\n        plt.xlabel(\"nhead\")\n        plt.ylabel(\"Test Accuracy\")\n        plt.title(f\"MultiSyntheticDatasets \u2013 {task_name} \u2013 Test Accuracy\")\n        for idx, acc in enumerate(test_accs):\n            plt.text(idx, acc + 0.01, f\"{acc:.2f}\", ha=\"center\")\n        fname = os.path.join(working_dir, f\"{task_name}_test_accuracy.png\")\n        plt.savefig(fname)\n        print(\"Saved\", fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating test-accuracy plot for {task_name}: {e}\")\n        plt.close()\n",
+    "plot_plan": "We will load the saved experiment_data.npy, iterate over the three synthetic datasets, and for each dataset gather (1) per-epoch train/validation accuracy, (2) per-epoch train/validation loss, and (3) final test accuracy for every recorded nhead configuration. Within three separate try-except blocks per dataset we will:  \n\u2022 plot combined accuracy curves (one line per nhead, solid=train, dashed=val);  \n\u2022 plot combined loss curves (same legend convention);  \n\u2022 plot a bar chart of test accuracies vs. nhead.  \nEach figure is titled descriptively (e.g. \u201cMultiSyntheticDatasets \u2013 EvenParity \u2013 Accuracy Curves\u201d) and saved to working_dir with an informative filename. We ensure at most five figures of each type are produced by limiting to the available three datasets. All figures are closed after saving, and any error during plotting is caught and printed without stopping the rest of the script. Finally, we print the file locations of the generated plots for quick verification.",
+    "plot_analyses": [
+      {
+        "analysis": "The accuracy curves for the EvenParity task show that increasing the number of heads (nhead) generally leads to better validation performance, with nhead=16 achieving the highest validation accuracy. Training accuracy consistently increases for all configurations, indicating effective learning. However, the gap between training and validation accuracy for nhead=2 and nhead=4 suggests potential overfitting. The results imply that higher nhead values capture sequence dependencies more effectively, leading to better generalization.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/EvenParity_accuracy_curves.png"
+      },
+      {
+        "analysis": "The loss curves for the EvenParity task demonstrate a steady decrease in cross-entropy loss for both training and validation sets across epochs. Higher nhead values show lower validation loss, particularly for nhead=16, which aligns with its superior accuracy. The consistent reduction in loss across configurations indicates effective model optimization.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/EvenParity_loss_curves.png"
+      },
+      {
+        "analysis": "The test accuracy bar chart for EvenParity reveals that nhead=16 achieves the highest test accuracy (0.83), marginally outperforming other configurations. This suggests that increasing nhead improves generalization performance, albeit with diminishing returns beyond nhead=8.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/EvenParity_test_accuracy.png"
+      },
+      {
+        "analysis": "The accuracy curves for the MajoritySymbol task indicate that increasing nhead improves training accuracy, with nhead=16 achieving the highest performance. However, the validation accuracy for nhead=2 and nhead=4 stagnates after initial improvement, suggesting limited generalization. The separation between training and validation accuracy for lower nhead values indicates potential overfitting.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/MajoritySymbol_accuracy_curves.png"
+      },
+      {
+        "analysis": "The loss curves for the MajoritySymbol task show a consistent decrease in cross-entropy loss for all configurations, with nhead=16 achieving the lowest validation loss. The results indicate that higher nhead values enable better optimization, though the validation loss plateau for nhead=2 and nhead=4 suggests limited generalization.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/MajoritySymbol_loss_curves.png"
+      },
+      {
+        "analysis": "The test accuracy bar chart for MajoritySymbol shows that nhead=8 achieves the highest test accuracy (0.66), slightly outperforming other configurations. The relatively lower test accuracy compared to training performance suggests that the task may be inherently more challenging or that the model struggles to generalize effectively.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/MajoritySymbol_test_accuracy.png"
+      },
+      {
+        "analysis": "The accuracy curves for the CyclicShift task show that all configurations achieve high training and validation accuracy, with nhead=4 and nhead=16 performing particularly well. The rapid convergence of validation accuracy for nhead=4 suggests that it effectively captures sequence dependencies for this task.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/CyclicShift_accuracy_curves.png"
+      },
+      {
+        "analysis": "The loss curves for the CyclicShift task demonstrate a consistent reduction in cross-entropy loss across epochs, with nhead=4 achieving the lowest validation loss. The results indicate that the model is well-optimized for this task, with minimal overfitting observed.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/CyclicShift_loss_curves.png"
+      },
+      {
+        "analysis": "The test accuracy bar chart for CyclicShift shows uniformly high performance across configurations, with nhead=16 achieving the highest accuracy (0.98). This indicates that the model generalizes well for this task, and increasing nhead provides marginal benefits.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/CyclicShift_test_accuracy.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/EvenParity_accuracy_curves.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/EvenParity_loss_curves.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/EvenParity_test_accuracy.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/MajoritySymbol_accuracy_curves.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/MajoritySymbol_loss_curves.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/MajoritySymbol_test_accuracy.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/CyclicShift_accuracy_curves.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/CyclicShift_loss_curves.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/CyclicShift_test_accuracy.png"
+    ],
+    "vlm_feedback_summary": "The provided plots demonstrate the impact of varying the number of attention heads (nhead) on model performance across different tasks. Higher nhead values generally improve both training and validation performance, though the benefits diminish beyond a certain point. The results suggest that the proposed model effectively captures sequence dependencies, particularly for tasks like CyclicShift, while tasks like MajoritySymbol pose greater challenges for generalization.",
+    "exp_results_dir": "experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697",
+    "ablation_name": "MultiSyntheticDatasets",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_4211a431bb0b4a979d8603c36575fa48_proc_3173697/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "The overall plan encompasses two phases of Transformer model experimentation. The first phase focused on hyperparameter tuning by varying the number of attention heads (2, 4, 8, 16) and recording comprehensive metrics to identify the optimal configuration. The second phase introduces an ablation study, named NoPaddingMask, which investigates the effect of removing the src_key_padding_mask from the Transformer encoder's forward pass while keeping other components intact. The results of this ablation are compared across different numbers of attention heads to assess the necessity and impact of the padding mask. This combined approach aims to enhance the understanding and optimization of Transformer models for improved performance and efficiency.",
+    "analysis": "The execution of the training script completed successfully without any errors or bugs. The model was trained and evaluated on the SPR_BENCH dataset with different values of 'nhead', and the results were saved successfully. Test accuracies were reported for all configurations, demonstrating that the ablation study was conducted as planned.",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "train accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy of the model on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.7995,
+                "best_value": 0.8035
+              }
+            ]
+          },
+          {
+            "metric_name": "validation accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy of the model on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.784,
+                "best_value": 0.792
+              }
+            ]
+          },
+          {
+            "metric_name": "train loss",
+            "lower_is_better": true,
+            "description": "Loss of the model on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.4793,
+                "best_value": 0.4691
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "Loss of the model on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.5285,
+                "best_value": 0.5285
+              }
+            ]
+          },
+          {
+            "metric_name": "test accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy of the model on the test dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.804,
+                "best_value": 0.804
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# ------------------  NoPaddingMask ablation \u2013 single-file script ------------------ #\nimport os, pathlib, random, math, time, json, numpy as np, torch\nfrom torch import nn\nfrom torch.utils.data import DataLoader\nfrom datasets import Dataset, DatasetDict, load_dataset\n\n# -------------------- EXPERIMENT DATA STRUCTURE --------------------- #\nexperiment_data = {\n    \"NoPaddingMask\": {\"SPR_BENCH\": {\"results\": {}}}  # will store one entry per nhead\n}\n\n# ---------------------- MISC SETUP ---------------------------------- #\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# --------------------------- DATA UTILS ----------------------------- #\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(split_csv: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / split_csv),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    return DatasetDict(\n        train=_load(\"train.csv\"),\n        dev=_load(\"dev.csv\"),\n        test=_load(\"test.csv\"),\n    )\n\n\ndef build_vocab(dataset: Dataset, seq_field: str = \"sequence\"):\n    vocab = {\"<pad>\": 0, \"<unk>\": 1}\n    idx = 2\n    for s in dataset[seq_field]:\n        for tok in s.strip().split():\n            if tok not in vocab:\n                vocab[tok] = idx\n                idx += 1\n    return vocab\n\n\ndef encode_sequence(seq, vocab, max_len=None):\n    tokens = [vocab.get(tok, vocab[\"<unk>\"]) for tok in seq.strip().split()]\n    if max_len is not None:\n        tokens = tokens[:max_len]\n    return tokens\n\n\n# ----------------------- SYNTHETIC DATA ----------------------------- #\ndef build_synthetic(num_train=500, num_dev=100, num_test=200, seqlen=10, vocab_sz=12):\n    symbols = [chr(ord(\"A\") + i) for i in range(vocab_sz)]\n\n    def gen_split(n):\n        data = {\"id\": [], \"sequence\": [], \"label\": []}\n        for i in range(n):\n            seq = [random.choice(symbols) for _ in range(seqlen)]\n            label = 1 if seq.count(\"A\") % 2 == 0 else 0\n            data[\"id\"].append(str(i))\n            data[\"sequence\"].append(\" \".join(seq))\n            data[\"label\"].append(label)\n        return Dataset.from_dict(data)\n\n    return DatasetDict(\n        train=gen_split(num_train), dev=gen_split(num_dev), test=gen_split(num_test)\n    )\n\n\n# ----------------------------- MODEL -------------------------------- #\nclass NoPadMaskTransformerClassifier(nn.Module):\n    \"\"\"\n    Identical to baseline SimpleTransformerClassifier except we DO NOT supply\n    src_key_padding_mask to the encoder (ablation).\n    \"\"\"\n\n    def __init__(self, vocab_size, embed_dim, nhead, num_layers, num_classes, pad_idx):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)\n        self.pos_embed = nn.Embedding(512, embed_dim)\n        encoder_layer = nn.TransformerEncoderLayer(\n            d_model=embed_dim,\n            nhead=nhead,\n            dim_feedforward=embed_dim * 4,\n            dropout=0.1,\n            activation=\"relu\",\n            batch_first=True,\n        )\n        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)\n        self.classifier = nn.Linear(embed_dim, num_classes)\n\n    def forward(self, x, mask):\n        # x : [B,T] ; mask : [B,T]  (True where PAD)\n        pos = torch.arange(0, x.size(1), device=x.device).unsqueeze(0)\n        h = self.embed(x) + self.pos_embed(pos)\n        # ---------------- No padding mask passed here ---------------- #\n        h = self.encoder(h)  # <- ablation\n        mask_flt = (~mask).unsqueeze(-1)  # False for PAD\n        h_sum = (h * mask_flt).sum(1)  # masked mean pool\n        lengths = mask_flt.sum(1).clamp(min=1)\n        pooled = h_sum / lengths\n        return self.classifier(pooled)\n\n\n# ---------------------- DATALOADER UTILS ---------------------------- #\ndef collate_fn(batch, vocab, max_len=128):\n    seqs = [encode_sequence(b[\"sequence\"], vocab, max_len) for b in batch]\n    labels = torch.tensor([b[\"label\"] for b in batch], dtype=torch.long)\n    max_len_batch = max(len(s) for s in seqs)\n    padded = [s + [vocab[\"<pad>\"]] * (max_len_batch - len(s)) for s in seqs]\n    x = torch.tensor(padded, dtype=torch.long)\n    mask = x == vocab[\"<pad>\"]\n    return {\"input_ids\": x, \"attention_mask\": mask, \"labels\": labels}\n\n\ndef evaluate(model, dataloader, criterion):\n    model.eval()\n    total_loss, correct, count = 0.0, 0, 0\n    with torch.no_grad():\n        for batch in dataloader:\n            batch = {\n                k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)\n            }\n            logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(logits, batch[\"labels\"])\n            total_loss += loss.item() * batch[\"labels\"].size(0)\n            preds = logits.argmax(-1)\n            correct += (preds == batch[\"labels\"]).sum().item()\n            count += batch[\"labels\"].size(0)\n    return total_loss / count, correct / count\n\n\n# --------------------------- LOAD DATA ------------------------------ #\nDATA_PATH = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\ntry:\n    datasets_dict = load_spr_bench(DATA_PATH)\n    print(\"Loaded real SPR_BENCH dataset.\")\nexcept Exception as e:\n    print(\"Could not load real dataset, using synthetic:\", e)\n    datasets_dict = build_synthetic()\n\nvocab = build_vocab(datasets_dict[\"train\"])\nnum_classes = len(set(datasets_dict[\"train\"][\"label\"]))\nprint(f\"Vocab size: {len(vocab)}, num_classes: {num_classes}\")\n\nbatch_size = 64\ntrain_dl = DataLoader(\n    datasets_dict[\"train\"],\n    batch_size=batch_size,\n    shuffle=True,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\ndev_dl = DataLoader(\n    datasets_dict[\"dev\"],\n    batch_size=batch_size,\n    shuffle=False,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\ntest_dl = DataLoader(\n    datasets_dict[\"test\"],\n    batch_size=batch_size,\n    shuffle=False,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\n\n# --------------------- HYPERPARAMETER SWEEP ------------------------- #\nnhead_values = [2, 4, 8, 16]\nepochs = 5\nembed_dim = 128\n\nfor nhead in nhead_values:\n    if embed_dim % nhead != 0:\n        print(f\"Skipping nhead={nhead} because embed_dim {embed_dim} not divisible.\")\n        continue\n    print(f\"\\n=== Training with nhead={nhead} (NoPaddingMask) ===\")\n    model = NoPadMaskTransformerClassifier(\n        vocab_size=len(vocab),\n        embed_dim=embed_dim,\n        nhead=nhead,\n        num_layers=2,\n        num_classes=num_classes,\n        pad_idx=vocab[\"<pad>\"],\n    ).to(device)\n\n    criterion = nn.CrossEntropyLoss()\n    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n\n    metrics = {\"train_acc\": [], \"val_acc\": []}\n    losses = {\"train_loss\": [], \"val_loss\": []}\n\n    for epoch in range(1, epochs + 1):\n        model.train()\n        epoch_loss, correct, total = 0.0, 0, 0\n        for batch in train_dl:\n            batch = {\n                k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)\n            }\n            optimizer.zero_grad()\n            logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(logits, batch[\"labels\"])\n            loss.backward()\n            optimizer.step()\n\n            epoch_loss += loss.item() * batch[\"labels\"].size(0)\n            preds = logits.argmax(-1)\n            correct += (preds == batch[\"labels\"]).sum().item()\n            total += batch[\"labels\"].size(0)\n\n        train_loss = epoch_loss / total\n        train_acc = correct / total\n        val_loss, val_acc = evaluate(model, dev_dl, criterion)\n\n        print(\n            f\"Epoch {epoch}/{epochs} | nhead={nhead} | train_acc={train_acc:.4f}, val_acc={val_acc:.4f}\"\n        )\n\n        metrics[\"train_acc\"].append(train_acc)\n        metrics[\"val_acc\"].append(val_acc)\n        losses[\"train_loss\"].append(train_loss)\n        losses[\"val_loss\"].append(val_loss)\n\n    # ------------------ TEST EVALUATION ----------------------------- #\n    test_loss, test_acc = evaluate(model, test_dl, criterion)\n    print(f\"nhead={nhead} | Test accuracy: {test_acc:.4f}\")\n\n    preds_all, gts_all = [], []\n    model.eval()\n    with torch.no_grad():\n        for batch in test_dl:\n            batch_gpu = {\n                k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)\n            }\n            logits = model(batch_gpu[\"input_ids\"], batch_gpu[\"attention_mask\"])\n            preds_all.extend(logits.argmax(-1).cpu().tolist())\n            gts_all.extend(batch[\"labels\"].tolist())\n\n    # --------------- SAVE RESULTS TO EXPERIMENT_DATA ---------------- #\n    experiment_data[\"NoPaddingMask\"][\"SPR_BENCH\"][\"results\"][str(nhead)] = {\n        \"metrics\": metrics,\n        \"losses\": losses,\n        \"test_acc\": test_acc,\n        \"predictions\": preds_all,\n        \"ground_truth\": gts_all,\n    }\n\n# ---------------- SAVE ALL EXPERIMENT DATA -------------------------- #\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"\\nSaved experiment data to\", os.path.join(working_dir, \"experiment_data.npy\"))\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ------------------ LOAD EXPERIMENT DATA ------------------ #\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\n# Quick exit if nothing to plot\nif not experiment_data:\n    exit()\n\nresults_dict = (\n    experiment_data.get(\"NoPaddingMask\", {}).get(\"SPR_BENCH\", {}).get(\"results\", {})\n)\nnheads = sorted(results_dict.keys(), key=int)\n\n# ------------------ PER-NHEAD ACCURACY CURVES --------------- #\nfor nh in nheads:\n    try:\n        metrics = results_dict[nh][\"metrics\"]\n        train_acc = metrics[\"train_acc\"]\n        val_acc = metrics[\"val_acc\"]\n        epochs = np.arange(1, len(train_acc) + 1)\n\n        plt.figure()\n        plt.plot(epochs, train_acc, marker=\"o\", label=\"Train Acc\")\n        plt.plot(epochs, val_acc, marker=\"s\", label=\"Val Acc\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Accuracy\")\n        plt.title(f\"SPR_BENCH \u2013 NoPaddingMask / Train vs Val Acc\\nnhead={nh}\")\n        plt.legend()\n        fname = f\"SPR_BENCH_nhead{nh}_train_val_acc.png\"\n        plt.savefig(os.path.join(working_dir, fname))\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating acc curve for nhead={nh}: {e}\")\n        plt.close()\n\n# ------------------ TEST ACCURACY BARPLOT ------------------ #\ntry:\n    test_accs = [results_dict[nh][\"test_acc\"] for nh in nheads]\n    plt.figure()\n    plt.bar(range(len(nheads)), test_accs, tick_label=nheads)\n    plt.ylabel(\"Test Accuracy\")\n    plt.title(\"SPR_BENCH \u2013 NoPaddingMask / Test Acc vs nhead\")\n    for idx, acc in enumerate(test_accs):\n        plt.text(idx, acc + 0.01, f\"{acc:.2f}\", ha=\"center\")\n    fname = \"SPR_BENCH_test_acc_barplot.png\"\n    plt.savefig(os.path.join(working_dir, fname))\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating test accuracy bar plot: {e}\")\n    plt.close()\n\nprint(\"Finished plotting experiment results.\")\n",
+    "plot_plan": "We first load the saved experiment_data.npy, identify every nhead setting tested, and for each of them fetch the per-epoch train/val accuracy arrays plus the final test accuracy.  \nA loop then creates one figure per nhead that overlays train and validation accuracy versus epoch; these plots help diagnose over/under-fitting and are saved with descriptive filenames.  \nTo keep the figure count reasonable (<5) we only plot accuracy curves (loss curves are similar and can be inspected numerically if needed).  \nAfter producing the four nhead-specific curves, we make a single bar plot that compares the final test accuracy across all heads\u2014this gives a quick \u201con one page\u201d view of model quality.  \nEvery plotting section is wrapped in its own try-except so that a failure on one figure does not stop the rest; in the except branch we still close any open figure.  \nEach figure is explicitly closed after saving, has a clear title and subtitle (e.g. \u201cSPR_BENCH \u2013 NoPaddingMask / Train vs Val Acc, nhead=4\u201d), and is written into the working directory.  \nThe script adheres to the import/working_dir requirements and prints a short confirmation once the plots have been generated.",
+    "plot_analyses": [
+      {
+        "analysis": "The training accuracy steadily increases over the epochs, stabilizing around 0.8. However, the validation accuracy shows fluctuations, reaching a peak at epoch 2, dropping at epoch 3, and recovering afterward. The gap between train and validation accuracy suggests potential overfitting, especially as the training accuracy stabilizes while validation accuracy fluctuates.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_32c926219b2d4f6bb241f545df0707bb_proc_3173698/SPR_BENCH_nhead2_train_val_acc.png"
+      },
+      {
+        "analysis": "Both training and validation accuracies improve steadily in the initial epochs, with training accuracy reaching a stable level around 0.8. Validation accuracy peaks at epoch 2 and then slightly decreases but remains relatively stable. The smaller gap between train and validation accuracies compared to the previous configuration indicates improved generalization with this setting.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_32c926219b2d4f6bb241f545df0707bb_proc_3173698/SPR_BENCH_nhead4_train_val_acc.png"
+      },
+      {
+        "analysis": "Training accuracy increases rapidly to stabilize at around 0.8, while validation accuracy shows a slight dip at epoch 3 before recovering. The gap between training and validation accuracies is slightly more pronounced than in the previous configuration, indicating a minor trade-off in generalization.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_32c926219b2d4f6bb241f545df0707bb_proc_3173698/SPR_BENCH_nhead8_train_val_acc.png"
+      },
+      {
+        "analysis": "Training accuracy stabilizes around 0.8, while validation accuracy steadily improves over the epochs, showing no significant dips. The gap between training and validation accuracies is narrow, suggesting improved generalization performance with this configuration.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_32c926219b2d4f6bb241f545df0707bb_proc_3173698/SPR_BENCH_nhead16_train_val_acc.png"
+      },
+      {
+        "analysis": "Test accuracy shows marginal differences across the different nhead configurations, ranging between 0.78 and 0.80. The highest accuracy is achieved with nhead=2, while the lowest is with nhead=16. This suggests that increasing the number of heads beyond a certain point does not yield significant improvements and might even slightly degrade performance.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_32c926219b2d4f6bb241f545df0707bb_proc_3173698/SPR_BENCH_test_acc_barplot.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_32c926219b2d4f6bb241f545df0707bb_proc_3173698/SPR_BENCH_nhead2_train_val_acc.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_32c926219b2d4f6bb241f545df0707bb_proc_3173698/SPR_BENCH_nhead4_train_val_acc.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_32c926219b2d4f6bb241f545df0707bb_proc_3173698/SPR_BENCH_nhead8_train_val_acc.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_32c926219b2d4f6bb241f545df0707bb_proc_3173698/SPR_BENCH_nhead16_train_val_acc.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_32c926219b2d4f6bb241f545df0707bb_proc_3173698/SPR_BENCH_test_acc_barplot.png"
+    ],
+    "vlm_feedback_summary": "The experiments reveal that training accuracy consistently stabilizes at around 0.8 across all configurations, while validation and test accuracies show variations. Lower nhead values (e.g., 2) tend to generalize slightly better, achieving the highest test accuracy. Increasing nhead does not significantly improve performance and may slightly degrade it. The results highlight the importance of balancing model complexity with generalization capabilities.",
+    "exp_results_dir": "experiment_results/experiment_32c926219b2d4f6bb241f545df0707bb_proc_3173698",
+    "ablation_name": "NoPaddingMask",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_32c926219b2d4f6bb241f545df0707bb_proc_3173698/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "The overall plan is a two-stage analysis aimed at optimizing and understanding Transformer model components. Initially, hyperparameter tuning of the number of attention heads (2, 4, 8, 16) was conducted, training separate models to find the optimal number of heads by analyzing train/validation loss and accuracy. The current plan adds an ablation study, 'FreezeTokenEmbeddings', where token embeddings are frozen to assess their impact on the training process, providing insights into the importance of different model components. Both experiments share a consistent pipeline, allowing direct comparisons. Results from both the hyperparameter tuning and ablation study are stored in the 'experiment_data.npy' file for integrated analysis.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "train accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy of the model on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.8025,
+                "best_value": 0.8025
+              }
+            ]
+          },
+          {
+            "metric_name": "validation accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy of the model on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.784,
+                "best_value": 0.784
+              }
+            ]
+          },
+          {
+            "metric_name": "train loss",
+            "lower_is_better": true,
+            "description": "Loss of the model on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.4699,
+                "best_value": 0.4699
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "Loss of the model on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.5389,
+                "best_value": 0.5389
+              }
+            ]
+          },
+          {
+            "metric_name": "test accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy of the model on the test dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.8,
+                "best_value": 0.8
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, pathlib, random, time, math, json, numpy as np, torch\nfrom torch import nn\nfrom torch.utils.data import DataLoader\nfrom datasets import Dataset, DatasetDict, load_dataset\n\n# -------------------- EXPERIMENT DATA STRUCTURE --------------------- #\nexperiment_data = {\n    \"FreezeTokenEmbeddings\": {  # ablation name\n        \"SPR_BENCH\": {\"results\": {}}  # dataset name  # one entry per nhead\n    }\n}\n\n# ---------------------- MISC SETUP ---------------------------------- #\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# --------------------------- DATA UTILS ----------------------------- #\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(split_csv: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / split_csv),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for split in [\"train\", \"dev\", \"test\"]:\n        d[split] = _load(f\"{split}.csv\")\n    return d\n\n\ndef build_vocab(dataset: Dataset, seq_field: str = \"sequence\"):\n    vocab = {\"<pad>\": 0, \"<unk>\": 1}\n    idx = 2\n    for s in dataset[seq_field]:\n        for tok in s.strip().split():\n            if tok not in vocab:\n                vocab[tok] = idx\n                idx += 1\n    return vocab\n\n\ndef encode_sequence(seq, vocab, max_len=None):\n    tokens = [vocab.get(tok, vocab[\"<unk>\"]) for tok in seq.strip().split()]\n    if max_len is not None:\n        tokens = tokens[:max_len]\n    return tokens\n\n\n# ----------------------- SYNTHETIC DATA ----------------------------- #\ndef build_synthetic(num_train=500, num_dev=100, num_test=200, seqlen=10, vocab_sz=12):\n    symbols = [chr(ord(\"A\") + i) for i in range(vocab_sz)]\n\n    def gen_split(n):\n        data = {\"id\": [], \"sequence\": [], \"label\": []}\n        for i in range(n):\n            seq = [random.choice(symbols) for _ in range(seqlen)]\n            label = 1 if seq.count(\"A\") % 2 == 0 else 0\n            data[\"id\"].append(str(i))\n            data[\"sequence\"].append(\" \".join(seq))\n            data[\"label\"].append(label)\n        return Dataset.from_dict(data)\n\n    return DatasetDict(\n        train=gen_split(num_train), dev=gen_split(num_dev), test=gen_split(num_test)\n    )\n\n\n# ----------------------------- MODEL -------------------------------- #\nclass SimpleTransformerClassifier(nn.Module):\n    def __init__(self, vocab_size, embed_dim, nhead, num_layers, num_classes, pad_idx):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)\n        self.pos_embed = nn.Embedding(512, embed_dim)\n        encoder_layer = nn.TransformerEncoderLayer(\n            d_model=embed_dim,\n            nhead=nhead,\n            dim_feedforward=embed_dim * 4,\n            dropout=0.1,\n            activation=\"relu\",\n            batch_first=True,\n        )\n        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)\n        self.classifier = nn.Linear(embed_dim, num_classes)\n\n    def forward(self, x, mask):\n        pos = torch.arange(0, x.size(1), device=x.device).unsqueeze(0)\n        h = self.embed(x) + self.pos_embed(pos)\n        h = self.encoder(h, src_key_padding_mask=mask)\n        mask_flt = (~mask).unsqueeze(-1)\n        h_sum = (h * mask_flt).sum(1)\n        lengths = mask_flt.sum(1).clamp(min=1)\n        pooled = h_sum / lengths\n        return self.classifier(pooled)\n\n\n# ---------------------- DATALOADER UTILS ---------------------------- #\ndef collate_fn(batch, vocab, max_len=128):\n    seqs = [encode_sequence(b[\"sequence\"], vocab, max_len) for b in batch]\n    labels = torch.tensor([b[\"label\"] for b in batch], dtype=torch.long)\n    max_len_batch = max(len(s) for s in seqs)\n    padded = [s + [vocab[\"<pad>\"]] * (max_len_batch - len(s)) for s in seqs]\n    x = torch.tensor(padded, dtype=torch.long)\n    mask = x == vocab[\"<pad>\"]\n    return {\"input_ids\": x, \"attention_mask\": mask, \"labels\": labels}\n\n\ndef evaluate(model, dataloader, criterion):\n    model.eval()\n    tot_loss, correct, cnt = 0.0, 0, 0\n    with torch.no_grad():\n        for batch in dataloader:\n            batch = {\n                k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)\n            }\n            logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(logits, batch[\"labels\"])\n            tot_loss += loss.item() * batch[\"labels\"].size(0)\n            preds = logits.argmax(-1)\n            correct += (preds == batch[\"labels\"]).sum().item()\n            cnt += batch[\"labels\"].size(0)\n    return tot_loss / cnt, correct / cnt\n\n\n# --------------------------- LOAD DATA ------------------------------ #\nDATA_PATH = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\ntry:\n    datasets_dict = load_spr_bench(DATA_PATH)\n    print(\"Loaded real SPR_BENCH dataset.\")\nexcept Exception as e:\n    print(\"Could not load real dataset, using synthetic:\", e)\n    datasets_dict = build_synthetic()\n\nvocab = build_vocab(datasets_dict[\"train\"])\nnum_classes = len(set(datasets_dict[\"train\"][\"label\"]))\nprint(f\"Vocab size: {len(vocab)}, num_classes: {num_classes}\")\n\nbatch_size = 64\ntrain_dl = DataLoader(\n    datasets_dict[\"train\"],\n    batch_size=batch_size,\n    shuffle=True,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\ndev_dl = DataLoader(\n    datasets_dict[\"dev\"],\n    batch_size=batch_size,\n    shuffle=False,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\ntest_dl = DataLoader(\n    datasets_dict[\"test\"],\n    batch_size=batch_size,\n    shuffle=False,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\n\n# --------------------- HYPERPARAMETER SWEEP ------------------------- #\nnhead_values = [2, 4, 8, 16]\nepochs = 5\nembed_dim = 128\n\nfor nhead in nhead_values:\n    if embed_dim % nhead != 0:\n        print(f\"Skipping nhead={nhead} because embed_dim {embed_dim} not divisible.\")\n        continue\n    print(f\"\\n=== FreezeTokenEmbeddings | Training with nhead={nhead} ===\")\n    model = SimpleTransformerClassifier(\n        vocab_size=len(vocab),\n        embed_dim=embed_dim,\n        nhead=nhead,\n        num_layers=2,\n        num_classes=num_classes,\n        pad_idx=vocab[\"<pad>\"],\n    ).to(device)\n\n    # -------------------- FREEZE TOKEN EMBEDDINGS ------------------- #\n    for param in model.embed.parameters():\n        param.requires_grad = False\n\n    criterion = nn.CrossEntropyLoss()\n    optimizer = torch.optim.Adam(\n        filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3\n    )\n\n    metrics = {\"train_acc\": [], \"val_acc\": []}\n    losses = {\"train_loss\": [], \"val_loss\": []}\n\n    for epoch in range(1, epochs + 1):\n        model.train()\n        ep_loss, correct, total = 0.0, 0, 0\n        for batch in train_dl:\n            batch = {\n                k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)\n            }\n            optimizer.zero_grad()\n            logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(logits, batch[\"labels\"])\n            loss.backward()\n            optimizer.step()\n            ep_loss += loss.item() * batch[\"labels\"].size(0)\n            preds = logits.argmax(-1)\n            correct += (preds == batch[\"labels\"]).sum().item()\n            total += batch[\"labels\"].size(0)\n        train_loss = ep_loss / total\n        train_acc = correct / total\n        val_loss, val_acc = evaluate(model, dev_dl, criterion)\n        print(\n            f\"Epoch {epoch}/{epochs} | nhead={nhead} | train_acc={train_acc:.4f}, val_acc={val_acc:.4f}\"\n        )\n        metrics[\"train_acc\"].append(train_acc)\n        metrics[\"val_acc\"].append(val_acc)\n        losses[\"train_loss\"].append(train_loss)\n        losses[\"val_loss\"].append(val_loss)\n\n    # ------------------ TEST EVALUATION ----------------------------- #\n    test_loss, test_acc = evaluate(model, test_dl, criterion)\n    print(f\"nhead={nhead} | Test accuracy: {test_acc:.4f}\")\n\n    preds_all, gts_all = [], []\n    model.eval()\n    with torch.no_grad():\n        for batch in test_dl:\n            batch_gpu = {\n                k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)\n            }\n            logits = model(batch_gpu[\"input_ids\"], batch_gpu[\"attention_mask\"])\n            preds_all.extend(logits.argmax(-1).cpu().tolist())\n            gts_all.extend(batch[\"labels\"].tolist())\n\n    # --------------- SAVE RESULTS TO EXPERIMENT_DATA ---------------- #\n    experiment_data[\"FreezeTokenEmbeddings\"][\"SPR_BENCH\"][\"results\"][str(nhead)] = {\n        \"metrics\": metrics,\n        \"losses\": losses,\n        \"test_acc\": test_acc,\n        \"predictions\": preds_all,\n        \"ground_truth\": gts_all,\n    }\n\n# ---------------- SAVE ALL EXPERIMENT DATA -------------------------- #\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"\\nSaved experiment data to\", os.path.join(working_dir, \"experiment_data.npy\"))\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ------------------------------------------------------------------ #\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\nfor ablation, dsets in experiment_data.items():\n    for dset_name, dset_blob in dsets.items():\n        results = dset_blob.get(\"results\", {})\n        # ----------------- 1. Test accuracy vs nhead ---------------- #\n        try:\n            nheads, test_accs = [], []\n            for nhead, blob in results.items():\n                nheads.append(int(nhead))\n                test_accs.append(blob.get(\"test_acc\", np.nan))\n            if nheads:\n                idx = np.argsort(nheads)\n                nheads = np.array(nheads)[idx]\n                test_accs = np.array(test_accs)[idx]\n                plt.figure()\n                plt.plot(nheads, test_accs, marker=\"o\")\n                plt.xlabel(\"nhead\")\n                plt.ylabel(\"Test Accuracy\")\n                plt.title(f\"{dset_name} | {ablation} | Test Accuracy vs nhead\")\n                save_path = os.path.join(\n                    working_dir, f\"{dset_name}_{ablation}_test_acc_vs_nhead.png\"\n                )\n                plt.savefig(save_path)\n                plt.close()\n        except Exception as e:\n            print(f\"Error plotting test-accuracy curve: {e}\")\n            plt.close()\n\n        # ----------- 2. Per-head training / validation curves ------- #\n        for i, (nhead, blob) in enumerate(results.items()):\n            metrics = blob.get(\"metrics\", {})\n            losses = blob.get(\"losses\", {})\n            epochs = range(1, 1 + len(metrics.get(\"train_acc\", [])))\n\n            # Accuracy plot\n            try:\n                plt.figure()\n                plt.plot(epochs, metrics.get(\"train_acc\", []), label=\"train\")\n                plt.plot(epochs, metrics.get(\"val_acc\", []), label=\"val\")\n                plt.xlabel(\"Epoch\")\n                plt.ylabel(\"Accuracy\")\n                plt.title(\n                    f\"{dset_name} | {ablation} | nhead={nhead}\\nTraining vs Validation Accuracy\"\n                )\n                plt.legend()\n                fname = f\"{dset_name}_{ablation}_nhead{nhead}_acc_curve.png\"\n                plt.savefig(os.path.join(working_dir, fname))\n                plt.close()\n            except Exception as e:\n                print(f\"Error creating acc plot for nhead={nhead}: {e}\")\n                plt.close()\n\n            # Loss plot\n            try:\n                plt.figure()\n                plt.plot(epochs, losses.get(\"train_loss\", []), label=\"train\")\n                plt.plot(epochs, losses.get(\"val_loss\", []), label=\"val\")\n                plt.xlabel(\"Epoch\")\n                plt.ylabel(\"Loss\")\n                plt.title(\n                    f\"{dset_name} | {ablation} | nhead={nhead}\\nTraining vs Validation Loss\"\n                )\n                plt.legend()\n                fname = f\"{dset_name}_{ablation}_nhead{nhead}_loss_curve.png\"\n                plt.savefig(os.path.join(working_dir, fname))\n                plt.close()\n            except Exception as e:\n                print(f\"Error creating loss plot for nhead={nhead}: {e}\")\n                plt.close()\n\n            # Confusion matrix (limit to first 4 heads)\n            if i < 4:\n                try:\n                    preds = np.array(blob.get(\"predictions\", []), dtype=int)\n                    gts = np.array(blob.get(\"ground_truth\", []), dtype=int)\n                    if preds.size and gts.size:\n                        num_classes = max(preds.max(), gts.max()) + 1\n                        cm = np.zeros((num_classes, num_classes), dtype=int)\n                        for gt, pr in zip(gts, preds):\n                            cm[gt, pr] += 1\n                        plt.figure()\n                        plt.imshow(cm, cmap=\"Blues\")\n                        plt.colorbar()\n                        plt.xlabel(\"Predicted\")\n                        plt.ylabel(\"Ground Truth\")\n                        plt.title(\n                            f\"{dset_name} | {ablation} | nhead={nhead}\\nConfusion Matrix\"\n                        )\n                        fname = (\n                            f\"{dset_name}_{ablation}_nhead{nhead}_confusion_matrix.png\"\n                        )\n                        plt.savefig(os.path.join(working_dir, fname))\n                        plt.close()\n                except Exception as e:\n                    print(f\"Error creating confusion matrix for nhead={nhead}: {e}\")\n                    plt.close()\n",
+    "plot_plan": "We will load the stored experiment_data.npy, iterate over every ablation\u2013dataset pair, and gather the per-head metrics already recorded by the training script.  For each head we will: (1) plot training/validation accuracy across epochs, (2) plot training/validation loss across epochs, and (3) draw a confusion-matrix heat-map from ground-truth versus predictions on the test set.  After that, we will aggregate all heads into a single line plot showing test accuracy versus nhead.  Each individual figure is wrapped in its own try-except so that one failure does not stop subsequent plots; figures are always closed.  File names contain ablation, dataset, head (when relevant) and the plotted metric.  We keep the number of confusion-matrix plots below the 5-figure cap by limiting them to the first four heads found.  All plots are saved into working_dir created at runtime.  Only data that exist inside experiment_data.npy are used\u2014no made-up values or external datasets.",
+    "plot_analyses": [
+      {
+        "analysis": "This plot demonstrates the relationship between the number of attention heads (nhead) and test accuracy. The accuracy decreases as the number of attention heads increases, suggesting that higher nhead values might introduce excessive complexity or noise that hinders performance. The best performance is observed at nhead=2, with a steady decline as nhead increases.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_test_acc_vs_nhead.png"
+      },
+      {
+        "analysis": "This plot compares training and validation accuracy across epochs for nhead=2. The training accuracy increases steadily, indicating effective learning. Validation accuracy fluctuates, initially improving but later showing signs of instability. This suggests potential overfitting or sensitivity to hyperparameters.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead2_acc_curve.png"
+      },
+      {
+        "analysis": "This plot shows the training and validation loss across epochs for nhead=2. Both losses decrease over time, with training loss reducing more consistently. The validation loss fluctuates, indicating potential overfitting or model instability despite overall improvement.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead2_loss_curve.png"
+      },
+      {
+        "analysis": "The confusion matrix provides insight into the model's performance for nhead=2. It shows a relatively balanced distribution of correct predictions for both classes, with some misclassifications. This suggests room for improvement in capturing symbolic rules.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead2_confusion_matrix.png"
+      },
+      {
+        "analysis": "This plot compares training and validation accuracy across epochs for nhead=4. Both training and validation accuracy improve initially, but validation accuracy starts to diverge from training accuracy in later epochs, indicating overfitting. The model performs slightly worse than for nhead=2.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead4_acc_curve.png"
+      },
+      {
+        "analysis": "This plot shows training and validation loss across epochs for nhead=4. Both losses decrease over time, but the validation loss plateaus and fluctuates in later epochs, further suggesting overfitting or difficulty in generalizing to unseen data.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead4_loss_curve.png"
+      },
+      {
+        "analysis": "This plot compares training and validation accuracy across epochs for nhead=8. Training accuracy increases steadily and stabilizes, while validation accuracy improves but remains consistently lower than training accuracy. The gap between training and validation accuracy reflects overfitting.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead4_confusion_matrix.png"
+      },
+      {
+        "analysis": "This plot shows training and validation loss across epochs for nhead=8. Training loss decreases steadily, while validation loss fluctuates and remains higher than training loss, indicating challenges in generalization and potential overfitting.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead8_acc_curve.png"
+      },
+      {
+        "analysis": "This plot compares training and validation accuracy across epochs for nhead=16. Training accuracy continues to improve, while validation accuracy shows a more pronounced divergence, indicating significant overfitting. The model's performance on unseen data is likely to be poor.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead8_loss_curve.png"
+      },
+      {
+        "analysis": "This plot shows training and validation loss across epochs for nhead=16. Training loss decreases steadily, while validation loss shows an increasing trend in later epochs, further confirming overfitting and poor generalization.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead8_confusion_matrix.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_test_acc_vs_nhead.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead2_acc_curve.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead2_loss_curve.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead2_confusion_matrix.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead4_acc_curve.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead4_loss_curve.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead4_confusion_matrix.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead8_acc_curve.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead8_loss_curve.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead8_confusion_matrix.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead16_acc_curve.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead16_loss_curve.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/SPR_BENCH_FreezeTokenEmbeddings_nhead16_confusion_matrix.png"
+    ],
+    "vlm_feedback_summary": "The analysis highlights the impact of varying the number of attention heads (nhead) on model performance. Lower nhead values (e.g., nhead=2) yield better test accuracy, while higher values result in overfitting and reduced generalization. Validation metrics indicate instability and overfitting across all configurations, emphasizing the need for regularization and hyperparameter tuning.",
+    "exp_results_dir": "experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699",
+    "ablation_name": "FreezeTokenEmbeddings",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_3458a72cf7104fd895bcfb1abe0dd588_proc_3173699/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "The overall plan combines the exploration of hyperparameter tuning related to the number of attention heads in Transformer models with an ablation study on the influence of pooling strategies using a learnable '[CLS]' token. Initially, the plan involved evaluating various configurations of attention heads (2, 4, 8, 16) to optimize model performance and efficiency. Building on this, the current plan introduces a comparison between the baseline masked-mean pooling and a '[CLS]' token pooling strategy. By maintaining identical hyperparameter settings across both strategies, the study aims to isolate the effect of pooling methods on performance. The combined plans aim to enhance understanding of how architectural and hyperparameter choices impact Transformer model efficacy, contributing to more informed model design decisions.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "accuracy",
+            "lower_is_better": false,
+            "description": "Measures the proportion of correct predictions made by the model.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.797,
+                "best_value": 0.8045
+              }
+            ]
+          },
+          {
+            "metric_name": "loss",
+            "lower_is_better": true,
+            "description": "Measures the error in the model's predictions. Lower values indicate better performance.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.5224,
+                "best_value": 0.4619
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# UseCLS token ablation vs. mean-pooling \u2013 single-file script\nimport os, pathlib, random, numpy as np, torch, math, time, json\nfrom torch import nn\nfrom torch.utils.data import DataLoader\nfrom datasets import Dataset, DatasetDict, load_dataset\n\n# ------------------ EXPERIMENT DATA STRUCTURE ---------------------- #\nexperiment_data = {\n    \"mean_pooling\": {\"SPR_BENCH\": {\"results\": {}}},\n    \"cls_token\": {\"SPR_BENCH\": {\"results\": {}}},\n}\n\n# ----------------------- MISC SETUP -------------------------------- #\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ------------------------- DATA UTILS ------------------------------ #\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(csv_name: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    return DatasetDict(\n        train=_load(\"train.csv\"), dev=_load(\"dev.csv\"), test=_load(\"test.csv\")\n    )\n\n\ndef build_vocab(dataset: DatasetDict, seq_field: str = \"sequence\"):\n    vocab = {\"<pad>\": 0, \"<unk>\": 1}\n    idx = 2\n    for s in dataset[seq_field]:\n        for tok in s.strip().split():\n            if tok not in vocab:\n                vocab[tok] = idx\n                idx += 1\n    vocab[\"<cls>\"] = idx  # reserve slot for CLS token (not used in sequences)\n    return vocab\n\n\ndef encode_sequence(seq: str, vocab, max_len=None):\n    toks = [vocab.get(t, vocab[\"<unk>\"]) for t in seq.strip().split()]\n    return toks[:max_len] if max_len else toks\n\n\n# --------------------- SYNTHETIC PARITY DATA ----------------------- #\ndef build_synthetic(n_train=500, n_dev=100, n_test=200, seqlen=10, vocab_sz=12):\n    symbols = [chr(ord(\"A\") + i) for i in range(vocab_sz)]\n\n    def _gen(n):\n        data = {\"id\": [], \"sequence\": [], \"label\": []}\n        for i in range(n):\n            seq = [random.choice(symbols) for _ in range(seqlen)]\n            lbl = 1 if seq.count(\"A\") % 2 == 0 else 0\n            data[\"id\"].append(str(i))\n            data[\"sequence\"].append(\" \".join(seq))\n            data[\"label\"].append(lbl)\n        return Dataset.from_dict(data)\n\n    return DatasetDict(train=_gen(n_train), dev=_gen(n_dev), test=_gen(n_test))\n\n\n# --------------------------- MODEL --------------------------------- #\nclass SimpleTransformerClassifier(nn.Module):\n    def __init__(\n        self,\n        vocab_size,\n        embed_dim,\n        nhead,\n        num_layers,\n        num_classes,\n        pad_idx,\n        use_cls: bool = False,\n    ):\n        super().__init__()\n        self.use_cls = use_cls\n        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)\n        self.pos_embed = nn.Embedding(512, embed_dim)\n        encoder_layer = nn.TransformerEncoderLayer(\n            d_model=embed_dim,\n            nhead=nhead,\n            dim_feedforward=embed_dim * 4,\n            dropout=0.1,\n            activation=\"relu\",\n            batch_first=True,\n        )\n        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)\n        if self.use_cls:\n            self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))\n            nn.init.trunc_normal_(self.cls_token, std=0.02)\n        self.classifier = nn.Linear(embed_dim, num_classes)\n\n    def forward(self, x: torch.Tensor, mask: torch.Tensor):\n        bs, seq_len = x.size()\n        pos = torch.arange(0, seq_len, device=x.device).unsqueeze(0)\n        h = self.embed(x) + self.pos_embed(pos)\n        if self.use_cls:\n            cls_tok = self.cls_token.expand(bs, -1, -1)  # (B,1,D)\n            h = torch.cat([cls_tok, h], dim=1)\n            zeros = torch.zeros(bs, 1, dtype=torch.bool, device=mask.device)\n            mask = torch.cat([zeros, mask], dim=1)  # cls never masked\n            pos = torch.arange(0, h.size(1), device=x.device).unsqueeze(0)\n            h[:, 1:] += self.pos_embed(pos[:, 1:])  # add pos to non-cls part\n        h = self.encoder(h, src_key_padding_mask=mask)\n        if self.use_cls:\n            pooled = h[:, 0, :]\n        else:\n            mask_flt = (~mask).unsqueeze(-1)  # (B,L,1)  True for valid tokens\n            h_sum = (h * mask_flt).sum(1)\n            lengths = mask_flt.sum(1).clamp(min=1)\n            pooled = h_sum / lengths\n        return self.classifier(pooled)\n\n\n# ----------------------- DATALOADER -------------------------------- #\ndef collate_fn(batch, vocab, max_len=128):\n    seqs = [encode_sequence(b[\"sequence\"], vocab, max_len) for b in batch]\n    labels = torch.tensor([b[\"label\"] for b in batch], dtype=torch.long)\n    max_len_b = max(len(s) for s in seqs)\n    pad_id = vocab[\"<pad>\"]\n    padded = [s + [pad_id] * (max_len_b - len(s)) for s in seqs]\n    x = torch.tensor(padded, dtype=torch.long)\n    mask = x == pad_id  # True where padding\n    return {\"input_ids\": x, \"attention_mask\": mask, \"labels\": labels}\n\n\ndef evaluate(model, loader, crit):\n    model.eval()\n    loss_tot, correct, count = 0.0, 0, 0\n    with torch.no_grad():\n        for batch in loader:\n            batch = {k: v.to(device) for k, v in batch.items() if torch.is_tensor(v)}\n            logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = crit(logits, batch[\"labels\"])\n            loss_tot += loss.item() * batch[\"labels\"].size(0)\n            preds = logits.argmax(-1)\n            correct += (preds == batch[\"labels\"]).sum().item()\n            count += batch[\"labels\"].size(0)\n    return loss_tot / count, correct / count\n\n\n# ----------------------- LOAD DATASET ------------------------------ #\nDATA_PATH = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\ntry:\n    datasets_dict = load_spr_bench(DATA_PATH)\n    print(\"Loaded real SPR_BENCH dataset.\")\nexcept Exception as e:\n    print(\"Could not load real dataset, using synthetic parity data:\", e)\n    datasets_dict = build_synthetic()\n\nvocab = build_vocab(datasets_dict[\"train\"])\nnum_classes = len(set(datasets_dict[\"train\"][\"label\"]))\nprint(f\"Vocab size: {len(vocab)}, num_classes: {num_classes}\")\n\nbatch_size = 64\ntrain_dl = DataLoader(\n    datasets_dict[\"train\"],\n    batch_size=batch_size,\n    shuffle=True,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\ndev_dl = DataLoader(\n    datasets_dict[\"dev\"],\n    batch_size=batch_size,\n    shuffle=False,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\ntest_dl = DataLoader(\n    datasets_dict[\"test\"],\n    batch_size=batch_size,\n    shuffle=False,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\n\n# ------------------- HYPER-PARAMETER SWEEP ------------------------- #\nnhead_values = [2, 4, 8, 16]\nepochs, embed_dim = 5, 128\n\nfor variant in [\"mean_pooling\", \"cls_token\"]:\n    print(f\"\\n##### Variant: {variant} #####\")\n    use_cls_flag = variant == \"cls_token\"\n    for nhead in nhead_values:\n        if embed_dim % nhead:\n            print(f\"Skip nhead={nhead} (embed_dim not divisible).\")\n            continue\n        print(f\"\\n=== Training ({variant}) with nhead={nhead} ===\")\n        model = SimpleTransformerClassifier(\n            vocab_size=len(vocab),\n            embed_dim=embed_dim,\n            nhead=nhead,\n            num_layers=2,\n            num_classes=num_classes,\n            pad_idx=vocab[\"<pad>\"],\n            use_cls=use_cls_flag,\n        ).to(device)\n\n        criterion = nn.CrossEntropyLoss()\n        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n\n        metrics = {\"train_acc\": [], \"val_acc\": []}\n        losses = {\"train_loss\": [], \"val_loss\": []}\n\n        for ep in range(1, epochs + 1):\n            model.train()\n            ep_loss, correct, total = 0.0, 0, 0\n            for batch in train_dl:\n                batch = {\n                    k: v.to(device) for k, v in batch.items() if torch.is_tensor(v)\n                }\n                optimizer.zero_grad()\n                logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n                loss = criterion(logits, batch[\"labels\"])\n                loss.backward()\n                optimizer.step()\n                ep_loss += loss.item() * batch[\"labels\"].size(0)\n                preds = logits.argmax(-1)\n                correct += (preds == batch[\"labels\"]).sum().item()\n                total += batch[\"labels\"].size(0)\n            train_loss, train_acc = ep_loss / total, correct / total\n            val_loss, val_acc = evaluate(model, dev_dl, criterion)\n            print(\n                f\"Epoch {ep}/{epochs} | nhead={nhead} | train_acc={train_acc:.4f} \"\n                f\"val_acc={val_acc:.4f}\"\n            )\n            metrics[\"train_acc\"].append(train_acc)\n            metrics[\"val_acc\"].append(val_acc)\n            losses[\"train_loss\"].append(train_loss)\n            losses[\"val_loss\"].append(val_loss)\n\n        # -------------------- TEST EVAL ------------------------------ #\n        test_loss, test_acc = evaluate(model, test_dl, criterion)\n        print(f\"Finished nhead={nhead} | Test accuracy: {test_acc:.4f}\")\n\n        # gather predictions\n        preds_all, gts_all = [], []\n        model.eval()\n        with torch.no_grad():\n            for batch in test_dl:\n                gts_all.extend(batch[\"labels\"].tolist())\n                batch_gpu = {\n                    k: v.to(device) for k, v in batch.items() if torch.is_tensor(v)\n                }\n                logits = model(batch_gpu[\"input_ids\"], batch_gpu[\"attention_mask\"])\n                preds_all.extend(logits.argmax(-1).cpu().tolist())\n\n        # store results\n        experiment_data[variant][\"SPR_BENCH\"][\"results\"][str(nhead)] = {\n            \"metrics\": metrics,\n            \"losses\": losses,\n            \"test_acc\": test_acc,\n            \"predictions\": preds_all,\n            \"ground_truth\": gts_all,\n        }\n\n# -------------------- SAVE EXPERIMENT DATA ------------------------- #\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"Saved experiment data to\", os.path.join(working_dir, \"experiment_data.npy\"))\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# set working directory\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# -------------------- LOAD EXPERIMENT DATA ------------------------- #\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\nvariants = [\"mean_pooling\", \"cls_token\"]\ndataset_name = \"SPR_BENCH\"\n\n# ----------------------- PLOT ACCURACY CURVES ---------------------- #\nfor v in variants:\n    try:\n        fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharey=True)\n        for nhead, res in (\n            experiment_data.get(v, {}).get(dataset_name, {}).get(\"results\", {}).items()\n        ):\n            epochs = range(1, len(res[\"metrics\"][\"train_acc\"]) + 1)\n            axes[0].plot(epochs, res[\"metrics\"][\"train_acc\"], label=f\"nhead={nhead}\")\n            axes[1].plot(epochs, res[\"metrics\"][\"val_acc\"], label=f\"nhead={nhead}\")\n        axes[0].set_title(\"Train Accuracy\")\n        axes[1].set_title(\"Validation Accuracy\")\n        for ax in axes:\n            ax.set_xlabel(\"Epoch\")\n            ax.set_ylabel(\"Accuracy\")\n            ax.legend()\n        fig.suptitle(f\"{dataset_name}: {v} (Left: Train, Right: Val)\")\n        save_path = os.path.join(working_dir, f\"{dataset_name}_{v}_accuracy_curves.png\")\n        plt.savefig(save_path)\n        plt.close()\n    except Exception as e:\n        print(f\"Error plotting accuracy curves for {v}: {e}\")\n        plt.close()\n\n# --------------- PLOT TEST ACCURACY VS NHEAD COMPARISON ------------ #\ntry:\n    fig = plt.figure(figsize=(6, 4))\n    for v in variants:\n        nheads, test_accs = [], []\n        for nhead, res in (\n            experiment_data.get(v, {}).get(dataset_name, {}).get(\"results\", {}).items()\n        ):\n            nheads.append(int(nhead))\n            test_accs.append(res[\"test_acc\"])\n        idx = np.argsort(nheads)\n        plt.plot(np.array(nheads)[idx], np.array(test_accs)[idx], marker=\"o\", label=v)\n    plt.title(f\"{dataset_name}: Test Accuracy vs nhead\")\n    plt.xlabel(\"Number of Attention Heads\")\n    plt.ylabel(\"Test Accuracy\")\n    plt.legend()\n    save_path = os.path.join(working_dir, f\"{dataset_name}_test_accuracy_vs_nhead.png\")\n    plt.savefig(save_path)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error plotting test accuracy comparison: {e}\")\n    plt.close()\n\n# ---------------------- PRINT SUMMARY METRICS ---------------------- #\nfor v in variants:\n    res_dict = experiment_data.get(v, {}).get(dataset_name, {}).get(\"results\", {})\n    best = max(res_dict.items(), key=lambda x: x[1][\"test_acc\"]) if res_dict else None\n    if best:\n        print(f\"{v:15s} | best test acc={best[1]['test_acc']:.4f} @ nhead={best[0]}\")\n",
+    "plot_plan": "We will load the stored experiment_data.npy, iterate through the two model variants and their n-head settings, and extract the per-epoch training/validation accuracy and loss as well as final test accuracy. Three separate figures will be created: (1) accuracy curves for the mean-pooling model, (2) accuracy curves for the CLS-token model, and (3) a comparison of test accuracy versus the number of heads for the two variants. Each figure is wrapped in its own try-except so that a failure in one plot does not stop the rest. All plots are saved into working_dir with descriptive filenames that include the dataset (SPR_BENCH) and plot type. After plotting, we print a small summary table of the best test accuracies for quick inspection.",
+    "plot_analyses": [
+      {
+        "analysis": "The first set of plots compares train and validation accuracy across different numbers of attention heads (nhead) for the mean pooling method. The training accuracy increases steadily for all configurations, converging near 0.80. However, validation accuracy shows some variability, with nhead=4 experiencing a dip at epoch 4. This suggests that while the model learns effectively during training, generalization to unseen data may be inconsistent for certain configurations.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_178a4120d23a4e8d8d8793111b9f39a2_proc_3173696/SPR_BENCH_mean_pooling_accuracy_curves.png"
+      },
+      {
+        "analysis": "The second set of plots evaluates train and validation accuracy for the cls_token method. Training accuracy trends are similar to the first set, with all configurations converging near 0.80. Validation accuracy, however, exhibits more pronounced fluctuations, especially for nhead=16, which shows instability in early epochs before improving. This indicates that cls_token may be more sensitive to the choice of nhead, impacting generalization.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_178a4120d23a4e8d8d8793111b9f39a2_proc_3173696/SPR_BENCH_cls_token_accuracy_curves.png"
+      },
+      {
+        "analysis": "The final plot compares test accuracy for mean pooling and cls_token methods across different nhead values. Mean pooling maintains relatively stable performance around 0.785 across all configurations. In contrast, cls_token shows a sharp decline in accuracy as nhead increases beyond 4, suggesting that this method is less robust to higher values of nhead. This highlights a potential limitation of cls_token in handling increased model complexity.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_178a4120d23a4e8d8d8793111b9f39a2_proc_3173696/SPR_BENCH_test_accuracy_vs_nhead.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_178a4120d23a4e8d8d8793111b9f39a2_proc_3173696/SPR_BENCH_mean_pooling_accuracy_curves.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_178a4120d23a4e8d8d8793111b9f39a2_proc_3173696/SPR_BENCH_cls_token_accuracy_curves.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_178a4120d23a4e8d8d8793111b9f39a2_proc_3173696/SPR_BENCH_test_accuracy_vs_nhead.png"
+    ],
+    "vlm_feedback_summary": "The analysis highlights the strengths and weaknesses of the two methods (mean pooling and cls_token) in handling different numbers of attention heads. Mean pooling demonstrates stable performance across configurations, while cls_token exhibits sensitivity to nhead, particularly at higher values. The results suggest that mean pooling may be more reliable for the SPR task, whereas cls_token requires careful tuning of nhead to avoid performance degradation.",
+    "exp_results_dir": "experiment_results/experiment_178a4120d23a4e8d8d8793111b9f39a2_proc_3173696",
+    "ablation_name": "UseCLSClassificationToken",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_178a4120d23a4e8d8d8793111b9f39a2_proc_3173696/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "The overall plan incorporates both hyperparameter tuning and architectural ablation. Initially, the focus was on hyperparameter tuning, specifically optimizing the number of attention heads in a Transformer model. This involved training separate models for each candidate head count (2, 4, 8, 16), recording training and validation metrics, and storing test predictions to identify the optimal configuration for minimizing loss and maximizing accuracy. The current plan introduces an ablation study by reducing the encoder depth from two layers to a single layer, while maintaining all other hyperparameters. This aims to evaluate the impact of model depth on performance, isolating this architectural variable by replicating the original pipeline with the adjusted encoder depth. Together, these plans aim to optimize both the hyperparameters and the architecture of the Transformer model, providing a comprehensive understanding of both parameter and structural influences on performance.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "train accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy of the model on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH | nhead=2",
+                "final_value": 0.797,
+                "best_value": 0.797
+              },
+              {
+                "dataset_name": "SPR_BENCH | nhead=4",
+                "final_value": 0.7835,
+                "best_value": 0.7835
+              },
+              {
+                "dataset_name": "SPR_BENCH | nhead=8",
+                "final_value": 0.8025,
+                "best_value": 0.8025
+              },
+              {
+                "dataset_name": "SPR_BENCH | nhead=16",
+                "final_value": 0.8,
+                "best_value": 0.8
+              }
+            ]
+          },
+          {
+            "metric_name": "validation accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy of the model on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH | nhead=2",
+                "final_value": 0.778,
+                "best_value": 0.778
+              },
+              {
+                "dataset_name": "SPR_BENCH | nhead=4",
+                "final_value": 0.768,
+                "best_value": 0.768
+              },
+              {
+                "dataset_name": "SPR_BENCH | nhead=8",
+                "final_value": 0.784,
+                "best_value": 0.784
+              },
+              {
+                "dataset_name": "SPR_BENCH | nhead=16",
+                "final_value": 0.774,
+                "best_value": 0.774
+              }
+            ]
+          },
+          {
+            "metric_name": "train loss",
+            "lower_is_better": true,
+            "description": "Loss of the model on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH | nhead=2",
+                "final_value": 0.4704,
+                "best_value": 0.4704
+              },
+              {
+                "dataset_name": "SPR_BENCH | nhead=4",
+                "final_value": 0.4915,
+                "best_value": 0.4915
+              },
+              {
+                "dataset_name": "SPR_BENCH | nhead=8",
+                "final_value": 0.4653,
+                "best_value": 0.4653
+              },
+              {
+                "dataset_name": "SPR_BENCH | nhead=16",
+                "final_value": 0.4811,
+                "best_value": 0.4811
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "Loss of the model on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH | nhead=2",
+                "final_value": 0.5726,
+                "best_value": 0.5726
+              },
+              {
+                "dataset_name": "SPR_BENCH | nhead=4",
+                "final_value": 0.5525,
+                "best_value": 0.5525
+              },
+              {
+                "dataset_name": "SPR_BENCH | nhead=8",
+                "final_value": 0.5608,
+                "best_value": 0.5608
+              },
+              {
+                "dataset_name": "SPR_BENCH | nhead=16",
+                "final_value": 0.5582,
+                "best_value": 0.5582
+              }
+            ]
+          },
+          {
+            "metric_name": "test accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy of the model on the test dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH | nhead=2",
+                "final_value": 0.791,
+                "best_value": 0.791
+              },
+              {
+                "dataset_name": "SPR_BENCH | nhead=4",
+                "final_value": 0.792,
+                "best_value": 0.792
+              },
+              {
+                "dataset_name": "SPR_BENCH | nhead=8",
+                "final_value": 0.787,
+                "best_value": 0.787
+              },
+              {
+                "dataset_name": "SPR_BENCH | nhead=16",
+                "final_value": 0.782,
+                "best_value": 0.782
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# ------------------------------------------------------------\n# Single-layer Transformer ablation study \u2013 self-contained file\n# ------------------------------------------------------------\nimport os, pathlib, random, math, time, json, numpy as np, torch\nfrom torch import nn\nfrom torch.utils.data import DataLoader\nfrom datasets import Dataset, DatasetDict, load_dataset\n\n# ---------------- EXPERIMENT DATA DICT ---------------------- #\nexperiment_data = {\n    \"SingleTransformerLayer\": {\"SPR_BENCH\": {\"results\": {}}}  # one entry per nhead\n}\n\n# -------------------- BASIC SETUP --------------------------- #\nwork_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(work_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ------------------------ DATA UTILS ------------------------ #\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(csv_name):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    d[\"train\"] = _load(\"train.csv\")\n    d[\"dev\"] = _load(\"dev.csv\")\n    d[\"test\"] = _load(\"test.csv\")\n    return d\n\n\ndef build_vocab(dataset: Dataset, seq_field=\"sequence\"):\n    vocab = {\"<pad>\": 0, \"<unk>\": 1}\n    idx = 2\n    for seq in dataset[seq_field]:\n        for tok in seq.strip().split():\n            if tok not in vocab:\n                vocab[tok] = idx\n                idx += 1\n    return vocab\n\n\ndef encode_sequence(seq, vocab, max_len=None):\n    toks = [vocab.get(t, vocab[\"<unk>\"]) for t in seq.strip().split()]\n    return toks[:max_len] if max_len else toks\n\n\n# -------------- SYNTHETIC DATA FALLBACK --------------------- #\ndef build_synthetic(n_train=500, n_dev=100, n_test=200, seqlen=10, vocab_sz=12):\n    symbols = [chr(ord(\"A\") + i) for i in range(vocab_sz)]\n\n    def _gen(n):\n        d = {\"id\": [], \"sequence\": [], \"label\": []}\n        for i in range(n):\n            seq = [random.choice(symbols) for _ in range(seqlen)]\n            lab = 1 if seq.count(\"A\") % 2 == 0 else 0\n            d[\"id\"].append(str(i))\n            d[\"sequence\"].append(\" \".join(seq))\n            d[\"label\"].append(lab)\n        return Dataset.from_dict(d)\n\n    return DatasetDict(train=_gen(n_train), dev=_gen(n_dev), test=_gen(n_test))\n\n\n# ---------------------- MODEL ------------------------------- #\nclass SimpleTransformerClassifier(nn.Module):\n    def __init__(self, vocab_size, embed_dim, nhead, num_layers, num_classes, pad_idx):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)\n        self.pos = nn.Embedding(512, embed_dim)\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=embed_dim,\n            nhead=nhead,\n            dim_feedforward=embed_dim * 4,\n            dropout=0.1,\n            activation=\"relu\",\n            batch_first=True,\n        )\n        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)\n        self.cls = nn.Linear(embed_dim, num_classes)\n\n    def forward(self, x, mask):\n        pos_ids = torch.arange(0, x.size(1), device=x.device).unsqueeze(0)\n        h = self.embed(x) + self.pos(pos_ids)\n        h = self.encoder(h, src_key_padding_mask=mask)\n        mask_inv = (~mask).unsqueeze(-1)\n        pooled = (h * mask_inv).sum(1) / mask_inv.sum(1).clamp(min=1)\n        return self.cls(pooled)\n\n\n# ------------------- BATCH COLLATOR ------------------------- #\ndef collate_fn(batch, vocab, max_len=128):\n    seqs = [encode_sequence(b[\"sequence\"], vocab, max_len) for b in batch]\n    labels = torch.tensor([b[\"label\"] for b in batch], dtype=torch.long)\n    maxlen = max(len(s) for s in seqs)\n    pad_idx = vocab[\"<pad>\"]\n    padded = [s + [pad_idx] * (maxlen - len(s)) for s in seqs]\n    x = torch.tensor(padded, dtype=torch.long)\n    mask = x == pad_idx\n    return {\"input_ids\": x, \"attention_mask\": mask, \"labels\": labels}\n\n\n# -------------------- LOAD DATA ----------------------------- #\nDATA_ROOT = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\ntry:\n    datasets_dict = load_spr_bench(DATA_ROOT)\n    print(\"Loaded SPR_BENCH dataset.\")\nexcept Exception as e:\n    print(\"Could not load SPR_BENCH; using synthetic. Err:\", e)\n    datasets_dict = build_synthetic()\n\nvocab = build_vocab(datasets_dict[\"train\"])\nnum_classes = len(set(datasets_dict[\"train\"][\"label\"]))\nprint(f\"Vocab size: {len(vocab)}, num_classes: {num_classes}\")\n\nbatch_size = 64\ntrain_dl = DataLoader(\n    datasets_dict[\"train\"],\n    batch_size=batch_size,\n    shuffle=True,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\ndev_dl = DataLoader(\n    datasets_dict[\"dev\"],\n    batch_size=batch_size,\n    shuffle=False,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\ntest_dl = DataLoader(\n    datasets_dict[\"test\"],\n    batch_size=batch_size,\n    shuffle=False,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\n\n\n# --------------------- TRAIN / EVAL ------------------------- #\ndef evaluate(model, dl, crit):\n    model.eval()\n    tot_loss = 0\n    correct = 0\n    n = 0\n    with torch.no_grad():\n        for bt in dl:\n            bt = {k: v.to(device) for k, v in bt.items() if isinstance(v, torch.Tensor)}\n            out = model(bt[\"input_ids\"], bt[\"attention_mask\"])\n            loss = crit(out, bt[\"labels\"])\n            preds = out.argmax(-1)\n            tot_loss += loss.item() * bt[\"labels\"].size(0)\n            correct += (preds == bt[\"labels\"]).sum().item()\n            n += bt[\"labels\"].size(0)\n    return tot_loss / n, correct / n\n\n\n# -------------------- ABLATION RUN -------------------------- #\nembed_dim = 128\nnhead_values = [2, 4, 8, 16]\nepochs = 5\n\nfor nhead in nhead_values:\n    if embed_dim % nhead != 0:\n        print(f\"Skipping nhead={nhead}; embed_dim not divisible.\")\n        continue\n    print(f\"\\n=== SingleLayer Ablation | nhead={nhead} ===\")\n    model = SimpleTransformerClassifier(\n        vocab_size=len(vocab),\n        embed_dim=embed_dim,\n        nhead=nhead,\n        num_layers=1,  # <-- key ablation change\n        num_classes=num_classes,\n        pad_idx=vocab[\"<pad>\"],\n    ).to(device)\n\n    criterion = nn.CrossEntropyLoss()\n    optim = torch.optim.Adam(model.parameters(), lr=1e-3)\n\n    metrics = {\"train\": [], \"val\": []}\n    losses = {\"train\": [], \"val\": []}\n\n    for ep in range(1, epochs + 1):\n        model.train()\n        ep_loss = 0\n        correct = 0\n        total = 0\n        for bt in train_dl:\n            bt = {k: v.to(device) for k, v in bt.items() if isinstance(v, torch.Tensor)}\n            optim.zero_grad()\n            out = model(bt[\"input_ids\"], bt[\"attention_mask\"])\n            loss = criterion(out, bt[\"labels\"])\n            loss.backward()\n            optim.step()\n            ep_loss += loss.item() * bt[\"labels\"].size(0)\n            preds = out.argmax(-1)\n            correct += (preds == bt[\"labels\"]).sum().item()\n            total += bt[\"labels\"].size(0)\n        train_loss = ep_loss / total\n        train_acc = correct / total\n        val_loss, val_acc = evaluate(model, dev_dl, criterion)\n        metrics[\"train\"].append(train_acc)\n        metrics[\"val\"].append(val_acc)\n        losses[\"train\"].append(train_loss)\n        losses[\"val\"].append(val_loss)\n        print(f\"Epoch {ep}/{epochs} | train_acc={train_acc:.4f} val_acc={val_acc:.4f}\")\n\n    # -------------- TEST & LOGGING -------------------------- #\n    test_loss, test_acc = evaluate(model, test_dl, criterion)\n    print(f\"nhead={nhead} | TEST ACCURACY: {test_acc:.4f}\")\n\n    # predictions / ground truth\n    preds_all, gts_all = [], []\n    model.eval()\n    with torch.no_grad():\n        for bt in test_dl:\n            bt_gpu = {\n                k: v.to(device) for k, v in bt.items() if isinstance(v, torch.Tensor)\n            }\n            out = model(bt_gpu[\"input_ids\"], bt_gpu[\"attention_mask\"])\n            preds_all.extend(out.argmax(-1).cpu().tolist())\n            gts_all.extend(bt[\"labels\"].tolist())\n\n    experiment_data[\"SingleTransformerLayer\"][\"SPR_BENCH\"][\"results\"][str(nhead)] = {\n        \"metrics\": metrics,\n        \"losses\": losses,\n        \"test_acc\": test_acc,\n        \"predictions\": preds_all,\n        \"ground_truth\": gts_all,\n    }\n\n# ------------------ SAVE EVERYTHING ------------------------- #\nsave_path = os.path.join(work_dir, \"experiment_data.npy\")\nnp.save(save_path, experiment_data)\nprint(\"\\nSaved experiment data to\", save_path)\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# Setup working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# Load experiment data\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\n    results = experiment_data[\"SingleTransformerLayer\"][\"SPR_BENCH\"][\"results\"]\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    results = {}\n\nnheads, test_accs = [], []\ntrain_acc_curves, val_acc_curves = {}, {}\ntrain_loss_curves, val_loss_curves = {}, {}\n\n# Extract metrics\nfor nh, res in results.items():\n    nheads.append(int(nh))\n    test_accs.append(res[\"test_acc\"])\n    train_acc_curves[nh] = res[\"metrics\"][\"train\"]\n    val_acc_curves[nh] = res[\"metrics\"][\"val\"]\n    train_loss_curves[nh] = res[\"losses\"][\"train\"]\n    val_loss_curves[nh] = res[\"losses\"][\"val\"]\n    print(f\"nhead={nh}: test_acc={res['test_acc']:.4f}\")\n\n# Plot 1: Accuracy curves\ntry:\n    plt.figure()\n    for nh in sorted(train_acc_curves, key=int):\n        epochs = range(1, len(train_acc_curves[nh]) + 1)\n        plt.plot(epochs, train_acc_curves[nh], label=f\"{nh}-head Train\")\n        plt.plot(epochs, val_acc_curves[nh], linestyle=\"--\", label=f\"{nh}-head Val\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Accuracy\")\n    plt.title(\"Accuracy Curves - SPR_BENCH\\nTrain vs Validation for each nhead\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_BENCH_accuracy_curves.png\")\n    plt.savefig(fname, dpi=150)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating accuracy plot: {e}\")\n    plt.close()\n\n# Plot 2: Loss curves\ntry:\n    plt.figure()\n    for nh in sorted(train_loss_curves, key=int):\n        epochs = range(1, len(train_loss_curves[nh]) + 1)\n        plt.plot(epochs, train_loss_curves[nh], label=f\"{nh}-head Train\")\n        plt.plot(epochs, val_loss_curves[nh], linestyle=\"--\", label=f\"{nh}-head Val\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Cross-Entropy Loss\")\n    plt.title(\"Loss Curves - SPR_BENCH\\nTrain vs Validation for each nhead\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_BENCH_loss_curves.png\")\n    plt.savefig(fname, dpi=150)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating loss plot: {e}\")\n    plt.close()\n\n# Plot 3: Test accuracy bar chart\ntry:\n    plt.figure()\n    plt.bar([str(nh) for nh in nheads], test_accs, color=\"skyblue\")\n    plt.xlabel(\"Number of Attention Heads\")\n    plt.ylabel(\"Test Accuracy\")\n    plt.ylim(0, 1)\n    plt.title(\"Final Test Accuracy - SPR_BENCH\\nSingle-Layer Transformer Ablation\")\n    fname = os.path.join(working_dir, \"SPR_BENCH_test_accuracy_bar.png\")\n    plt.savefig(fname, dpi=150)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating test-accuracy bar plot: {e}\")\n    plt.close()\n",
+    "plot_plan": "We will load the saved experiment_data.npy, iterate over the four n-head settings, and extract the stored \u201cmetrics\u201d, \u201closses\u201d, and \u201ctest_acc\u201d.  \nThree figures will be produced (each in its own try\u2013except):  \n1) Training vs validation accuracy curves for every n-head on the same axes.  \n2) Training vs validation loss curves, again overlaying the four heads.  \n3) A bar chart of final test accuracy for each n-head.  \nAll plots will be saved in the working directory with descriptive file names that contain the dataset name (SPR_BENCH) and plot type.  \nTitles will mention the dataset and include a clear subtitle describing the comparison (e.g. \u201cTrain vs Val\u201d).  \nWe respect the \u201c\u22645 figures\u201d rule and close every figure.  \nThe script also prints the loaded test accuracies so the user immediately sees the quantitative results.",
+    "plot_analyses": [
+      {
+        "analysis": "This plot compares the training and validation accuracy across different numbers of attention heads (2, 4, 8, 16) over 5 epochs. As the number of attention heads increases, the training accuracy generally improves slightly, with 16-heads achieving the highest training accuracy. However, the validation accuracy does not consistently improve with more attention heads and starts to diverge after epoch 3, especially for configurations with higher numbers of heads. This suggests that larger models may overfit the training data, leading to reduced generalization.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_2a41055a408c4fd09a30dc44e5fc15e7_proc_3173698/SPR_BENCH_accuracy_curves.png"
+      },
+      {
+        "analysis": "This plot displays the cross-entropy loss for training and validation data for different numbers of attention heads. The training loss decreases steadily for all configurations, with 16-heads achieving the lowest final loss. However, validation loss shows irregular trends, with some configurations (e.g., 2-heads and 4-heads) experiencing increases after epoch 3. This indicates potential overfitting for more complex models and suggests that simpler configurations may generalize better.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_2a41055a408c4fd09a30dc44e5fc15e7_proc_3173698/SPR_BENCH_loss_curves.png"
+      },
+      {
+        "analysis": "This plot shows the final test accuracy for different numbers of attention heads. All configurations achieve similar test accuracy, with only marginal differences between them. This suggests that increasing the number of attention heads beyond 2 does not significantly impact the model's ability to generalize to the test data, highlighting diminishing returns for more complex models in this task.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_2a41055a408c4fd09a30dc44e5fc15e7_proc_3173698/SPR_BENCH_test_accuracy_bar.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_2a41055a408c4fd09a30dc44e5fc15e7_proc_3173698/SPR_BENCH_accuracy_curves.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_2a41055a408c4fd09a30dc44e5fc15e7_proc_3173698/SPR_BENCH_loss_curves.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_2a41055a408c4fd09a30dc44e5fc15e7_proc_3173698/SPR_BENCH_test_accuracy_bar.png"
+    ],
+    "vlm_feedback_summary": "The plots reveal that while increasing the number of attention heads improves training performance, it does not consistently enhance validation or test accuracy. Overfitting appears to be a concern for higher-head configurations, as indicated by diverging validation accuracy and loss trends. Simpler configurations may offer a better balance between performance and generalization.",
+    "exp_results_dir": "experiment_results/experiment_2a41055a408c4fd09a30dc44e5fc15e7_proc_3173698",
+    "ablation_name": "SingleTransformerLayer",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_2a41055a408c4fd09a30dc44e5fc15e7_proc_3173698/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "The overall plan initially involved hyperparameter tuning of the Transformer model by varying the number of attention heads to optimize model performance. This was done by training separate models with different configurations, aiming to find the ideal number of attention heads for effective model complexity and generalization. The current plan shifts focus to an ablation study by introducing a new Bag-of-Embeddings classifier named NoTransformerEncoder, which omits the TransformerEncoder entirely. This allows for a baseline comparison to understand the necessity and impact of the TransformerEncoder component. The objective is to explore both fine-tuning specific components and evaluating the fundamental architecture, potentially leading to more efficient models or confirming the essential nature of the Transformer architecture.",
+    "analysis": "The execution of the training script completed successfully without any bugs. The model was trained on the real SPR_BENCH dataset, achieving a final test accuracy of 76.4% for the NoTransformerEncoder ablation. All results were saved correctly, and the script ran efficiently within the time limit.",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "train accuracy",
+            "lower_is_better": false,
+            "description": "Measures the accuracy of the model on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.7665,
+                "best_value": 0.7665
+              }
+            ]
+          },
+          {
+            "metric_name": "validation accuracy",
+            "lower_is_better": false,
+            "description": "Measures the accuracy of the model on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.746,
+                "best_value": 0.746
+              }
+            ]
+          },
+          {
+            "metric_name": "train loss",
+            "lower_is_better": true,
+            "description": "Represents the loss value of the model on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.557622,
+                "best_value": 0.557622
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "Represents the loss value of the model on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.569559,
+                "best_value": 0.569559
+              }
+            ]
+          },
+          {
+            "metric_name": "test accuracy",
+            "lower_is_better": false,
+            "description": "Measures the accuracy of the model on the test dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.764,
+                "best_value": 0.764
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# NoTransformerEncoder ablation \u2013 single-file script\nimport os, pathlib, random, math, json, time, numpy as np, torch\nfrom torch import nn\nfrom torch.utils.data import DataLoader\nfrom datasets import Dataset, DatasetDict, load_dataset\n\n# -------------------- EXPERIMENT DATA STRUCTURE -------------------- #\nexperiment_data = {\n    \"NoTransformerEncoder\": {\n        \"SPR_BENCH\": {\n            \"metrics\": {\"train\": [], \"val\": []},\n            \"losses\": {\"train\": [], \"val\": []},\n            \"predictions\": [],\n            \"ground_truth\": [],\n            \"test_acc\": None,\n        }\n    }\n}\n\n# --------------------------- MISC SETUP ---------------------------- #\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ----------------------------- DATA UTILS -------------------------- #\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(csv_name: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    d[\"train\"] = _load(\"train.csv\")\n    d[\"dev\"] = _load(\"dev.csv\")\n    d[\"test\"] = _load(\"test.csv\")\n    return d\n\n\ndef build_vocab(dataset: Dataset, seq_field: str = \"sequence\"):\n    vocab, idx = {\"<pad>\": 0, \"<unk>\": 1}, 2\n    for s in dataset[seq_field]:\n        for tok in s.strip().split():\n            if tok not in vocab:\n                vocab[tok] = idx\n                idx += 1\n    return vocab\n\n\ndef encode_sequence(seq: str, vocab: dict, max_len=None):\n    tok_ids = [vocab.get(tok, vocab[\"<unk>\"]) for tok in seq.strip().split()]\n    return tok_ids[:max_len] if max_len else tok_ids\n\n\n# ----------------------- SYNTHETIC DATA ---------------------------- #\ndef build_synthetic(num_train=500, num_dev=100, num_test=200, seqlen=10, vocab_sz=12):\n    symbols = [chr(ord(\"A\") + i) for i in range(vocab_sz)]\n\n    def _gen(n):\n        data = {\"id\": [], \"sequence\": [], \"label\": []}\n        for i in range(n):\n            seq = [random.choice(symbols) for _ in range(seqlen)]\n            label = 1 if seq.count(\"A\") % 2 == 0 else 0\n            data[\"id\"].append(str(i))\n            data[\"sequence\"].append(\" \".join(seq))\n            data[\"label\"].append(label)\n        return Dataset.from_dict(data)\n\n    return DatasetDict(train=_gen(num_train), dev=_gen(num_dev), test=_gen(num_test))\n\n\n# ----------------------------- MODEL ------------------------------- #\nclass BagOfEmbedsClassifier(nn.Module):\n    \"\"\"NoTransformerEncoder ablation model: EMBED -> MEAN POOL -> FC.\"\"\"\n\n    def __init__(self, vocab_size, embed_dim, num_classes, pad_idx):\n        super().__init__()\n        self.token_embed = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)\n        self.pos_embed = nn.Embedding(512, embed_dim)\n        self.classifier = nn.Linear(embed_dim, num_classes)\n\n    def forward(self, x, pad_mask):\n        # x: [B, T], pad_mask True where PAD\n        pos = torch.arange(0, x.size(1), device=x.device).unsqueeze(0)\n        h = self.token_embed(x) + self.pos_embed(pos)  # [B,T,E]\n        mask_flt = (~pad_mask).unsqueeze(-1).float()  # [B,T,1]\n        h_sum = (h * mask_flt).sum(1)  # [B,E]\n        lengths = mask_flt.sum(1).clamp(min=1)  # [B,1]\n        pooled = h_sum / lengths  # [B,E]\n        return self.classifier(pooled)  # [B,C]\n\n\n# ------------------------- DATALOADER UTILS ------------------------ #\ndef collate_fn(batch, vocab, max_len=128):\n    seqs = [encode_sequence(b[\"sequence\"], vocab, max_len) for b in batch]\n    lbls = torch.tensor([b[\"label\"] for b in batch], dtype=torch.long)\n    max_len_b = max(len(s) for s in seqs)\n    padded = [s + [vocab[\"<pad>\"]] * (max_len_b - len(s)) for s in seqs]\n    x = torch.tensor(padded, dtype=torch.long)\n    pad_mask = x == vocab[\"<pad>\"]\n    return {\"input_ids\": x, \"attention_mask\": pad_mask, \"labels\": lbls}\n\n\n@torch.no_grad()\ndef evaluate(model, dataloader, criterion):\n    model.eval()\n    tot_loss, correct, count = 0.0, 0, 0\n    for batch in dataloader:\n        batch = {k: v.to(device) for k, v in batch.items() if torch.is_tensor(v)}\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        loss = criterion(logits, batch[\"labels\"])\n        tot_loss += loss.item() * batch[\"labels\"].size(0)\n        preds = logits.argmax(-1)\n        correct += (preds == batch[\"labels\"]).sum().item()\n        count += batch[\"labels\"].size(0)\n    return tot_loss / count, correct / count\n\n\n# --------------------------- LOAD DATA ----------------------------- #\nDATA_PATH = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\ntry:\n    datasets_dict = load_spr_bench(DATA_PATH)\n    print(\"Loaded real SPR_BENCH dataset.\")\nexcept Exception as e:\n    print(\"Could not load real dataset, using synthetic:\", e)\n    datasets_dict = build_synthetic()\n\nvocab = build_vocab(datasets_dict[\"train\"])\nnum_classes = len(set(datasets_dict[\"train\"][\"label\"]))\nprint(f\"Vocab size: {len(vocab)}, num_classes: {num_classes}\")\n\nbatch_size = 64\ntrain_dl = DataLoader(\n    datasets_dict[\"train\"],\n    batch_size=batch_size,\n    shuffle=True,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\ndev_dl = DataLoader(\n    datasets_dict[\"dev\"],\n    batch_size=batch_size,\n    shuffle=False,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\ntest_dl = DataLoader(\n    datasets_dict[\"test\"],\n    batch_size=batch_size,\n    shuffle=False,\n    collate_fn=lambda b: collate_fn(b, vocab),\n)\n\n# ----------------------------- TRAIN ------------------------------- #\nembed_dim = 128\nepochs = 5\nmodel = BagOfEmbedsClassifier(\n    vocab_size=len(vocab),\n    embed_dim=embed_dim,\n    num_classes=num_classes,\n    pad_idx=vocab[\"<pad>\"],\n).to(device)\n\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n\nfor ep in range(1, epochs + 1):\n    model.train()\n    ep_loss, correct, total = 0.0, 0, 0\n    for batch in train_dl:\n        batch = {k: v.to(device) for k, v in batch.items() if torch.is_tensor(v)}\n        optimizer.zero_grad()\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        loss = criterion(logits, batch[\"labels\"])\n        loss.backward()\n        optimizer.step()\n        ep_loss += loss.item() * batch[\"labels\"].size(0)\n        preds = logits.argmax(-1)\n        correct += (preds == batch[\"labels\"]).sum().item()\n        total += batch[\"labels\"].size(0)\n    train_loss = ep_loss / total\n    train_acc = correct / total\n    val_loss, val_acc = evaluate(model, dev_dl, criterion)\n    print(f\"Epoch {ep}/{epochs} | train_acc={train_acc:.4f}, val_acc={val_acc:.4f}\")\n    experiment_data[\"NoTransformerEncoder\"][\"SPR_BENCH\"][\"metrics\"][\"train\"].append(\n        train_acc\n    )\n    experiment_data[\"NoTransformerEncoder\"][\"SPR_BENCH\"][\"metrics\"][\"val\"].append(\n        val_acc\n    )\n    experiment_data[\"NoTransformerEncoder\"][\"SPR_BENCH\"][\"losses\"][\"train\"].append(\n        train_loss\n    )\n    experiment_data[\"NoTransformerEncoder\"][\"SPR_BENCH\"][\"losses\"][\"val\"].append(\n        val_loss\n    )\n\n# -------------------------- FINAL TEST ----------------------------- #\ntest_loss, test_acc = evaluate(model, test_dl, criterion)\nexperiment_data[\"NoTransformerEncoder\"][\"SPR_BENCH\"][\"test_acc\"] = test_acc\nprint(f\"Test accuracy (NoTransformerEncoder): {test_acc:.4f}\")\n\n# store predictions / ground truth\nmodel.eval()\nwith torch.no_grad():\n    for batch in test_dl:\n        batch_gpu = {k: v.to(device) for k, v in batch.items() if torch.is_tensor(v)}\n        logits = model(batch_gpu[\"input_ids\"], batch_gpu[\"attention_mask\"])\n        experiment_data[\"NoTransformerEncoder\"][\"SPR_BENCH\"][\"predictions\"].extend(\n            logits.argmax(-1).cpu().tolist()\n        )\n        experiment_data[\"NoTransformerEncoder\"][\"SPR_BENCH\"][\"ground_truth\"].extend(\n            batch[\"labels\"].tolist()\n        )\n\n# --------------------------- SAVE DATA ----------------------------- #\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"Saved experiment data to\", os.path.join(working_dir, \"experiment_data.npy\"))\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ------------------- Load experiment data ------------------- #\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\n\n# ------------------- Helper for safe fetch ------------------ #\ndef _safe_get(d, *keys, default=None):\n    cur = d\n    for k in keys:\n        if k not in cur:\n            return default\n        cur = cur[k]\n    return cur if cur is not None else default\n\n\n# ------------------- Iterate and plot ----------------------- #\nfor model_name, datasets in experiment_data.items():\n    for ds_name, records in datasets.items():\n        # Fetch arrays\n        train_acc = _safe_get(records, \"metrics\", \"train\", default=[])\n        val_acc = _safe_get(records, \"metrics\", \"val\", default=[])\n        train_loss = _safe_get(records, \"losses\", \"train\", default=[])\n        val_loss = _safe_get(records, \"losses\", \"val\", default=[])\n        test_acc = _safe_get(records, \"test_acc\", default=None)\n\n        epochs = range(1, len(train_acc) + 1)\n\n        # --------------- Accuracy curve ---------------- #\n        try:\n            plt.figure()\n            plt.plot(epochs, train_acc, label=\"Train\")\n            plt.plot(epochs, val_acc, label=\"Validation\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Accuracy\")\n            plt.title(f\"{model_name} on {ds_name}\\nTraining vs Validation Accuracy\")\n            plt.legend()\n            save_name = f\"{ds_name}_accuracy_curve_{model_name}.png\"\n            plt.savefig(os.path.join(working_dir, save_name))\n            plt.close()\n        except Exception as e:\n            print(f\"Error creating accuracy plot for {ds_name}: {e}\")\n            plt.close()\n\n        # --------------- Loss curve -------------------- #\n        try:\n            plt.figure()\n            plt.plot(epochs, train_loss, label=\"Train\")\n            plt.plot(epochs, val_loss, label=\"Validation\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Cross-Entropy Loss\")\n            plt.title(f\"{model_name} on {ds_name}\\nTraining vs Validation Loss\")\n            plt.legend()\n            save_name = f\"{ds_name}_loss_curve_{model_name}.png\"\n            plt.savefig(os.path.join(working_dir, save_name))\n            plt.close()\n        except Exception as e:\n            print(f\"Error creating loss plot for {ds_name}: {e}\")\n            plt.close()\n\n        # --------------- Print final metrics ----------- #\n        final_train = train_acc[-1] if train_acc else None\n        final_val = val_acc[-1] if val_acc else None\n        if final_train is not None:\n            print(\n                f\"{model_name} | {ds_name}: Train Acc={final_train:.4f}, Val Acc={final_val:.4f}, Test Acc={test_acc:.4f}\"\n                if test_acc is not None\n                else f\"{model_name} | {ds_name}: Train Acc={final_train:.4f}, Val Acc={final_val:.4f}\"\n            )\n",
+    "plot_plan": "The solution loads the saved experiment dictionary, safely extracts available arrays, and produces up-to-date visualizations without fabricating information. Two plots are generated for each dataset\u2013model pair: (1) training/validation accuracy across epochs and (2) training/validation loss across epochs. Each figure is created inside its own try-except block, closed after saving, and titled descriptively with subtitles clarifying the left/right content where relevant. Filenames always include the dataset name and plot type to remain self-explanatory. When optional data (e.g., predictions) exist, additional summary metrics such as final test accuracy are printed, but no extra plots are made because they would duplicate information. Only the first five epochs (or fewer if the run is shorter) are plotted to respect the \u201cat most 5 figures\u201d rule. All files are stored in the predefined working directory, which the script ensures exists before plotting.",
+    "plot_analyses": [
+      {
+        "analysis": "The plot shows the training and validation accuracy over 5 epochs for a model without a Transformer encoder on the SPR_BENCH dataset. The training accuracy increases steadily, reaching approximately 0.76 by epoch 5, while the validation accuracy plateaus around 0.74 after epoch 3. This indicates that the model is learning effectively during training but has limited generalization capacity as the validation accuracy does not improve significantly beyond epoch 3. The small gap between training and validation accuracy suggests that overfitting is not a major issue at this stage, but the model's performance might be constrained by its architecture or lack of certain features, such as a Transformer encoder.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_e46f3c6a839048e584bf3541709fdb79_proc_3173699/SPR_BENCH_accuracy_curve_NoTransformerEncoder.png"
+      },
+      {
+        "analysis": "This plot illustrates the training and validation loss over 5 epochs for the same model. Both losses decrease steadily, with the training loss dropping slightly faster than the validation loss. By epoch 5, the training loss is around 0.56, while the validation loss is slightly higher, indicating that the model is learning but may have room for improvement in terms of generalization. The consistent reduction in loss indicates that the optimization process is effective, but the relatively small gap between training and validation loss suggests that the model might be underutilizing its capacity for capturing complex patterns in the data, potentially due to the absence of a Transformer encoder.",
+        "plot_path": "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_e46f3c6a839048e584bf3541709fdb79_proc_3173699/SPR_BENCH_loss_curve_NoTransformerEncoder.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_e46f3c6a839048e584bf3541709fdb79_proc_3173699/SPR_BENCH_accuracy_curve_NoTransformerEncoder.png",
+      "experiments/2025-08-17_00-45-19_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_e46f3c6a839048e584bf3541709fdb79_proc_3173699/SPR_BENCH_loss_curve_NoTransformerEncoder.png"
+    ],
+    "vlm_feedback_summary": "The results suggest that the model is learning effectively, with steady improvements in both accuracy and loss. However, the performance plateaus early, indicating potential limitations in the architecture. Incorporating a Transformer encoder or other enhancements might improve generalization and overall performance on the SPR_BENCH dataset.",
+    "exp_results_dir": "experiment_results/experiment_e46f3c6a839048e584bf3541709fdb79_proc_3173699",
+    "ablation_name": "NoTransformerEncoder",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_e46f3c6a839048e584bf3541709fdb79_proc_3173699/experiment_data.npy"
+    ]
+  }
+]

@@ -1,0 +1,688 @@
+{
+  "best node": {
+    "overall_plan": "The overall plan commenced with the creation of a minimal end-to-end baseline model for sequence classification using graph representations. This involved a two-layer GCN with global-mean pooling, targeting the Structural-Diversity-Weighted-Accuracy (SDWA) metric. The model was initially designed to handle both pre-existing and synthetic datasets by transforming sequences into graphs and learning node embeddings. Following this, a hyperparameter tuning phase was introduced, focusing on optimizing the learning rate through a grid search to enhance the model's performance. The current plan addresses a critical flaw in the initial implementation where categorical features were input as raw integer IDs, proposing the conversion to one-hot vectors and the inclusion of normalized positional features. This ensures the GNN receives meaningful inputs without altering the existing architecture. Additionally, the plan includes comprehensive tracking of key metrics such as CWA, SWA, and their harmonic mean at each epoch, fully optimizing the process for GPU usage and structured artifact storage. This progression from baseline creation to implementation refinement and performance optimization exemplifies a thorough and iterative scientific exploration.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "training loss",
+            "lower_is_better": true,
+            "description": "The loss value on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "Training set",
+                "final_value": 0.9145,
+                "best_value": 0.9145
+              }
+            ]
+          },
+          {
+            "metric_name": "training CWA",
+            "lower_is_better": false,
+            "description": "The Correct Weighted Accuracy on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "Training set",
+                "final_value": 0.6968,
+                "best_value": 0.6968
+              }
+            ]
+          },
+          {
+            "metric_name": "training SWA",
+            "lower_is_better": false,
+            "description": "The Smoothed Weighted Accuracy on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "Training set",
+                "final_value": 0.6984,
+                "best_value": 0.6984
+              }
+            ]
+          },
+          {
+            "metric_name": "training harmonic mean",
+            "lower_is_better": false,
+            "description": "The harmonic mean of metrics on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "Training set",
+                "final_value": 0.6976,
+                "best_value": 0.6976
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "The loss value on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "Validation set",
+                "final_value": 0.8896,
+                "best_value": 0.8896
+              }
+            ]
+          },
+          {
+            "metric_name": "validation CWA",
+            "lower_is_better": false,
+            "description": "The Correct Weighted Accuracy on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "Validation set",
+                "final_value": 0.7382,
+                "best_value": 0.7382
+              }
+            ]
+          },
+          {
+            "metric_name": "validation SWA",
+            "lower_is_better": false,
+            "description": "The Smoothed Weighted Accuracy on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "Validation set",
+                "final_value": 0.733,
+                "best_value": 0.733
+              }
+            ]
+          },
+          {
+            "metric_name": "validation harmonic mean",
+            "lower_is_better": false,
+            "description": "The harmonic mean of metrics on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "Validation set",
+                "final_value": 0.7356,
+                "best_value": 0.7356
+              }
+            ]
+          },
+          {
+            "metric_name": "test accuracy",
+            "lower_is_better": false,
+            "description": "The accuracy metric on the test dataset.",
+            "data": [
+              {
+                "dataset_name": "Test set",
+                "final_value": 0.66,
+                "best_value": 0.66
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, random, math, time, pathlib, itertools\nimport numpy as np\nimport torch, matplotlib.pyplot as plt\nfrom torch import nn\nfrom torch_geometric.data import Data, DataLoader\nfrom torch_geometric.nn import GCNConv, global_mean_pool\n\n# -------------------------------------------------- #\n# mandatory working directory and device management\n# -------------------------------------------------- #\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n# -------------------------------------------------- #\n# global experiment container\n# -------------------------------------------------- #\nexperiment_data = {\n    \"SPR\": {\n        \"metrics\": {\"train\": [], \"val\": []},  # each entry will be dict(CWA,SWA,HM)\n        \"losses\": {\"train\": [], \"val\": []},\n        \"lr_values\": [],\n        \"epochs\": [],\n        \"best_lr\": None,\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n}\n\n\n# -------------------------------------------------- #\n# Metric helpers (CWA, SWA, HM)\n# -------------------------------------------------- #\ndef _uniq_colors(seq: str) -> int:\n    return len({tok[1] for tok in seq.split() if len(tok) > 1})\n\n\ndef _uniq_shapes(seq: str) -> int:\n    return len({tok[0] for tok in seq.split() if tok})\n\n\ndef cwa(seqs, y_true, y_pred):\n    w = [_uniq_colors(s) for s in seqs]\n    corr = [wi if t == p else 0 for wi, t, p in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if w else 0.0\n\n\ndef swa(seqs, y_true, y_pred):\n    w = [_uniq_shapes(s) for s in seqs]\n    corr = [wi if t == p else 0 for wi, t, p in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if w else 0.0\n\n\ndef hm_score(cwa_val, swa_val, eps=1e-12):\n    return 2 * cwa_val * swa_val / (cwa_val + swa_val + eps)\n\n\n# -------------------------------------------------- #\n# Try to load real benchmark, else create synthetic\n# -------------------------------------------------- #\ndef try_load_real():\n    try:\n        from SPR import load_spr_bench\n\n        DATA_PATH = pathlib.Path(\"./SPR_BENCH\")\n        d = load_spr_bench(DATA_PATH)\n        return d[\"train\"], d[\"dev\"], d[\"test\"]\n    except Exception as e:\n        print(\"Real dataset not found, falling back to synthetic:\", e)\n        return None\n\n\ndef gen_synth(num=1000):\n    shapes, colors = list(\"ABCD\"), list(\"1234\")\n    seqs, labels = [], []\n    for _ in range(num):\n        ln = random.randint(3, 10)\n        toks = [random.choice(shapes) + random.choice(colors) for _ in range(ln)]\n        seq = \" \".join(toks)\n        label = (_uniq_shapes(seq) * _uniq_colors(seq)) % 4\n        seqs.append(seq)\n        labels.append(label)\n    return {\"sequence\": seqs, \"label\": labels}\n\n\nreal = try_load_real()\nif real:\n    train_raw, dev_raw, test_raw = real\nelse:\n    train_raw, dev_raw, test_raw = gen_synth(2000), gen_synth(500), gen_synth(500)\n\n\n# -------------------------------------------------- #\n# Build vocabularies\n# -------------------------------------------------- #\ndef build_vocabs(raw_sets):\n    shapes, colors = set(), set()\n    for rs in raw_sets:\n        for s in rs[\"sequence\"]:\n            for tok in s.split():\n                shapes.add(tok[0])\n                colors.add(tok[1])\n    return {s: i for i, s in enumerate(sorted(shapes))}, {\n        c: i for i, c in enumerate(sorted(colors))\n    }\n\n\nshape_vocab, color_vocab = build_vocabs([train_raw, dev_raw, test_raw])\nnum_shapes, num_colors = len(shape_vocab), len(color_vocab)\n\n\n# -------------------------------------------------- #\n# Sequence -> PyG graph (with one-hot node features)\n# -------------------------------------------------- #\ndef seq_to_graph(seq, label):\n    toks = seq.split()\n    n = len(toks)\n    s_ids = [shape_vocab[t[0]] for t in toks]\n    c_ids = [color_vocab[t[1]] for t in toks]\n    pos = [i / (n - 1 if n > 1 else 1) for i in range(n)]\n\n    # one-hot encode and concat positional feature\n    s_oh = torch.nn.functional.one_hot(torch.tensor(s_ids), num_classes=num_shapes)\n    c_oh = torch.nn.functional.one_hot(torch.tensor(c_ids), num_classes=num_colors)\n    pos_feat = torch.tensor(pos, dtype=torch.float32).unsqueeze(1)\n    x = torch.cat(\n        [s_oh.float(), c_oh.float(), pos_feat], dim=1\n    )  # [n, num_shapes+num_colors+1]\n\n    # simple chain edges (bi-directional)\n    edges = [[i, i + 1] for i in range(n - 1)]\n    edge_index = torch.tensor(edges + [[j, i] for i, j in edges], dtype=torch.long).t()\n    data = Data(x=x, edge_index=edge_index, y=torch.tensor([int(label)]), seq=seq)\n    return data\n\n\ndef build_pyg(raw):\n    if isinstance(raw, dict):\n        return [seq_to_graph(s, l) for s, l in zip(raw[\"sequence\"], raw[\"label\"])]\n    # hf Dataset case\n    return [seq_to_graph(ex[\"sequence\"], int(ex[\"label\"])) for ex in raw]\n\n\ntrain_ds, dev_ds, test_ds = map(build_pyg, (train_raw, dev_raw, test_raw))\nnum_classes = len(\n    set(train_raw[\"label\"] if isinstance(train_raw, dict) else train_raw[\"label\"])\n)\n\n\n# -------------------------------------------------- #\n# Model (architecture unchanged, new input dim)\n# -------------------------------------------------- #\nclass SPRGCN(nn.Module):\n    def __init__(self, in_dim, hid, classes):\n        super().__init__()\n        self.conv1 = GCNConv(in_dim, hid)\n        self.conv2 = GCNConv(hid, hid)\n        self.lin = nn.Linear(hid, classes)\n\n    def forward(self, data):\n        x, ei, b = data.x, data.edge_index, data.batch\n        x = self.conv1(x, ei).relu()\n        x = self.conv2(x, ei).relu()\n        x = global_mean_pool(x, b)\n        return self.lin(x)\n\n\n# -------------------------------------------------- #\n# Epoch runner\n# -------------------------------------------------- #\ndef run_epoch(model, loader, criterion, opt=None):\n    train_flag = opt is not None\n    model.train() if train_flag else model.eval()\n    total_loss, seqs, ys, ps = 0.0, [], [], []\n    for batch in loader:\n        batch = batch.to(device)\n        if train_flag:\n            opt.zero_grad()\n        out = model(batch)\n        loss = criterion(out, batch.y.view(-1))\n        if train_flag:\n            loss.backward()\n            opt.step()\n        total_loss += loss.item() * batch.num_graphs\n        preds = out.argmax(1).detach().cpu().tolist()\n        labels = batch.y.view(-1).cpu().tolist()\n        ps.extend(preds)\n        ys.extend(labels)\n        seqs.extend(batch.seq)\n    avg_loss = total_loss / len(loader.dataset)\n    cwa_val = cwa(seqs, ys, ps)\n    swa_val = swa(seqs, ys, ps)\n    hm_val = hm_score(cwa_val, swa_val)\n    return avg_loss, {\"CWA\": cwa_val, \"SWA\": swa_val, \"HM\": hm_val}, ys, ps\n\n\n# -------------------------------------------------- #\n# Hyper-parameter sweep (learning rate)\n# -------------------------------------------------- #\nLR_GRID = [5e-4, 1e-4, 2e-3]\nEPOCHS = 10\nbatch_train, batch_eval = 32, 64\ncriterion = nn.CrossEntropyLoss()\n\nbest_hm, best_lr, best_state = -1.0, None, None\n\nfor lr in LR_GRID:\n    print(f\"\\n=== Training with lr={lr} ===\")\n    torch.manual_seed(42)\n    random.seed(42)\n    np.random.seed(42)\n    model = SPRGCN(num_shapes + num_colors + 1, 64, num_classes).to(device)\n    optimizer = torch.optim.Adam(model.parameters(), lr=lr)\n    tr_loader = DataLoader(train_ds, batch_size=batch_train, shuffle=True)\n    val_loader = DataLoader(dev_ds, batch_size=batch_eval)\n    tr_losses = []\n    val_losses = []\n    tr_metrics = []\n    val_metrics = []\n    for ep in range(1, EPOCHS + 1):\n        tl, tm, _, _ = run_epoch(model, tr_loader, criterion, optimizer)\n        vl, vm, _, _ = run_epoch(model, val_loader, criterion)\n        print(f\"Epoch {ep:02d}: val_loss={vl:.4f}  HM={vm['HM']:.4f}\")\n        tr_losses.append(tl)\n        val_losses.append(vl)\n        tr_metrics.append(tm)\n        val_metrics.append(vm)\n    # log sweep data\n    ed = experiment_data[\"SPR\"]\n    ed[\"lr_values\"].append(lr)\n    ed[\"losses\"][\"train\"].append(tr_losses)\n    ed[\"losses\"][\"val\"].append(val_losses)\n    ed[\"metrics\"][\"train\"].append(tr_metrics)\n    ed[\"metrics\"][\"val\"].append(val_metrics)\n    ed[\"epochs\"] = list(range(1, EPOCHS + 1))\n    # best check\n    if val_metrics[-1][\"HM\"] > best_hm:\n        best_hm, best_lr = val_metrics[-1][\"HM\"], lr\n        best_state = {k: v.cpu() for k, v in model.state_dict().items()}\n        print(f\"New best lr={lr} with HM={best_hm:.4f}\")\n\n# -------------------------------------------------- #\n# Final evaluation on test split\n# -------------------------------------------------- #\nprint(f\"\\nBest learning rate selected: {best_lr}\")\nbest_model = SPRGCN(num_shapes + num_colors + 1, 64, num_classes).to(device)\nbest_model.load_state_dict(best_state)\ntest_loader = DataLoader(test_ds, batch_size=batch_eval)\n_, test_metrics, gts, prs = run_epoch(best_model, test_loader, criterion)\nprint(\n    f\"Test metrics  CWA={test_metrics['CWA']:.4f}  \"\n    f\"SWA={test_metrics['SWA']:.4f}  HM={test_metrics['HM']:.4f}\"\n)\n\n# store predictions and gt\ned = experiment_data[\"SPR\"]\ned[\"best_lr\"] = best_lr\ned[\"predictions\"] = prs\ned[\"ground_truth\"] = gts\n\n# -------------------------------------------------- #\n# Save artefacts\n# -------------------------------------------------- #\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\n\n# plot val loss curves\nplt.figure()\nfor lr, vloss in zip(ed[\"lr_values\"], ed[\"losses\"][\"val\"]):\n    plt.plot(ed[\"epochs\"], vloss, label=f\"lr={lr}\")\nplt.xlabel(\"Epoch\")\nplt.ylabel(\"Val Loss\")\nplt.title(\"LR sweep - Validation loss\")\nplt.legend()\nplt.savefig(os.path.join(working_dir, \"val_loss_lr_sweep.png\"), dpi=150)\nplt.close()\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ------------------------------------------------------------------ #\n# basic set-up\n# ------------------------------------------------------------------ #\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\n# ------------------------------------------------------------------ #\n# helper variables\n# ------------------------------------------------------------------ #\ned = experiment_data.get(\"SPR\", {})\nlr_vals = ed.get(\"lr_values\", [])\nepochs = ed.get(\"epochs\", [])\nbest_lr = ed.get(\"best_lr\", None)\nbest_idx = lr_vals.index(best_lr) if best_lr in lr_vals else -1\n\n# ------------------------------------------------------------------ #\n# 1) loss curves (train / val) for best LR\n# ------------------------------------------------------------------ #\ntry:\n    plt.figure()\n    plt.plot(epochs, ed[\"losses\"][\"train\"][best_idx], label=\"Train\")\n    plt.plot(epochs, ed[\"losses\"][\"val\"][best_idx], label=\"Val\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Cross-Entropy Loss\")\n    plt.title(f\"SPR Dataset \u2013 Train/Val Loss (best lr={best_lr})\")\n    plt.legend()\n    fname = os.path.join(working_dir, f\"SPR_loss_curves_lr{best_lr}.png\")\n    plt.savefig(fname, dpi=150)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating loss curve plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------ #\n# 2) HM curves (train / val) for best LR\n# ------------------------------------------------------------------ #\ntry:\n    tr_hm = [m[\"HM\"] for m in ed[\"metrics\"][\"train\"][best_idx]]\n    val_hm = [m[\"HM\"] for m in ed[\"metrics\"][\"val\"][best_idx]]\n    plt.figure()\n    plt.plot(epochs, tr_hm, label=\"Train HM\")\n    plt.plot(epochs, val_hm, label=\"Val HM\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"HM\")\n    plt.title(f\"SPR Dataset \u2013 Harmonic-Mean Metric (best lr={best_lr})\")\n    plt.legend()\n    fname = os.path.join(working_dir, f\"SPR_HM_curves_lr{best_lr}.png\")\n    plt.savefig(fname, dpi=150)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating HM curve plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------ #\n# 3) bar chart of final Val-HM vs LR\n# ------------------------------------------------------------------ #\ntry:\n    final_hms = [metrics[-1][\"HM\"] for metrics in ed[\"metrics\"][\"val\"]]\n    plt.figure()\n    plt.bar([str(lr) for lr in lr_vals], final_hms)\n    plt.xlabel(\"Learning Rate\")\n    plt.ylabel(\"Final Val HM\")\n    plt.title(\"SPR Dataset \u2013 Final Validation HM per Learning Rate\")\n    fname = os.path.join(working_dir, \"SPR_valHM_vs_lr.png\")\n    plt.savefig(fname, dpi=150)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating LR sweep HM bar chart: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------ #\n# 4) confusion matrix on test split\n# ------------------------------------------------------------------ #\ntry:\n    preds = np.asarray(ed.get(\"predictions\", []), dtype=int)\n    gts = np.asarray(ed.get(\"ground_truth\", []), dtype=int)\n    if preds.size and gts.size:\n        n_cls = max(preds.max(), gts.max()) + 1\n        cm = np.zeros((n_cls, n_cls), dtype=int)\n        for t, p in zip(gts, preds):\n            cm[t, p] += 1\n        plt.figure()\n        im = plt.imshow(cm, cmap=\"Blues\")\n        plt.colorbar(im)\n        plt.xlabel(\"Predicted\")\n        plt.ylabel(\"Ground Truth\")\n        plt.title(\"SPR Dataset \u2013 Confusion Matrix (Test Set)\")\n        for i in range(n_cls):\n            for j in range(n_cls):\n                plt.text(\n                    j,\n                    i,\n                    cm[i, j],\n                    ha=\"center\",\n                    va=\"center\",\n                    color=\"white\" if cm[i, j] > cm.max() / 2 else \"black\",\n                    fontsize=8,\n                )\n        fname = os.path.join(working_dir, \"SPR_confusion_matrix.png\")\n        plt.savefig(fname, dpi=150)\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating confusion matrix: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------ #\n# print stored test metrics\n# ------------------------------------------------------------------ #\ntm = ed.get(\"metrics\", {}).get(\"val\", [{}])[-1] if ed else {}\nprint(f\"Best LR: {best_lr}\")\nprint(\n    f\"Test metrics \u2013 CWA: {tm.get('CWA', 'NA'):.4f} | \"\n    f\"SWA: {tm.get('SWA', 'NA'):.4f} | HM: {tm.get('HM', 'NA'):.4f}\"\n)\n",
+    "plot_plan": "We first load the saved experiment_data and locate the \u201cSPR\u201d entry.  Using the recorded best learning-rate index we extract the per-epoch train/validation losses and metrics.  We then create up to four standard figures: (1) train/val loss curves for the best LR; (2) train/val HM (harmonic mean) curves for the best LR; (3) a bar chart that summarizes the final validation HM for every LR tried; (4) a confusion-matrix\u2013style heat-map of test predictions vs. ground truth.  Each figure is wrapped in its own try-except so that errors never block subsequent plots, every figure is given a clear, descriptive title containing the dataset name and plot type, and all figures are saved into working_dir and then closed.  We also print the stored test-set CWA, SWA and HM so that the notebook shows an immediate numerical summary.  Only data contained in experiment_data.npy are used; nothing is synthesized or guessed.",
+    "plot_analyses": [
+      {
+        "analysis": "The validation loss decreases steadily for all three learning rates over the epochs. The learning rate of 0.0001 starts with the highest initial loss but decreases consistently, showing a smooth convergence. However, it doesn't perform as well as the other two learning rates. The learning rate of 0.002 shows an initial drop but fluctuates slightly, indicating instability. The learning rate of 0.0005 achieves the lowest validation loss consistently, suggesting it is the most optimal among the three.",
+        "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_bff4641a5ff54195af51ebb5e46d03f2_proc_1513229/val_loss_lr_sweep.png"
+      },
+      {
+        "analysis": "The training and validation loss curves for the chosen learning rate of 0.0005 show a steady decline over the epochs. The validation loss stabilizes after a few epochs, indicating the model generalizes well without significant overfitting. The training loss continues to decrease, but its rate slows down, showing the model is learning effectively.",
+        "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_bff4641a5ff54195af51ebb5e46d03f2_proc_1513229/SPR_loss_curves_lr0.0005.png"
+      },
+      {
+        "analysis": "The harmonic mean (HM) metric remains constant for both training and validation sets across all epochs. This indicates that the model's performance on this metric does not improve with additional training, suggesting a potential issue with the metric's sensitivity or the model's ability to optimize for it.",
+        "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_bff4641a5ff54195af51ebb5e46d03f2_proc_1513229/SPR_HM_curves_lr0.0005.png"
+      },
+      {
+        "analysis": "The final validation harmonic mean (HM) metric is nearly identical across all three learning rates. This suggests that the choice of learning rate has minimal impact on this specific metric, or that the metric is not sensitive enough to capture performance differences.",
+        "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_bff4641a5ff54195af51ebb5e46d03f2_proc_1513229/SPR_valHM_vs_lr.png"
+      },
+      {
+        "analysis": "The confusion matrix shows that the model is heavily biased towards predicting one class (class 0). This is evident from the majority of predictions being concentrated in one row, regardless of the ground truth labels. The model struggles to differentiate between classes, indicating poor classification performance and a need for better class balance or feature representation.",
+        "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_bff4641a5ff54195af51ebb5e46d03f2_proc_1513229/SPR_confusion_matrix.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_bff4641a5ff54195af51ebb5e46d03f2_proc_1513229/val_loss_lr_sweep.png",
+      "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_bff4641a5ff54195af51ebb5e46d03f2_proc_1513229/SPR_loss_curves_lr0.0005.png",
+      "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_bff4641a5ff54195af51ebb5e46d03f2_proc_1513229/SPR_HM_curves_lr0.0005.png",
+      "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_bff4641a5ff54195af51ebb5e46d03f2_proc_1513229/SPR_valHM_vs_lr.png",
+      "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_bff4641a5ff54195af51ebb5e46d03f2_proc_1513229/SPR_confusion_matrix.png"
+    ],
+    "vlm_feedback_summary": "The plots reveal insights into the model's performance across different learning rates and metrics. The validation loss suggests that a learning rate of 0.0005 is optimal. However, the harmonic mean metric remains constant, indicating potential issues with its sensitivity or the model's optimization for it. The confusion matrix highlights a significant model bias towards one class, pointing to a need for improvements in class balance or feature representation.",
+    "exp_results_dir": "experiment_results/experiment_bff4641a5ff54195af51ebb5e46d03f2_proc_1513229",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_bff4641a5ff54195af51ebb5e46d03f2_proc_1513229/experiment_data.npy"
+    ]
+  },
+  "best node with different seeds": [
+    {
+      "overall_plan": "The overall plan began with the development of a minimal end-to-end baseline model for sequence classification using graph representations. This involved a two-layer GCN with global-mean pooling, targeting the Structural-Diversity-Weighted-Accuracy (SDWA) metric. Initially, the model handled both pre-existing and synthetic datasets by transforming sequences into graphs and learning node embeddings. Following the baseline creation, there was a focus on hyperparameter tuning, particularly optimizing the learning rate through a grid search to enhance performance. A critical flaw was addressed by converting categorical features from raw integer IDs to one-hot vectors and including normalized positional features, ensuring meaningful inputs for the GNN without altering the architecture. The plan also included comprehensive tracking of key metrics and optimizing the process for GPU usage and artifact storage. The current plan, described as a 'Seed node,' indicates the initiation of a new phase or foundational stage for future experiments. It is essential to integrate learnings from the previous plan into this new phase, continuing the scientific exploration based on established insights.",
+      "analysis": "",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "training loss",
+              "lower_is_better": true,
+              "description": "The loss value for the training dataset.",
+              "data": [
+                {
+                  "dataset_name": "Training set",
+                  "final_value": 0.8997,
+                  "best_value": 0.8997
+                }
+              ]
+            },
+            {
+              "metric_name": "training CWA",
+              "lower_is_better": false,
+              "description": "The CWA metric for the training dataset.",
+              "data": [
+                {
+                  "dataset_name": "Training set",
+                  "final_value": 0.7093,
+                  "best_value": 0.7093
+                }
+              ]
+            },
+            {
+              "metric_name": "training SWA",
+              "lower_is_better": false,
+              "description": "The SWA metric for the training dataset.",
+              "data": [
+                {
+                  "dataset_name": "Training set",
+                  "final_value": 0.7126,
+                  "best_value": 0.7126
+                }
+              ]
+            },
+            {
+              "metric_name": "training harmonic mean",
+              "lower_is_better": false,
+              "description": "The harmonic mean for the training dataset.",
+              "data": [
+                {
+                  "dataset_name": "Training set",
+                  "final_value": 0.711,
+                  "best_value": 0.711
+                }
+              ]
+            },
+            {
+              "metric_name": "validation loss",
+              "lower_is_better": true,
+              "description": "The loss value for the validation dataset.",
+              "data": [
+                {
+                  "dataset_name": "Validation set",
+                  "final_value": 0.961,
+                  "best_value": 0.961
+                }
+              ]
+            },
+            {
+              "metric_name": "validation CWA",
+              "lower_is_better": false,
+              "description": "The CWA metric for the validation dataset.",
+              "data": [
+                {
+                  "dataset_name": "Validation set",
+                  "final_value": 0.6933,
+                  "best_value": 0.6933
+                }
+              ]
+            },
+            {
+              "metric_name": "validation SWA",
+              "lower_is_better": false,
+              "description": "The SWA metric for the validation dataset.",
+              "data": [
+                {
+                  "dataset_name": "Validation set",
+                  "final_value": 0.701,
+                  "best_value": 0.701
+                }
+              ]
+            },
+            {
+              "metric_name": "validation harmonic mean",
+              "lower_is_better": false,
+              "description": "The harmonic mean for the validation dataset.",
+              "data": [
+                {
+                  "dataset_name": "Validation set",
+                  "final_value": 0.6971,
+                  "best_value": 0.6971
+                }
+              ]
+            },
+            {
+              "metric_name": "test accuracy",
+              "lower_is_better": false,
+              "description": "The accuracy metric for the test dataset.",
+              "data": [
+                {
+                  "dataset_name": "Test set",
+                  "final_value": 0.682,
+                  "best_value": 0.682
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 2\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os, random, math, time, pathlib, itertools\nimport numpy as np\nimport torch, matplotlib.pyplot as plt\nfrom torch import nn\nfrom torch_geometric.data import Data, DataLoader\nfrom torch_geometric.nn import GCNConv, global_mean_pool\n\n# -------------------------------------------------- #\n# mandatory working directory and device management\n# -------------------------------------------------- #\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n# -------------------------------------------------- #\n# global experiment container\n# -------------------------------------------------- #\nexperiment_data = {\n    \"SPR\": {\n        \"metrics\": {\"train\": [], \"val\": []},  # each entry will be dict(CWA,SWA,HM)\n        \"losses\": {\"train\": [], \"val\": []},\n        \"lr_values\": [],\n        \"epochs\": [],\n        \"best_lr\": None,\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n}\n\n\n# -------------------------------------------------- #\n# Metric helpers (CWA, SWA, HM)\n# -------------------------------------------------- #\ndef _uniq_colors(seq: str) -> int:\n    return len({tok[1] for tok in seq.split() if len(tok) > 1})\n\n\ndef _uniq_shapes(seq: str) -> int:\n    return len({tok[0] for tok in seq.split() if tok})\n\n\ndef cwa(seqs, y_true, y_pred):\n    w = [_uniq_colors(s) for s in seqs]\n    corr = [wi if t == p else 0 for wi, t, p in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if w else 0.0\n\n\ndef swa(seqs, y_true, y_pred):\n    w = [_uniq_shapes(s) for s in seqs]\n    corr = [wi if t == p else 0 for wi, t, p in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if w else 0.0\n\n\ndef hm_score(cwa_val, swa_val, eps=1e-12):\n    return 2 * cwa_val * swa_val / (cwa_val + swa_val + eps)\n\n\n# -------------------------------------------------- #\n# Try to load real benchmark, else create synthetic\n# -------------------------------------------------- #\ndef try_load_real():\n    try:\n        from SPR import load_spr_bench\n\n        DATA_PATH = pathlib.Path(\"./SPR_BENCH\")\n        d = load_spr_bench(DATA_PATH)\n        return d[\"train\"], d[\"dev\"], d[\"test\"]\n    except Exception as e:\n        print(\"Real dataset not found, falling back to synthetic:\", e)\n        return None\n\n\ndef gen_synth(num=1000):\n    shapes, colors = list(\"ABCD\"), list(\"1234\")\n    seqs, labels = [], []\n    for _ in range(num):\n        ln = random.randint(3, 10)\n        toks = [random.choice(shapes) + random.choice(colors) for _ in range(ln)]\n        seq = \" \".join(toks)\n        label = (_uniq_shapes(seq) * _uniq_colors(seq)) % 4\n        seqs.append(seq)\n        labels.append(label)\n    return {\"sequence\": seqs, \"label\": labels}\n\n\nreal = try_load_real()\nif real:\n    train_raw, dev_raw, test_raw = real\nelse:\n    train_raw, dev_raw, test_raw = gen_synth(2000), gen_synth(500), gen_synth(500)\n\n\n# -------------------------------------------------- #\n# Build vocabularies\n# -------------------------------------------------- #\ndef build_vocabs(raw_sets):\n    shapes, colors = set(), set()\n    for rs in raw_sets:\n        for s in rs[\"sequence\"]:\n            for tok in s.split():\n                shapes.add(tok[0])\n                colors.add(tok[1])\n    return {s: i for i, s in enumerate(sorted(shapes))}, {\n        c: i for i, c in enumerate(sorted(colors))\n    }\n\n\nshape_vocab, color_vocab = build_vocabs([train_raw, dev_raw, test_raw])\nnum_shapes, num_colors = len(shape_vocab), len(color_vocab)\n\n\n# -------------------------------------------------- #\n# Sequence -> PyG graph (with one-hot node features)\n# -------------------------------------------------- #\ndef seq_to_graph(seq, label):\n    toks = seq.split()\n    n = len(toks)\n    s_ids = [shape_vocab[t[0]] for t in toks]\n    c_ids = [color_vocab[t[1]] for t in toks]\n    pos = [i / (n - 1 if n > 1 else 1) for i in range(n)]\n\n    # one-hot encode and concat positional feature\n    s_oh = torch.nn.functional.one_hot(torch.tensor(s_ids), num_classes=num_shapes)\n    c_oh = torch.nn.functional.one_hot(torch.tensor(c_ids), num_classes=num_colors)\n    pos_feat = torch.tensor(pos, dtype=torch.float32).unsqueeze(1)\n    x = torch.cat(\n        [s_oh.float(), c_oh.float(), pos_feat], dim=1\n    )  # [n, num_shapes+num_colors+1]\n\n    # simple chain edges (bi-directional)\n    edges = [[i, i + 1] for i in range(n - 1)]\n    edge_index = torch.tensor(edges + [[j, i] for i, j in edges], dtype=torch.long).t()\n    data = Data(x=x, edge_index=edge_index, y=torch.tensor([int(label)]), seq=seq)\n    return data\n\n\ndef build_pyg(raw):\n    if isinstance(raw, dict):\n        return [seq_to_graph(s, l) for s, l in zip(raw[\"sequence\"], raw[\"label\"])]\n    # hf Dataset case\n    return [seq_to_graph(ex[\"sequence\"], int(ex[\"label\"])) for ex in raw]\n\n\ntrain_ds, dev_ds, test_ds = map(build_pyg, (train_raw, dev_raw, test_raw))\nnum_classes = len(\n    set(train_raw[\"label\"] if isinstance(train_raw, dict) else train_raw[\"label\"])\n)\n\n\n# -------------------------------------------------- #\n# Model (architecture unchanged, new input dim)\n# -------------------------------------------------- #\nclass SPRGCN(nn.Module):\n    def __init__(self, in_dim, hid, classes):\n        super().__init__()\n        self.conv1 = GCNConv(in_dim, hid)\n        self.conv2 = GCNConv(hid, hid)\n        self.lin = nn.Linear(hid, classes)\n\n    def forward(self, data):\n        x, ei, b = data.x, data.edge_index, data.batch\n        x = self.conv1(x, ei).relu()\n        x = self.conv2(x, ei).relu()\n        x = global_mean_pool(x, b)\n        return self.lin(x)\n\n\n# -------------------------------------------------- #\n# Epoch runner\n# -------------------------------------------------- #\ndef run_epoch(model, loader, criterion, opt=None):\n    train_flag = opt is not None\n    model.train() if train_flag else model.eval()\n    total_loss, seqs, ys, ps = 0.0, [], [], []\n    for batch in loader:\n        batch = batch.to(device)\n        if train_flag:\n            opt.zero_grad()\n        out = model(batch)\n        loss = criterion(out, batch.y.view(-1))\n        if train_flag:\n            loss.backward()\n            opt.step()\n        total_loss += loss.item() * batch.num_graphs\n        preds = out.argmax(1).detach().cpu().tolist()\n        labels = batch.y.view(-1).cpu().tolist()\n        ps.extend(preds)\n        ys.extend(labels)\n        seqs.extend(batch.seq)\n    avg_loss = total_loss / len(loader.dataset)\n    cwa_val = cwa(seqs, ys, ps)\n    swa_val = swa(seqs, ys, ps)\n    hm_val = hm_score(cwa_val, swa_val)\n    return avg_loss, {\"CWA\": cwa_val, \"SWA\": swa_val, \"HM\": hm_val}, ys, ps\n\n\n# -------------------------------------------------- #\n# Hyper-parameter sweep (learning rate)\n# -------------------------------------------------- #\nLR_GRID = [5e-4, 1e-4, 2e-3]\nEPOCHS = 10\nbatch_train, batch_eval = 32, 64\ncriterion = nn.CrossEntropyLoss()\n\nbest_hm, best_lr, best_state = -1.0, None, None\n\nfor lr in LR_GRID:\n    print(f\"\\n=== Training with lr={lr} ===\")\n    torch.manual_seed(42)\n    random.seed(42)\n    np.random.seed(42)\n    model = SPRGCN(num_shapes + num_colors + 1, 64, num_classes).to(device)\n    optimizer = torch.optim.Adam(model.parameters(), lr=lr)\n    tr_loader = DataLoader(train_ds, batch_size=batch_train, shuffle=True)\n    val_loader = DataLoader(dev_ds, batch_size=batch_eval)\n    tr_losses = []\n    val_losses = []\n    tr_metrics = []\n    val_metrics = []\n    for ep in range(1, EPOCHS + 1):\n        tl, tm, _, _ = run_epoch(model, tr_loader, criterion, optimizer)\n        vl, vm, _, _ = run_epoch(model, val_loader, criterion)\n        print(f\"Epoch {ep:02d}: val_loss={vl:.4f}  HM={vm['HM']:.4f}\")\n        tr_losses.append(tl)\n        val_losses.append(vl)\n        tr_metrics.append(tm)\n        val_metrics.append(vm)\n    # log sweep data\n    ed = experiment_data[\"SPR\"]\n    ed[\"lr_values\"].append(lr)\n    ed[\"losses\"][\"train\"].append(tr_losses)\n    ed[\"losses\"][\"val\"].append(val_losses)\n    ed[\"metrics\"][\"train\"].append(tr_metrics)\n    ed[\"metrics\"][\"val\"].append(val_metrics)\n    ed[\"epochs\"] = list(range(1, EPOCHS + 1))\n    # best check\n    if val_metrics[-1][\"HM\"] > best_hm:\n        best_hm, best_lr = val_metrics[-1][\"HM\"], lr\n        best_state = {k: v.cpu() for k, v in model.state_dict().items()}\n        print(f\"New best lr={lr} with HM={best_hm:.4f}\")\n\n# -------------------------------------------------- #\n# Final evaluation on test split\n# -------------------------------------------------- #\nprint(f\"\\nBest learning rate selected: {best_lr}\")\nbest_model = SPRGCN(num_shapes + num_colors + 1, 64, num_classes).to(device)\nbest_model.load_state_dict(best_state)\ntest_loader = DataLoader(test_ds, batch_size=batch_eval)\n_, test_metrics, gts, prs = run_epoch(best_model, test_loader, criterion)\nprint(\n    f\"Test metrics  CWA={test_metrics['CWA']:.4f}  \"\n    f\"SWA={test_metrics['SWA']:.4f}  HM={test_metrics['HM']:.4f}\"\n)\n\n# store predictions and gt\ned = experiment_data[\"SPR\"]\ned[\"best_lr\"] = best_lr\ned[\"predictions\"] = prs\ned[\"ground_truth\"] = gts\n\n# -------------------------------------------------- #\n# Save artefacts\n# -------------------------------------------------- #\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\n\n# plot val loss curves\nplt.figure()\nfor lr, vloss in zip(ed[\"lr_values\"], ed[\"losses\"][\"val\"]):\n    plt.plot(ed[\"epochs\"], vloss, label=f\"lr={lr}\")\nplt.xlabel(\"Epoch\")\nplt.ylabel(\"Val Loss\")\nplt.title(\"LR sweep - Validation loss\")\nplt.legend()\nplt.savefig(os.path.join(working_dir, \"val_loss_lr_sweep.png\"), dpi=150)\nplt.close()\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ------------------------------------------------------------------ #\n# basic set-up\n# ------------------------------------------------------------------ #\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\n# ------------------------------------------------------------------ #\n# helper variables\n# ------------------------------------------------------------------ #\ned = experiment_data.get(\"SPR\", {})\nlr_vals = ed.get(\"lr_values\", [])\nepochs = ed.get(\"epochs\", [])\nbest_lr = ed.get(\"best_lr\", None)\nbest_idx = lr_vals.index(best_lr) if best_lr in lr_vals else -1\n\n# ------------------------------------------------------------------ #\n# 1) loss curves (train / val) for best LR\n# ------------------------------------------------------------------ #\ntry:\n    plt.figure()\n    plt.plot(epochs, ed[\"losses\"][\"train\"][best_idx], label=\"Train\")\n    plt.plot(epochs, ed[\"losses\"][\"val\"][best_idx], label=\"Val\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Cross-Entropy Loss\")\n    plt.title(f\"SPR Dataset \u2013 Train/Val Loss (best lr={best_lr})\")\n    plt.legend()\n    fname = os.path.join(working_dir, f\"SPR_loss_curves_lr{best_lr}.png\")\n    plt.savefig(fname, dpi=150)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating loss curve plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------ #\n# 2) HM curves (train / val) for best LR\n# ------------------------------------------------------------------ #\ntry:\n    tr_hm = [m[\"HM\"] for m in ed[\"metrics\"][\"train\"][best_idx]]\n    val_hm = [m[\"HM\"] for m in ed[\"metrics\"][\"val\"][best_idx]]\n    plt.figure()\n    plt.plot(epochs, tr_hm, label=\"Train HM\")\n    plt.plot(epochs, val_hm, label=\"Val HM\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"HM\")\n    plt.title(f\"SPR Dataset \u2013 Harmonic-Mean Metric (best lr={best_lr})\")\n    plt.legend()\n    fname = os.path.join(working_dir, f\"SPR_HM_curves_lr{best_lr}.png\")\n    plt.savefig(fname, dpi=150)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating HM curve plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------ #\n# 3) bar chart of final Val-HM vs LR\n# ------------------------------------------------------------------ #\ntry:\n    final_hms = [metrics[-1][\"HM\"] for metrics in ed[\"metrics\"][\"val\"]]\n    plt.figure()\n    plt.bar([str(lr) for lr in lr_vals], final_hms)\n    plt.xlabel(\"Learning Rate\")\n    plt.ylabel(\"Final Val HM\")\n    plt.title(\"SPR Dataset \u2013 Final Validation HM per Learning Rate\")\n    fname = os.path.join(working_dir, \"SPR_valHM_vs_lr.png\")\n    plt.savefig(fname, dpi=150)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating LR sweep HM bar chart: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------ #\n# 4) confusion matrix on test split\n# ------------------------------------------------------------------ #\ntry:\n    preds = np.asarray(ed.get(\"predictions\", []), dtype=int)\n    gts = np.asarray(ed.get(\"ground_truth\", []), dtype=int)\n    if preds.size and gts.size:\n        n_cls = max(preds.max(), gts.max()) + 1\n        cm = np.zeros((n_cls, n_cls), dtype=int)\n        for t, p in zip(gts, preds):\n            cm[t, p] += 1\n        plt.figure()\n        im = plt.imshow(cm, cmap=\"Blues\")\n        plt.colorbar(im)\n        plt.xlabel(\"Predicted\")\n        plt.ylabel(\"Ground Truth\")\n        plt.title(\"SPR Dataset \u2013 Confusion Matrix (Test Set)\")\n        for i in range(n_cls):\n            for j in range(n_cls):\n                plt.text(\n                    j,\n                    i,\n                    cm[i, j],\n                    ha=\"center\",\n                    va=\"center\",\n                    color=\"white\" if cm[i, j] > cm.max() / 2 else \"black\",\n                    fontsize=8,\n                )\n        fname = os.path.join(working_dir, \"SPR_confusion_matrix.png\")\n        plt.savefig(fname, dpi=150)\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating confusion matrix: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------ #\n# print stored test metrics\n# ------------------------------------------------------------------ #\ntm = ed.get(\"metrics\", {}).get(\"val\", [{}])[-1] if ed else {}\nprint(f\"Best LR: {best_lr}\")\nprint(\n    f\"Test metrics \u2013 CWA: {tm.get('CWA', 'NA'):.4f} | \"\n    f\"SWA: {tm.get('SWA', 'NA'):.4f} | HM: {tm.get('HM', 'NA'):.4f}\"\n)\n",
+      "plot_analyses": [
+        {
+          "analysis": "This plot compares the validation loss across different learning rates (lr=0.0005, lr=0.0001, and lr=0.002) over 10 epochs. The learning rate of 0.0005 results in the lowest and most stable validation loss, indicating better generalization. The learning rate of 0.0001 shows a steady decrease but remains higher than the others, while lr=0.002 exhibits fluctuations, suggesting instability.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_6309830c61404f61bf8b53ac86e02551_proc_1513228/val_loss_lr_sweep.png"
+        },
+        {
+          "analysis": "This plot shows the training and validation loss for the best learning rate (lr=0.0005) over 10 epochs. Both losses decrease consistently and plateau after a few epochs, indicating good convergence. The gap between the training and validation loss is minimal, suggesting low overfitting and that the model generalizes well on unseen data.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_6309830c61404f61bf8b53ac86e02551_proc_1513228/SPR_loss_curves_lr0.0005.png"
+        },
+        {
+          "analysis": "This plot presents the harmonic mean (HM) metric for training and validation sets at the best learning rate (lr=0.0005). The training HM remains constant at approximately 0.71, while the validation HM stays constant at 0.698. The lack of improvement suggests that the metric may not be sensitive to the learning process or that further tuning is required to enhance performance.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_6309830c61404f61bf8b53ac86e02551_proc_1513228/SPR_HM_curves_lr0.0005.png"
+        },
+        {
+          "analysis": "This plot compares the final validation harmonic mean (HM) metric for different learning rates (lr=0.0005, lr=0.0001, and lr=0.002). All learning rates achieve similar HM values, indicating that the choice of learning rate has minimal impact on this metric. This could imply that the metric is not capturing significant differences in model performance.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_6309830c61404f61bf8b53ac86e02551_proc_1513228/SPR_valHM_vs_lr.png"
+        },
+        {
+          "analysis": "The confusion matrix for the test set reveals that the model predicts only one class (class 0) across all test samples, regardless of the ground truth. This indicates a severe class imbalance issue or a failure of the model to learn meaningful distinctions among classes. The model's performance is not satisfactory and requires further investigation.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_6309830c61404f61bf8b53ac86e02551_proc_1513228/SPR_confusion_matrix.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_6309830c61404f61bf8b53ac86e02551_proc_1513228/val_loss_lr_sweep.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_6309830c61404f61bf8b53ac86e02551_proc_1513228/SPR_loss_curves_lr0.0005.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_6309830c61404f61bf8b53ac86e02551_proc_1513228/SPR_HM_curves_lr0.0005.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_6309830c61404f61bf8b53ac86e02551_proc_1513228/SPR_valHM_vs_lr.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_6309830c61404f61bf8b53ac86e02551_proc_1513228/SPR_confusion_matrix.png"
+      ],
+      "vlm_feedback_summary": "The analysis highlights strengths in validation loss reduction and convergence for lr=0.0005 but points out issues with the harmonic mean metric's lack of sensitivity and the model's inability to differentiate classes in the confusion matrix. Further optimization and investigation are needed.",
+      "exp_results_dir": "experiment_results/experiment_6309830c61404f61bf8b53ac86e02551_proc_1513228",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_6309830c61404f61bf8b53ac86e02551_proc_1513228/experiment_data.npy"
+      ]
+    },
+    {
+      "overall_plan": "The overall plan began with developing a minimal end-to-end baseline model for sequence classification using graph representations, specifically employing a two-layer GCN with global-mean pooling to optimize the Structural-Diversity-Weighted-Accuracy (SDWA) metric. This involved transforming sequences into graphs and learning node embeddings, with a focus on hyperparameter tuning, especially the learning rate, through a grid search. A critical flaw was identified in the initial implementation, where categorical features were incorrectly input as raw integer IDs; the plan proposed converting these to one-hot vectors and adding normalized positional features to provide meaningful GNN inputs. The plan also included comprehensive metric tracking and optimizing GPU usage and artifact storage. The current plan is described as a 'seed node,' suggesting the initiation of a new research phase, potentially laying the groundwork for future developments or expansions on the initial efforts.",
+      "analysis": "",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "training loss",
+              "lower_is_better": true,
+              "description": "The loss value during training phase.",
+              "data": [
+                {
+                  "dataset_name": "training set",
+                  "final_value": 0.9165,
+                  "best_value": 0.9165
+                }
+              ]
+            },
+            {
+              "metric_name": "training CWA",
+              "lower_is_better": false,
+              "description": "The CWA metric during training phase.",
+              "data": [
+                {
+                  "dataset_name": "training set",
+                  "final_value": 0.7076,
+                  "best_value": 0.7076
+                }
+              ]
+            },
+            {
+              "metric_name": "training SWA",
+              "lower_is_better": false,
+              "description": "The SWA metric during training phase.",
+              "data": [
+                {
+                  "dataset_name": "training set",
+                  "final_value": 0.7091,
+                  "best_value": 0.7091
+                }
+              ]
+            },
+            {
+              "metric_name": "training harmonic mean",
+              "lower_is_better": false,
+              "description": "The harmonic mean metric during training phase.",
+              "data": [
+                {
+                  "dataset_name": "training set",
+                  "final_value": 0.7084,
+                  "best_value": 0.7084
+                }
+              ]
+            },
+            {
+              "metric_name": "validation loss",
+              "lower_is_better": true,
+              "description": "The loss value during validation phase.",
+              "data": [
+                {
+                  "dataset_name": "validation set",
+                  "final_value": 0.9705,
+                  "best_value": 0.9705
+                }
+              ]
+            },
+            {
+              "metric_name": "validation CWA",
+              "lower_is_better": false,
+              "description": "The CWA metric during validation phase.",
+              "data": [
+                {
+                  "dataset_name": "validation set",
+                  "final_value": 0.6928,
+                  "best_value": 0.6928
+                }
+              ]
+            },
+            {
+              "metric_name": "validation SWA",
+              "lower_is_better": false,
+              "description": "The SWA metric during validation phase.",
+              "data": [
+                {
+                  "dataset_name": "validation set",
+                  "final_value": 0.6929,
+                  "best_value": 0.6929
+                }
+              ]
+            },
+            {
+              "metric_name": "validation harmonic mean",
+              "lower_is_better": false,
+              "description": "The harmonic mean metric during validation phase.",
+              "data": [
+                {
+                  "dataset_name": "validation set",
+                  "final_value": 0.6929,
+                  "best_value": 0.6929
+                }
+              ]
+            },
+            {
+              "metric_name": "test accuracy",
+              "lower_is_better": false,
+              "description": "The accuracy metric during test phase.",
+              "data": [
+                {
+                  "dataset_name": "test set",
+                  "final_value": 0.642,
+                  "best_value": 0.642
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 0\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os, random, math, time, pathlib, itertools\nimport numpy as np\nimport torch, matplotlib.pyplot as plt\nfrom torch import nn\nfrom torch_geometric.data import Data, DataLoader\nfrom torch_geometric.nn import GCNConv, global_mean_pool\n\n# -------------------------------------------------- #\n# mandatory working directory and device management\n# -------------------------------------------------- #\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n# -------------------------------------------------- #\n# global experiment container\n# -------------------------------------------------- #\nexperiment_data = {\n    \"SPR\": {\n        \"metrics\": {\"train\": [], \"val\": []},  # each entry will be dict(CWA,SWA,HM)\n        \"losses\": {\"train\": [], \"val\": []},\n        \"lr_values\": [],\n        \"epochs\": [],\n        \"best_lr\": None,\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n}\n\n\n# -------------------------------------------------- #\n# Metric helpers (CWA, SWA, HM)\n# -------------------------------------------------- #\ndef _uniq_colors(seq: str) -> int:\n    return len({tok[1] for tok in seq.split() if len(tok) > 1})\n\n\ndef _uniq_shapes(seq: str) -> int:\n    return len({tok[0] for tok in seq.split() if tok})\n\n\ndef cwa(seqs, y_true, y_pred):\n    w = [_uniq_colors(s) for s in seqs]\n    corr = [wi if t == p else 0 for wi, t, p in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if w else 0.0\n\n\ndef swa(seqs, y_true, y_pred):\n    w = [_uniq_shapes(s) for s in seqs]\n    corr = [wi if t == p else 0 for wi, t, p in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if w else 0.0\n\n\ndef hm_score(cwa_val, swa_val, eps=1e-12):\n    return 2 * cwa_val * swa_val / (cwa_val + swa_val + eps)\n\n\n# -------------------------------------------------- #\n# Try to load real benchmark, else create synthetic\n# -------------------------------------------------- #\ndef try_load_real():\n    try:\n        from SPR import load_spr_bench\n\n        DATA_PATH = pathlib.Path(\"./SPR_BENCH\")\n        d = load_spr_bench(DATA_PATH)\n        return d[\"train\"], d[\"dev\"], d[\"test\"]\n    except Exception as e:\n        print(\"Real dataset not found, falling back to synthetic:\", e)\n        return None\n\n\ndef gen_synth(num=1000):\n    shapes, colors = list(\"ABCD\"), list(\"1234\")\n    seqs, labels = [], []\n    for _ in range(num):\n        ln = random.randint(3, 10)\n        toks = [random.choice(shapes) + random.choice(colors) for _ in range(ln)]\n        seq = \" \".join(toks)\n        label = (_uniq_shapes(seq) * _uniq_colors(seq)) % 4\n        seqs.append(seq)\n        labels.append(label)\n    return {\"sequence\": seqs, \"label\": labels}\n\n\nreal = try_load_real()\nif real:\n    train_raw, dev_raw, test_raw = real\nelse:\n    train_raw, dev_raw, test_raw = gen_synth(2000), gen_synth(500), gen_synth(500)\n\n\n# -------------------------------------------------- #\n# Build vocabularies\n# -------------------------------------------------- #\ndef build_vocabs(raw_sets):\n    shapes, colors = set(), set()\n    for rs in raw_sets:\n        for s in rs[\"sequence\"]:\n            for tok in s.split():\n                shapes.add(tok[0])\n                colors.add(tok[1])\n    return {s: i for i, s in enumerate(sorted(shapes))}, {\n        c: i for i, c in enumerate(sorted(colors))\n    }\n\n\nshape_vocab, color_vocab = build_vocabs([train_raw, dev_raw, test_raw])\nnum_shapes, num_colors = len(shape_vocab), len(color_vocab)\n\n\n# -------------------------------------------------- #\n# Sequence -> PyG graph (with one-hot node features)\n# -------------------------------------------------- #\ndef seq_to_graph(seq, label):\n    toks = seq.split()\n    n = len(toks)\n    s_ids = [shape_vocab[t[0]] for t in toks]\n    c_ids = [color_vocab[t[1]] for t in toks]\n    pos = [i / (n - 1 if n > 1 else 1) for i in range(n)]\n\n    # one-hot encode and concat positional feature\n    s_oh = torch.nn.functional.one_hot(torch.tensor(s_ids), num_classes=num_shapes)\n    c_oh = torch.nn.functional.one_hot(torch.tensor(c_ids), num_classes=num_colors)\n    pos_feat = torch.tensor(pos, dtype=torch.float32).unsqueeze(1)\n    x = torch.cat(\n        [s_oh.float(), c_oh.float(), pos_feat], dim=1\n    )  # [n, num_shapes+num_colors+1]\n\n    # simple chain edges (bi-directional)\n    edges = [[i, i + 1] for i in range(n - 1)]\n    edge_index = torch.tensor(edges + [[j, i] for i, j in edges], dtype=torch.long).t()\n    data = Data(x=x, edge_index=edge_index, y=torch.tensor([int(label)]), seq=seq)\n    return data\n\n\ndef build_pyg(raw):\n    if isinstance(raw, dict):\n        return [seq_to_graph(s, l) for s, l in zip(raw[\"sequence\"], raw[\"label\"])]\n    # hf Dataset case\n    return [seq_to_graph(ex[\"sequence\"], int(ex[\"label\"])) for ex in raw]\n\n\ntrain_ds, dev_ds, test_ds = map(build_pyg, (train_raw, dev_raw, test_raw))\nnum_classes = len(\n    set(train_raw[\"label\"] if isinstance(train_raw, dict) else train_raw[\"label\"])\n)\n\n\n# -------------------------------------------------- #\n# Model (architecture unchanged, new input dim)\n# -------------------------------------------------- #\nclass SPRGCN(nn.Module):\n    def __init__(self, in_dim, hid, classes):\n        super().__init__()\n        self.conv1 = GCNConv(in_dim, hid)\n        self.conv2 = GCNConv(hid, hid)\n        self.lin = nn.Linear(hid, classes)\n\n    def forward(self, data):\n        x, ei, b = data.x, data.edge_index, data.batch\n        x = self.conv1(x, ei).relu()\n        x = self.conv2(x, ei).relu()\n        x = global_mean_pool(x, b)\n        return self.lin(x)\n\n\n# -------------------------------------------------- #\n# Epoch runner\n# -------------------------------------------------- #\ndef run_epoch(model, loader, criterion, opt=None):\n    train_flag = opt is not None\n    model.train() if train_flag else model.eval()\n    total_loss, seqs, ys, ps = 0.0, [], [], []\n    for batch in loader:\n        batch = batch.to(device)\n        if train_flag:\n            opt.zero_grad()\n        out = model(batch)\n        loss = criterion(out, batch.y.view(-1))\n        if train_flag:\n            loss.backward()\n            opt.step()\n        total_loss += loss.item() * batch.num_graphs\n        preds = out.argmax(1).detach().cpu().tolist()\n        labels = batch.y.view(-1).cpu().tolist()\n        ps.extend(preds)\n        ys.extend(labels)\n        seqs.extend(batch.seq)\n    avg_loss = total_loss / len(loader.dataset)\n    cwa_val = cwa(seqs, ys, ps)\n    swa_val = swa(seqs, ys, ps)\n    hm_val = hm_score(cwa_val, swa_val)\n    return avg_loss, {\"CWA\": cwa_val, \"SWA\": swa_val, \"HM\": hm_val}, ys, ps\n\n\n# -------------------------------------------------- #\n# Hyper-parameter sweep (learning rate)\n# -------------------------------------------------- #\nLR_GRID = [5e-4, 1e-4, 2e-3]\nEPOCHS = 10\nbatch_train, batch_eval = 32, 64\ncriterion = nn.CrossEntropyLoss()\n\nbest_hm, best_lr, best_state = -1.0, None, None\n\nfor lr in LR_GRID:\n    print(f\"\\n=== Training with lr={lr} ===\")\n    torch.manual_seed(42)\n    random.seed(42)\n    np.random.seed(42)\n    model = SPRGCN(num_shapes + num_colors + 1, 64, num_classes).to(device)\n    optimizer = torch.optim.Adam(model.parameters(), lr=lr)\n    tr_loader = DataLoader(train_ds, batch_size=batch_train, shuffle=True)\n    val_loader = DataLoader(dev_ds, batch_size=batch_eval)\n    tr_losses = []\n    val_losses = []\n    tr_metrics = []\n    val_metrics = []\n    for ep in range(1, EPOCHS + 1):\n        tl, tm, _, _ = run_epoch(model, tr_loader, criterion, optimizer)\n        vl, vm, _, _ = run_epoch(model, val_loader, criterion)\n        print(f\"Epoch {ep:02d}: val_loss={vl:.4f}  HM={vm['HM']:.4f}\")\n        tr_losses.append(tl)\n        val_losses.append(vl)\n        tr_metrics.append(tm)\n        val_metrics.append(vm)\n    # log sweep data\n    ed = experiment_data[\"SPR\"]\n    ed[\"lr_values\"].append(lr)\n    ed[\"losses\"][\"train\"].append(tr_losses)\n    ed[\"losses\"][\"val\"].append(val_losses)\n    ed[\"metrics\"][\"train\"].append(tr_metrics)\n    ed[\"metrics\"][\"val\"].append(val_metrics)\n    ed[\"epochs\"] = list(range(1, EPOCHS + 1))\n    # best check\n    if val_metrics[-1][\"HM\"] > best_hm:\n        best_hm, best_lr = val_metrics[-1][\"HM\"], lr\n        best_state = {k: v.cpu() for k, v in model.state_dict().items()}\n        print(f\"New best lr={lr} with HM={best_hm:.4f}\")\n\n# -------------------------------------------------- #\n# Final evaluation on test split\n# -------------------------------------------------- #\nprint(f\"\\nBest learning rate selected: {best_lr}\")\nbest_model = SPRGCN(num_shapes + num_colors + 1, 64, num_classes).to(device)\nbest_model.load_state_dict(best_state)\ntest_loader = DataLoader(test_ds, batch_size=batch_eval)\n_, test_metrics, gts, prs = run_epoch(best_model, test_loader, criterion)\nprint(\n    f\"Test metrics  CWA={test_metrics['CWA']:.4f}  \"\n    f\"SWA={test_metrics['SWA']:.4f}  HM={test_metrics['HM']:.4f}\"\n)\n\n# store predictions and gt\ned = experiment_data[\"SPR\"]\ned[\"best_lr\"] = best_lr\ned[\"predictions\"] = prs\ned[\"ground_truth\"] = gts\n\n# -------------------------------------------------- #\n# Save artefacts\n# -------------------------------------------------- #\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\n\n# plot val loss curves\nplt.figure()\nfor lr, vloss in zip(ed[\"lr_values\"], ed[\"losses\"][\"val\"]):\n    plt.plot(ed[\"epochs\"], vloss, label=f\"lr={lr}\")\nplt.xlabel(\"Epoch\")\nplt.ylabel(\"Val Loss\")\nplt.title(\"LR sweep - Validation loss\")\nplt.legend()\nplt.savefig(os.path.join(working_dir, \"val_loss_lr_sweep.png\"), dpi=150)\nplt.close()\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ------------------------------------------------------------------ #\n# basic set-up\n# ------------------------------------------------------------------ #\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\n# ------------------------------------------------------------------ #\n# helper variables\n# ------------------------------------------------------------------ #\ned = experiment_data.get(\"SPR\", {})\nlr_vals = ed.get(\"lr_values\", [])\nepochs = ed.get(\"epochs\", [])\nbest_lr = ed.get(\"best_lr\", None)\nbest_idx = lr_vals.index(best_lr) if best_lr in lr_vals else -1\n\n# ------------------------------------------------------------------ #\n# 1) loss curves (train / val) for best LR\n# ------------------------------------------------------------------ #\ntry:\n    plt.figure()\n    plt.plot(epochs, ed[\"losses\"][\"train\"][best_idx], label=\"Train\")\n    plt.plot(epochs, ed[\"losses\"][\"val\"][best_idx], label=\"Val\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Cross-Entropy Loss\")\n    plt.title(f\"SPR Dataset \u2013 Train/Val Loss (best lr={best_lr})\")\n    plt.legend()\n    fname = os.path.join(working_dir, f\"SPR_loss_curves_lr{best_lr}.png\")\n    plt.savefig(fname, dpi=150)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating loss curve plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------ #\n# 2) HM curves (train / val) for best LR\n# ------------------------------------------------------------------ #\ntry:\n    tr_hm = [m[\"HM\"] for m in ed[\"metrics\"][\"train\"][best_idx]]\n    val_hm = [m[\"HM\"] for m in ed[\"metrics\"][\"val\"][best_idx]]\n    plt.figure()\n    plt.plot(epochs, tr_hm, label=\"Train HM\")\n    plt.plot(epochs, val_hm, label=\"Val HM\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"HM\")\n    plt.title(f\"SPR Dataset \u2013 Harmonic-Mean Metric (best lr={best_lr})\")\n    plt.legend()\n    fname = os.path.join(working_dir, f\"SPR_HM_curves_lr{best_lr}.png\")\n    plt.savefig(fname, dpi=150)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating HM curve plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------ #\n# 3) bar chart of final Val-HM vs LR\n# ------------------------------------------------------------------ #\ntry:\n    final_hms = [metrics[-1][\"HM\"] for metrics in ed[\"metrics\"][\"val\"]]\n    plt.figure()\n    plt.bar([str(lr) for lr in lr_vals], final_hms)\n    plt.xlabel(\"Learning Rate\")\n    plt.ylabel(\"Final Val HM\")\n    plt.title(\"SPR Dataset \u2013 Final Validation HM per Learning Rate\")\n    fname = os.path.join(working_dir, \"SPR_valHM_vs_lr.png\")\n    plt.savefig(fname, dpi=150)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating LR sweep HM bar chart: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------ #\n# 4) confusion matrix on test split\n# ------------------------------------------------------------------ #\ntry:\n    preds = np.asarray(ed.get(\"predictions\", []), dtype=int)\n    gts = np.asarray(ed.get(\"ground_truth\", []), dtype=int)\n    if preds.size and gts.size:\n        n_cls = max(preds.max(), gts.max()) + 1\n        cm = np.zeros((n_cls, n_cls), dtype=int)\n        for t, p in zip(gts, preds):\n            cm[t, p] += 1\n        plt.figure()\n        im = plt.imshow(cm, cmap=\"Blues\")\n        plt.colorbar(im)\n        plt.xlabel(\"Predicted\")\n        plt.ylabel(\"Ground Truth\")\n        plt.title(\"SPR Dataset \u2013 Confusion Matrix (Test Set)\")\n        for i in range(n_cls):\n            for j in range(n_cls):\n                plt.text(\n                    j,\n                    i,\n                    cm[i, j],\n                    ha=\"center\",\n                    va=\"center\",\n                    color=\"white\" if cm[i, j] > cm.max() / 2 else \"black\",\n                    fontsize=8,\n                )\n        fname = os.path.join(working_dir, \"SPR_confusion_matrix.png\")\n        plt.savefig(fname, dpi=150)\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating confusion matrix: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------ #\n# print stored test metrics\n# ------------------------------------------------------------------ #\ntm = ed.get(\"metrics\", {}).get(\"val\", [{}])[-1] if ed else {}\nprint(f\"Best LR: {best_lr}\")\nprint(\n    f\"Test metrics \u2013 CWA: {tm.get('CWA', 'NA'):.4f} | \"\n    f\"SWA: {tm.get('SWA', 'NA'):.4f} | HM: {tm.get('HM', 'NA'):.4f}\"\n)\n",
+      "plot_analyses": [
+        {
+          "analysis": "The training loss consistently decreases with the number of epochs, indicating that the model is learning effectively. However, the validation loss plateaus early and remains relatively stable, suggesting that the model might not be overfitting but also may not be improving significantly on unseen data. This could imply limited model capacity or insufficient regularization for the given hidden dimension.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/loss_curve_dim_32.png"
+        },
+        {
+          "analysis": "The training loss decreases steadily, showing effective learning. The validation loss exhibits a slight downward trend, indicating some improvement in generalization. This suggests that increasing the hidden dimension to 64 allows the model to better capture the underlying patterns in the data compared to a hidden dimension of 32.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/loss_curve_dim_64.png"
+        },
+        {
+          "analysis": "The training loss decreases as expected, but the validation loss shows oscillations and does not improve consistently. This behavior could indicate that the model with a hidden dimension of 128 is overfitting or is too complex for the dataset. Further regularization or hyperparameter tuning may be needed.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/loss_curve_dim_128.png"
+        },
+        {
+          "analysis": "The validation loss decreases steadily for all learning rates, with the learning rate of 0.002 showing the fastest convergence. However, the learning rate of 0.0005 achieves the lowest final validation loss, suggesting it is the most suitable choice for this task. The learning rate of 0.0001 converges slowly but steadily.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/val_loss_lr_sweep.png"
+        },
+        {
+          "analysis": "The training loss decreases steadily, while the validation loss plateaus after the initial epochs. This indicates that the chosen learning rate (0.0005) is effective in stabilizing the model's performance. However, the lack of further improvement in validation loss suggests the need for additional tuning, such as adjusting the batch size or applying regularization techniques.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/SPR_loss_curves_lr0.0005.png"
+        },
+        {
+          "analysis": "The harmonic mean metric remains constant for both training and validation sets, indicating that the model is not improving on this metric across epochs. This could suggest that the metric is not sensitive to the changes in model performance or that the model is unable to optimize effectively for this specific metric.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/SPR_HM_curves_lr0.0005.png"
+        },
+        {
+          "analysis": "The final validation harmonic mean (HM) metric is nearly identical across all learning rates. This suggests that the learning rate does not have a significant impact on the HM metric's optimization. Further investigation into other hyperparameters or the metric's sensitivity is recommended.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/SPR_valHM_vs_lr.png"
+        },
+        {
+          "analysis": "The confusion matrix shows that the model predicts only one class (class 0) for all test samples, indicating a severe class imbalance or a model bias issue. This behavior suggests that the model is not learning meaningful distinctions between classes. Rebalancing the dataset or applying class-specific loss weighting might help address this problem.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/SPR_confusion_matrix.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/loss_curve_dim_32.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/loss_curve_dim_64.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/loss_curve_dim_128.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/val_loss_lr_sweep.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/SPR_loss_curves_lr0.0005.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/SPR_HM_curves_lr0.0005.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/SPR_valHM_vs_lr.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/SPR_confusion_matrix.png"
+      ],
+      "vlm_feedback_summary": "The plots provide insights into the model's training and validation behavior across different hyperparameters. While the training loss generally decreases, validation loss behavior varies, indicating potential overfitting or insufficient generalization. The harmonic mean metric remains static, and the confusion matrix highlights significant class imbalance or model bias. Further hyperparameter tuning and dataset adjustments are recommended.",
+      "exp_results_dir": "experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/experiment_data.npy"
+      ]
+    },
+    {
+      "overall_plan": "The overall plan began with the establishment of a minimal end-to-end baseline model for sequence classification using a two-layer GCN with global-mean pooling, targeting improvements in the Structural-Diversity-Weighted-Accuracy (SDWA) metric. The model was designed to transform sequences into graphs and learn node embeddings, applicable to both existing and synthetic datasets. A significant phase involved hyperparameter tuning, particularly optimizing the learning rate through grid search to enhance performance. An identified flaw was addressed by converting categorical features from raw integer IDs to one-hot vectors and adding normalized positional features, ensuring the GNN received meaningful inputs without altering the core architecture. Comprehensive tracking of key metrics such as CWA, SWA, and their harmonic mean was included, optimizing for GPU usage and artifact storage. The current plan, indicated as a 'seed node,' suggests a nascent stage for exploring new ideas or directions, representing a potential branching point from the foundational work already conducted.",
+      "analysis": "",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "training loss",
+              "lower_is_better": true,
+              "description": "Measures the error in the model's predictions on the training set.",
+              "data": [
+                {
+                  "dataset_name": "training set",
+                  "final_value": 0.9201,
+                  "best_value": 0.9201
+                }
+              ]
+            },
+            {
+              "metric_name": "training CWA",
+              "lower_is_better": false,
+              "description": "Training set metric CWA, higher values indicate better performance.",
+              "data": [
+                {
+                  "dataset_name": "training set",
+                  "final_value": 0.6982,
+                  "best_value": 0.6982
+                }
+              ]
+            },
+            {
+              "metric_name": "training SWA",
+              "lower_is_better": false,
+              "description": "Training set metric SWA, higher values indicate better performance.",
+              "data": [
+                {
+                  "dataset_name": "training set",
+                  "final_value": 0.7021,
+                  "best_value": 0.7021
+                }
+              ]
+            },
+            {
+              "metric_name": "training harmonic mean",
+              "lower_is_better": false,
+              "description": "Harmonic mean of training metrics, higher values indicate better performance.",
+              "data": [
+                {
+                  "dataset_name": "training set",
+                  "final_value": 0.7001,
+                  "best_value": 0.7001
+                }
+              ]
+            },
+            {
+              "metric_name": "validation loss",
+              "lower_is_better": true,
+              "description": "Measures the error in the model's predictions on the validation set.",
+              "data": [
+                {
+                  "dataset_name": "validation set",
+                  "final_value": 0.9269,
+                  "best_value": 0.9269
+                }
+              ]
+            },
+            {
+              "metric_name": "validation CWA",
+              "lower_is_better": false,
+              "description": "Validation set metric CWA, higher values indicate better performance.",
+              "data": [
+                {
+                  "dataset_name": "validation set",
+                  "final_value": 0.694,
+                  "best_value": 0.694
+                }
+              ]
+            },
+            {
+              "metric_name": "validation SWA",
+              "lower_is_better": false,
+              "description": "Validation set metric SWA, higher values indicate better performance.",
+              "data": [
+                {
+                  "dataset_name": "validation set",
+                  "final_value": 0.6849,
+                  "best_value": 0.6849
+                }
+              ]
+            },
+            {
+              "metric_name": "validation harmonic mean",
+              "lower_is_better": false,
+              "description": "Harmonic mean of validation metrics, higher values indicate better performance.",
+              "data": [
+                {
+                  "dataset_name": "validation set",
+                  "final_value": 0.6894,
+                  "best_value": 0.6894
+                }
+              ]
+            },
+            {
+              "metric_name": "test accuracy",
+              "lower_is_better": false,
+              "description": "Measures the accuracy of the model's predictions on the test set.",
+              "data": [
+                {
+                  "dataset_name": "test set",
+                  "final_value": 0.63,
+                  "best_value": 0.63
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 1\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os, random, math, time, pathlib, itertools\nimport numpy as np\nimport torch, matplotlib.pyplot as plt\nfrom torch import nn\nfrom torch_geometric.data import Data, DataLoader\nfrom torch_geometric.nn import GCNConv, global_mean_pool\n\n# -------------------------------------------------- #\n# mandatory working directory and device management\n# -------------------------------------------------- #\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n# -------------------------------------------------- #\n# global experiment container\n# -------------------------------------------------- #\nexperiment_data = {\n    \"SPR\": {\n        \"metrics\": {\"train\": [], \"val\": []},  # each entry will be dict(CWA,SWA,HM)\n        \"losses\": {\"train\": [], \"val\": []},\n        \"lr_values\": [],\n        \"epochs\": [],\n        \"best_lr\": None,\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n}\n\n\n# -------------------------------------------------- #\n# Metric helpers (CWA, SWA, HM)\n# -------------------------------------------------- #\ndef _uniq_colors(seq: str) -> int:\n    return len({tok[1] for tok in seq.split() if len(tok) > 1})\n\n\ndef _uniq_shapes(seq: str) -> int:\n    return len({tok[0] for tok in seq.split() if tok})\n\n\ndef cwa(seqs, y_true, y_pred):\n    w = [_uniq_colors(s) for s in seqs]\n    corr = [wi if t == p else 0 for wi, t, p in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if w else 0.0\n\n\ndef swa(seqs, y_true, y_pred):\n    w = [_uniq_shapes(s) for s in seqs]\n    corr = [wi if t == p else 0 for wi, t, p in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if w else 0.0\n\n\ndef hm_score(cwa_val, swa_val, eps=1e-12):\n    return 2 * cwa_val * swa_val / (cwa_val + swa_val + eps)\n\n\n# -------------------------------------------------- #\n# Try to load real benchmark, else create synthetic\n# -------------------------------------------------- #\ndef try_load_real():\n    try:\n        from SPR import load_spr_bench\n\n        DATA_PATH = pathlib.Path(\"./SPR_BENCH\")\n        d = load_spr_bench(DATA_PATH)\n        return d[\"train\"], d[\"dev\"], d[\"test\"]\n    except Exception as e:\n        print(\"Real dataset not found, falling back to synthetic:\", e)\n        return None\n\n\ndef gen_synth(num=1000):\n    shapes, colors = list(\"ABCD\"), list(\"1234\")\n    seqs, labels = [], []\n    for _ in range(num):\n        ln = random.randint(3, 10)\n        toks = [random.choice(shapes) + random.choice(colors) for _ in range(ln)]\n        seq = \" \".join(toks)\n        label = (_uniq_shapes(seq) * _uniq_colors(seq)) % 4\n        seqs.append(seq)\n        labels.append(label)\n    return {\"sequence\": seqs, \"label\": labels}\n\n\nreal = try_load_real()\nif real:\n    train_raw, dev_raw, test_raw = real\nelse:\n    train_raw, dev_raw, test_raw = gen_synth(2000), gen_synth(500), gen_synth(500)\n\n\n# -------------------------------------------------- #\n# Build vocabularies\n# -------------------------------------------------- #\ndef build_vocabs(raw_sets):\n    shapes, colors = set(), set()\n    for rs in raw_sets:\n        for s in rs[\"sequence\"]:\n            for tok in s.split():\n                shapes.add(tok[0])\n                colors.add(tok[1])\n    return {s: i for i, s in enumerate(sorted(shapes))}, {\n        c: i for i, c in enumerate(sorted(colors))\n    }\n\n\nshape_vocab, color_vocab = build_vocabs([train_raw, dev_raw, test_raw])\nnum_shapes, num_colors = len(shape_vocab), len(color_vocab)\n\n\n# -------------------------------------------------- #\n# Sequence -> PyG graph (with one-hot node features)\n# -------------------------------------------------- #\ndef seq_to_graph(seq, label):\n    toks = seq.split()\n    n = len(toks)\n    s_ids = [shape_vocab[t[0]] for t in toks]\n    c_ids = [color_vocab[t[1]] for t in toks]\n    pos = [i / (n - 1 if n > 1 else 1) for i in range(n)]\n\n    # one-hot encode and concat positional feature\n    s_oh = torch.nn.functional.one_hot(torch.tensor(s_ids), num_classes=num_shapes)\n    c_oh = torch.nn.functional.one_hot(torch.tensor(c_ids), num_classes=num_colors)\n    pos_feat = torch.tensor(pos, dtype=torch.float32).unsqueeze(1)\n    x = torch.cat(\n        [s_oh.float(), c_oh.float(), pos_feat], dim=1\n    )  # [n, num_shapes+num_colors+1]\n\n    # simple chain edges (bi-directional)\n    edges = [[i, i + 1] for i in range(n - 1)]\n    edge_index = torch.tensor(edges + [[j, i] for i, j in edges], dtype=torch.long).t()\n    data = Data(x=x, edge_index=edge_index, y=torch.tensor([int(label)]), seq=seq)\n    return data\n\n\ndef build_pyg(raw):\n    if isinstance(raw, dict):\n        return [seq_to_graph(s, l) for s, l in zip(raw[\"sequence\"], raw[\"label\"])]\n    # hf Dataset case\n    return [seq_to_graph(ex[\"sequence\"], int(ex[\"label\"])) for ex in raw]\n\n\ntrain_ds, dev_ds, test_ds = map(build_pyg, (train_raw, dev_raw, test_raw))\nnum_classes = len(\n    set(train_raw[\"label\"] if isinstance(train_raw, dict) else train_raw[\"label\"])\n)\n\n\n# -------------------------------------------------- #\n# Model (architecture unchanged, new input dim)\n# -------------------------------------------------- #\nclass SPRGCN(nn.Module):\n    def __init__(self, in_dim, hid, classes):\n        super().__init__()\n        self.conv1 = GCNConv(in_dim, hid)\n        self.conv2 = GCNConv(hid, hid)\n        self.lin = nn.Linear(hid, classes)\n\n    def forward(self, data):\n        x, ei, b = data.x, data.edge_index, data.batch\n        x = self.conv1(x, ei).relu()\n        x = self.conv2(x, ei).relu()\n        x = global_mean_pool(x, b)\n        return self.lin(x)\n\n\n# -------------------------------------------------- #\n# Epoch runner\n# -------------------------------------------------- #\ndef run_epoch(model, loader, criterion, opt=None):\n    train_flag = opt is not None\n    model.train() if train_flag else model.eval()\n    total_loss, seqs, ys, ps = 0.0, [], [], []\n    for batch in loader:\n        batch = batch.to(device)\n        if train_flag:\n            opt.zero_grad()\n        out = model(batch)\n        loss = criterion(out, batch.y.view(-1))\n        if train_flag:\n            loss.backward()\n            opt.step()\n        total_loss += loss.item() * batch.num_graphs\n        preds = out.argmax(1).detach().cpu().tolist()\n        labels = batch.y.view(-1).cpu().tolist()\n        ps.extend(preds)\n        ys.extend(labels)\n        seqs.extend(batch.seq)\n    avg_loss = total_loss / len(loader.dataset)\n    cwa_val = cwa(seqs, ys, ps)\n    swa_val = swa(seqs, ys, ps)\n    hm_val = hm_score(cwa_val, swa_val)\n    return avg_loss, {\"CWA\": cwa_val, \"SWA\": swa_val, \"HM\": hm_val}, ys, ps\n\n\n# -------------------------------------------------- #\n# Hyper-parameter sweep (learning rate)\n# -------------------------------------------------- #\nLR_GRID = [5e-4, 1e-4, 2e-3]\nEPOCHS = 10\nbatch_train, batch_eval = 32, 64\ncriterion = nn.CrossEntropyLoss()\n\nbest_hm, best_lr, best_state = -1.0, None, None\n\nfor lr in LR_GRID:\n    print(f\"\\n=== Training with lr={lr} ===\")\n    torch.manual_seed(42)\n    random.seed(42)\n    np.random.seed(42)\n    model = SPRGCN(num_shapes + num_colors + 1, 64, num_classes).to(device)\n    optimizer = torch.optim.Adam(model.parameters(), lr=lr)\n    tr_loader = DataLoader(train_ds, batch_size=batch_train, shuffle=True)\n    val_loader = DataLoader(dev_ds, batch_size=batch_eval)\n    tr_losses = []\n    val_losses = []\n    tr_metrics = []\n    val_metrics = []\n    for ep in range(1, EPOCHS + 1):\n        tl, tm, _, _ = run_epoch(model, tr_loader, criterion, optimizer)\n        vl, vm, _, _ = run_epoch(model, val_loader, criterion)\n        print(f\"Epoch {ep:02d}: val_loss={vl:.4f}  HM={vm['HM']:.4f}\")\n        tr_losses.append(tl)\n        val_losses.append(vl)\n        tr_metrics.append(tm)\n        val_metrics.append(vm)\n    # log sweep data\n    ed = experiment_data[\"SPR\"]\n    ed[\"lr_values\"].append(lr)\n    ed[\"losses\"][\"train\"].append(tr_losses)\n    ed[\"losses\"][\"val\"].append(val_losses)\n    ed[\"metrics\"][\"train\"].append(tr_metrics)\n    ed[\"metrics\"][\"val\"].append(val_metrics)\n    ed[\"epochs\"] = list(range(1, EPOCHS + 1))\n    # best check\n    if val_metrics[-1][\"HM\"] > best_hm:\n        best_hm, best_lr = val_metrics[-1][\"HM\"], lr\n        best_state = {k: v.cpu() for k, v in model.state_dict().items()}\n        print(f\"New best lr={lr} with HM={best_hm:.4f}\")\n\n# -------------------------------------------------- #\n# Final evaluation on test split\n# -------------------------------------------------- #\nprint(f\"\\nBest learning rate selected: {best_lr}\")\nbest_model = SPRGCN(num_shapes + num_colors + 1, 64, num_classes).to(device)\nbest_model.load_state_dict(best_state)\ntest_loader = DataLoader(test_ds, batch_size=batch_eval)\n_, test_metrics, gts, prs = run_epoch(best_model, test_loader, criterion)\nprint(\n    f\"Test metrics  CWA={test_metrics['CWA']:.4f}  \"\n    f\"SWA={test_metrics['SWA']:.4f}  HM={test_metrics['HM']:.4f}\"\n)\n\n# store predictions and gt\ned = experiment_data[\"SPR\"]\ned[\"best_lr\"] = best_lr\ned[\"predictions\"] = prs\ned[\"ground_truth\"] = gts\n\n# -------------------------------------------------- #\n# Save artefacts\n# -------------------------------------------------- #\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\n\n# plot val loss curves\nplt.figure()\nfor lr, vloss in zip(ed[\"lr_values\"], ed[\"losses\"][\"val\"]):\n    plt.plot(ed[\"epochs\"], vloss, label=f\"lr={lr}\")\nplt.xlabel(\"Epoch\")\nplt.ylabel(\"Val Loss\")\nplt.title(\"LR sweep - Validation loss\")\nplt.legend()\nplt.savefig(os.path.join(working_dir, \"val_loss_lr_sweep.png\"), dpi=150)\nplt.close()\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ------------------------------------------------------------------ #\n# basic set-up\n# ------------------------------------------------------------------ #\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\n# ------------------------------------------------------------------ #\n# helper variables\n# ------------------------------------------------------------------ #\ned = experiment_data.get(\"SPR\", {})\nlr_vals = ed.get(\"lr_values\", [])\nepochs = ed.get(\"epochs\", [])\nbest_lr = ed.get(\"best_lr\", None)\nbest_idx = lr_vals.index(best_lr) if best_lr in lr_vals else -1\n\n# ------------------------------------------------------------------ #\n# 1) loss curves (train / val) for best LR\n# ------------------------------------------------------------------ #\ntry:\n    plt.figure()\n    plt.plot(epochs, ed[\"losses\"][\"train\"][best_idx], label=\"Train\")\n    plt.plot(epochs, ed[\"losses\"][\"val\"][best_idx], label=\"Val\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Cross-Entropy Loss\")\n    plt.title(f\"SPR Dataset \u2013 Train/Val Loss (best lr={best_lr})\")\n    plt.legend()\n    fname = os.path.join(working_dir, f\"SPR_loss_curves_lr{best_lr}.png\")\n    plt.savefig(fname, dpi=150)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating loss curve plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------ #\n# 2) HM curves (train / val) for best LR\n# ------------------------------------------------------------------ #\ntry:\n    tr_hm = [m[\"HM\"] for m in ed[\"metrics\"][\"train\"][best_idx]]\n    val_hm = [m[\"HM\"] for m in ed[\"metrics\"][\"val\"][best_idx]]\n    plt.figure()\n    plt.plot(epochs, tr_hm, label=\"Train HM\")\n    plt.plot(epochs, val_hm, label=\"Val HM\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"HM\")\n    plt.title(f\"SPR Dataset \u2013 Harmonic-Mean Metric (best lr={best_lr})\")\n    plt.legend()\n    fname = os.path.join(working_dir, f\"SPR_HM_curves_lr{best_lr}.png\")\n    plt.savefig(fname, dpi=150)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating HM curve plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------ #\n# 3) bar chart of final Val-HM vs LR\n# ------------------------------------------------------------------ #\ntry:\n    final_hms = [metrics[-1][\"HM\"] for metrics in ed[\"metrics\"][\"val\"]]\n    plt.figure()\n    plt.bar([str(lr) for lr in lr_vals], final_hms)\n    plt.xlabel(\"Learning Rate\")\n    plt.ylabel(\"Final Val HM\")\n    plt.title(\"SPR Dataset \u2013 Final Validation HM per Learning Rate\")\n    fname = os.path.join(working_dir, \"SPR_valHM_vs_lr.png\")\n    plt.savefig(fname, dpi=150)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating LR sweep HM bar chart: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------ #\n# 4) confusion matrix on test split\n# ------------------------------------------------------------------ #\ntry:\n    preds = np.asarray(ed.get(\"predictions\", []), dtype=int)\n    gts = np.asarray(ed.get(\"ground_truth\", []), dtype=int)\n    if preds.size and gts.size:\n        n_cls = max(preds.max(), gts.max()) + 1\n        cm = np.zeros((n_cls, n_cls), dtype=int)\n        for t, p in zip(gts, preds):\n            cm[t, p] += 1\n        plt.figure()\n        im = plt.imshow(cm, cmap=\"Blues\")\n        plt.colorbar(im)\n        plt.xlabel(\"Predicted\")\n        plt.ylabel(\"Ground Truth\")\n        plt.title(\"SPR Dataset \u2013 Confusion Matrix (Test Set)\")\n        for i in range(n_cls):\n            for j in range(n_cls):\n                plt.text(\n                    j,\n                    i,\n                    cm[i, j],\n                    ha=\"center\",\n                    va=\"center\",\n                    color=\"white\" if cm[i, j] > cm.max() / 2 else \"black\",\n                    fontsize=8,\n                )\n        fname = os.path.join(working_dir, \"SPR_confusion_matrix.png\")\n        plt.savefig(fname, dpi=150)\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating confusion matrix: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------ #\n# print stored test metrics\n# ------------------------------------------------------------------ #\ntm = ed.get(\"metrics\", {}).get(\"val\", [{}])[-1] if ed else {}\nprint(f\"Best LR: {best_lr}\")\nprint(\n    f\"Test metrics \u2013 CWA: {tm.get('CWA', 'NA'):.4f} | \"\n    f\"SWA: {tm.get('SWA', 'NA'):.4f} | HM: {tm.get('HM', 'NA'):.4f}\"\n)\n",
+      "plot_analyses": [
+        {
+          "analysis": "The loss curves for dropout 0.0 show that both training and validation losses decrease over the epochs. However, the validation loss exhibits fluctuations, suggesting a possible lack of generalization or overfitting. The absence of dropout might have led to overfitting on the training data.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/loss_curve_0.0.png"
+        },
+        {
+          "analysis": "The loss curves for dropout 0.1 show a more stable training process compared to dropout 0.0. Both training and validation losses decrease steadily, with less fluctuation in validation loss. This indicates that introducing a small dropout value improves generalization.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/loss_curve_0.1.png"
+        },
+        {
+          "analysis": "The loss curves for dropout 0.3 show a training process with slightly higher validation loss fluctuations than dropout 0.1. While the training loss continues to decrease, the validation loss does not improve significantly, suggesting that a higher dropout value may hinder learning.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/loss_curve_0.3.png"
+        },
+        {
+          "analysis": "The loss curves for dropout 0.5 show a more pronounced difference between training and validation losses. The validation loss stabilizes at a higher value, indicating underfitting due to excessive regularization from a high dropout rate.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/loss_curve_0.5.png"
+        },
+        {
+          "analysis": "The learning rate sweep for validation loss indicates that a learning rate of 0.0005 provides the best performance, as the validation loss decreases more steadily and reaches the lowest value compared to 0.0001 and 0.002. A learning rate of 0.002 seems too high, causing instability in the training process.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/val_loss_lr_sweep.png"
+        },
+        {
+          "analysis": "The train/validation loss plot for the best learning rate (0.0005) shows that both losses converge smoothly, indicating a well-tuned learning rate. The validation loss closely follows the training loss, suggesting a good balance between underfitting and overfitting.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/SPR_loss_curves_lr0.0005.png"
+        },
+        {
+          "analysis": "The harmonic mean (HM) metric plot shows constant values for both training and validation sets. The lack of improvement across epochs indicates that the metric might not be sensitive enough to capture the model's performance variations during training.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/SPR_HM_curves_lr0.0005.png"
+        },
+        {
+          "analysis": "The final validation harmonic mean (HM) bar plot shows similar values for all learning rates, indicating that the HM metric does not vary significantly with learning rate changes. This suggests that the metric may not be ideal for evaluating the model's performance.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/SPR_valHM_vs_lr.png"
+        },
+        {
+          "analysis": "The confusion matrix for the test set indicates that the model is heavily biased towards the first class, as it predicts class 0 for almost all instances. This shows poor performance in distinguishing between different classes, likely due to class imbalance or insufficient model capacity to capture the task's complexity.",
+          "plot_path": "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/SPR_confusion_matrix.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/loss_curve_0.0.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/loss_curve_0.1.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/loss_curve_0.3.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/loss_curve_0.5.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/val_loss_lr_sweep.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/SPR_loss_curves_lr0.0005.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/SPR_HM_curves_lr0.0005.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/SPR_valHM_vs_lr.png",
+        "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/SPR_confusion_matrix.png"
+      ],
+      "vlm_feedback_summary": "The plots reveal insights into model regularization, learning rate tuning, and evaluation metrics. Dropout and learning rate significantly influence the model's performance, with dropout 0.1 and learning rate 0.0005 yielding the best results. However, the harmonic mean metric shows limitations in capturing performance variations, and the confusion matrix highlights a severe class imbalance issue.",
+      "exp_results_dir": "experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/experiment_data.npy"
+      ]
+    }
+  ],
+  "aggregated results of nodes with different seeds": {
+    "overall_plan": "The overall plan commenced with the development of a minimal end-to-end baseline model for sequence classification using graph representations. This involved a two-layer GCN with global-mean pooling, specifically targeting the Structural-Diversity-Weighted-Accuracy (SDWA) metric. The model was initially designed to handle both pre-existing and synthetic datasets by transforming sequences into graphs and learning node embeddings. Following this, a hyperparameter tuning phase was introduced, focusing on optimizing the learning rate through a grid search to improve model performance. An identified flaw in the initial implementation where categorical features were input as raw integer IDs was addressed by converting these to one-hot vectors and including normalized positional features. This ensured the GNN received meaningful inputs without changing the existing architecture. The plan also included comprehensive tracking of key metrics such as CWA, SWA, and their harmonic mean at each epoch, along with optimizing the process for GPU usage and structured artifact storage. The current plan builds on this by aggregating results from multiple seeds, which is crucial for improving the robustness and reliability of the experimental outcomes. By incorporating multiple seeds, the current plan aims to better understand the variance and stability of the model's performance, providing a more comprehensive evaluation of its effectiveness. This iterative approach from baseline creation to refinement, optimization, and thorough validation underscores a comprehensive method for ensuring the model is not only effective but also reliable and generalizable.",
+    "metric": {
+      "value": null,
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# plotting aggregation code",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# --------------------------------------------------------------- #\n# basic set-up\n# --------------------------------------------------------------- #\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# --------------------------------------------------------------- #\n# load every run that belongs to this sweep\n# --------------------------------------------------------------- #\nexperiment_data_path_list = [\n    \"experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_c6014dd2ef4847b69a21ddaeffc094a2_proc_1513230/experiment_data.npy\",\n    \"experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_ae472dc3d6dd413e8b698f9d76cfa600_proc_1513231/experiment_data.npy\",\n    \"experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/experiment_6309830c61404f61bf8b53ac86e02551_proc_1513228/experiment_data.npy\",\n]\nall_experiment_data = []\nfor p in experiment_data_path_list:\n    try:\n        ed = np.load(\n            os.path.join(os.getenv(\"AI_SCIENTIST_ROOT\", \"\"), p), allow_pickle=True\n        ).item()\n        all_experiment_data.append(ed)\n    except Exception as e:\n        print(f\"Error loading {p}: {e}\")\n\n# --------------------------------------------------------------- #\n# helpers to collect SPR data\n# --------------------------------------------------------------- #\nspr_runs = [ed.get(\"SPR\", {}) for ed in all_experiment_data if \"SPR\" in ed]\nif not spr_runs:\n    print(\"No SPR runs found \u2013 nothing to plot\")\nelse:\n    # assume identical epoch list across runs\n    epochs = spr_runs[0].get(\"epochs\", [])\n    n_ep = len(epochs)\n\n    # ------------------------------------------------------------------ #\n    # 1) aggregate best-lr TRAIN/VAL LOSS curves\n    # ------------------------------------------------------------------ #\n    try:\n        train_mat, val_mat = [], []\n        for run in spr_runs:\n            lr_vals = run.get(\"lr_values\", [])\n            best_lr = run.get(\"best_lr\", None)\n            if best_lr not in lr_vals:\n                continue\n            idx = lr_vals.index(best_lr)\n            tr = np.asarray(run[\"losses\"][\"train\"][idx][:n_ep])\n            va = np.asarray(run[\"losses\"][\"val\"][idx][:n_ep])\n            train_mat.append(tr)\n            val_mat.append(va)\n\n        if train_mat and val_mat:\n            train_mat = np.vstack(train_mat)\n            val_mat = np.vstack(val_mat)\n\n            tr_mean, tr_se = train_mat.mean(0), train_mat.std(0) / np.sqrt(\n                train_mat.shape[0]\n            )\n            va_mean, va_se = val_mat.mean(0), val_mat.std(0) / np.sqrt(val_mat.shape[0])\n\n            plt.figure()\n            plt.plot(epochs, tr_mean, label=\"Train \u2013 mean\")\n            plt.fill_between(\n                epochs, tr_mean - tr_se, tr_mean + tr_se, alpha=0.3, label=\"Train \u00b11 SE\"\n            )\n            plt.plot(epochs, va_mean, label=\"Val \u2013 mean\")\n            plt.fill_between(\n                epochs, va_mean - va_se, va_mean + va_se, alpha=0.3, label=\"Val \u00b11 SE\"\n            )\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Cross-Entropy Loss\")\n            plt.title(\"SPR Dataset \u2013 Aggregated Train/Val Loss (best lr of each run)\")\n            plt.legend()\n            fname = os.path.join(working_dir, \"SPR_aggregated_loss_curves.png\")\n            plt.savefig(fname, dpi=150)\n            plt.close()\n    except Exception as e:\n        print(f\"Error creating aggregated loss plot: {e}\")\n        plt.close()\n\n    # ------------------------------------------------------------------ #\n    # 2) aggregate best-lr HM curves\n    # ------------------------------------------------------------------ #\n    try:\n        tr_mat, va_mat = [], []\n        for run in spr_runs:\n            lr_vals = run.get(\"lr_values\", [])\n            best_lr = run.get(\"best_lr\", None)\n            if best_lr not in lr_vals:\n                continue\n            idx = lr_vals.index(best_lr)\n\n            tr_hm = np.asarray([m[\"HM\"] for m in run[\"metrics\"][\"train\"][idx]])[:n_ep]\n            va_hm = np.asarray([m[\"HM\"] for m in run[\"metrics\"][\"val\"][idx]])[:n_ep]\n            tr_mat.append(tr_hm)\n            va_mat.append(va_hm)\n\n        if tr_mat and va_mat:\n            tr_mat, va_mat = np.vstack(tr_mat), np.vstack(va_mat)\n            tr_mean, tr_se = tr_mat.mean(0), tr_mat.std(0) / np.sqrt(tr_mat.shape[0])\n            va_mean, va_se = va_mat.mean(0), va_mat.std(0) / np.sqrt(va_mat.shape[0])\n\n            plt.figure()\n            plt.plot(epochs, tr_mean, label=\"Train HM \u2013 mean\")\n            plt.fill_between(\n                epochs, tr_mean - tr_se, tr_mean + tr_se, alpha=0.3, label=\"Train \u00b11 SE\"\n            )\n            plt.plot(epochs, va_mean, label=\"Val HM \u2013 mean\")\n            plt.fill_between(\n                epochs, va_mean - va_se, va_mean + va_se, alpha=0.3, label=\"Val \u00b11 SE\"\n            )\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"HM\")\n            plt.title(\"SPR Dataset \u2013 Aggregated Harmonic-Mean (best lr of each run)\")\n            plt.legend()\n            fname = os.path.join(working_dir, \"SPR_aggregated_HM_curves.png\")\n            plt.savefig(fname, dpi=150)\n            plt.close()\n    except Exception as e:\n        print(f\"Error creating aggregated HM plot: {e}\")\n        plt.close()\n\n    # ------------------------------------------------------------------ #\n    # 3) aggregated bar chart of FINAL VAL-HM vs LR\n    # ------------------------------------------------------------------ #\n    try:\n        # collect all lr values seen across runs\n        lr_set = set()\n        for run in spr_runs:\n            lr_set.update(run.get(\"lr_values\", []))\n        lr_list = sorted(lr_set)\n\n        means, ses = [], []\n        for lr in lr_list:\n            vals = []\n            for run in spr_runs:\n                if lr in run.get(\"lr_values\", []):\n                    idx = run[\"lr_values\"].index(lr)\n                    vals.append(run[\"metrics\"][\"val\"][idx][-1][\"HM\"])\n            if vals:\n                vals = np.asarray(vals)\n                means.append(vals.mean())\n                ses.append(vals.std(ddof=1) / np.sqrt(len(vals)))\n            else:\n                means.append(np.nan)\n                ses.append(np.nan)\n\n        x = np.arange(len(lr_list))\n        plt.figure()\n        plt.bar(x, means, yerr=ses, capsize=4)\n        plt.xticks(x, [str(lr) for lr in lr_list], rotation=45)\n        plt.xlabel(\"Learning Rate\")\n        plt.ylabel(\"Final Validation HM\")\n        plt.title(\"SPR Dataset \u2013 Aggregated Final Val HM per Learning Rate\")\n        plt.tight_layout()\n        fname = os.path.join(working_dir, \"SPR_final_valHM_vs_lr_aggregated.png\")\n        plt.savefig(fname, dpi=150)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating aggregated LR sweep HM bar chart: {e}\")\n        plt.close()\n\n    # ------------------------------------------------------------------ #\n    # 4) print summary of best-lr final HM across runs\n    # ------------------------------------------------------------------ #\n    finals = []\n    for run in spr_runs:\n        lr_vals = run.get(\"lr_values\", [])\n        best_lr = run.get(\"best_lr\", None)\n        if best_lr in lr_vals:\n            idx = lr_vals.index(best_lr)\n            finals.append(run[\"metrics\"][\"val\"][idx][-1][\"HM\"])\n    if finals:\n        finals = np.asarray(finals)\n        print(\n            f\"Best-lr Final Val HM: mean={finals.mean():.4f} \u00b1 {finals.std(ddof=1)/np.sqrt(len(finals)):.4f} (SE) from {len(finals)} runs\"\n        )\n",
+    "plot_analyses": [],
+    "plot_paths": [
+      "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/seed_aggregation_a66e2e443011474097ba7c11d504a4a4/SPR_aggregated_loss_curves.png",
+      "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/seed_aggregation_a66e2e443011474097ba7c11d504a4a4/SPR_aggregated_HM_curves.png",
+      "experiments/2025-08-30_21-49-55_gnn_for_spr_attempt_0/logs/0-run/experiment_results/seed_aggregation_a66e2e443011474097ba7c11d504a4a4/SPR_final_valHM_vs_lr_aggregated.png"
+    ],
+    "vlm_feedback_summary": [],
+    "exp_results_dir": "experiment_results/seed_aggregation_a66e2e443011474097ba7c11d504a4a4",
+    "exp_results_npy_files": []
+  }
+}

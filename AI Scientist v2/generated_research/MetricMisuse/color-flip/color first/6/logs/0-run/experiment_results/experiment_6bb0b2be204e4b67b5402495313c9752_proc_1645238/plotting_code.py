@@ -1,0 +1,4 @@
+import matplotlib.pyplot as plt
+import numpy as np
+
+We will load experiment_data.npy, safely extract the saved losses and validation metrics, and produce up-to-date visualizations inside the working directory. Four figures will be created: the overall training/validation loss curve, and three separate curves for CWA, SWA, and EWA validation metrics across epochs. Each figure is generated inside its own try-except block, is titled clearly (e.g. “SPR_BENCH – CWA over Epochs”), and saved with a descriptive file name that contains the dataset name and plot type. After plotting, we compute and print a simple test accuracy from the stored predictions/ground-truth lists (weight-based scores can’t be recomputed because raw sequences weren’t saved). All figures are closed explicitly to avoid memory leaks, and only matplotlib’s basic interface is used. At most five figures are produced, satisfying the interval guideline.

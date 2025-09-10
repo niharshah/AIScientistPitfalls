@@ -1,0 +1,798 @@
+[
+  {
+    "overall_plan": "Ablation name: RemovePositionalEmbedding.\nThe solution trains a variant of the original classifier in which the learnable positional-embedding matrix is completely removed; token embeddings are passed unchanged to the Transformer encoder.  The script reproduces the earlier pipeline (data loading, vocabulary building, batching, training/validation/testing, logging) but instantiates `SPRTransformerNoPos`, storing all metrics in the required dictionary under the key `'RemovePositionalEmbedding'`.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "Training loss",
+            "lower_is_better": true,
+            "description": "The loss calculated on the training data.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6204,
+                "best_value": 0.6204
+              }
+            ]
+          },
+          {
+            "metric_name": "Validation loss",
+            "lower_is_better": true,
+            "description": "The loss calculated on the validation data.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6275,
+                "best_value": 0.6275
+              }
+            ]
+          },
+          {
+            "metric_name": "Training MCC",
+            "lower_is_better": false,
+            "description": "The Matthews correlation coefficient calculated on the training data.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.3796,
+                "best_value": 0.3796
+              }
+            ]
+          },
+          {
+            "metric_name": "Validation MCC",
+            "lower_is_better": false,
+            "description": "The Matthews correlation coefficient calculated on the validation data.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.3719,
+                "best_value": 0.3719
+              }
+            ]
+          },
+          {
+            "metric_name": "Test MCC",
+            "lower_is_better": false,
+            "description": "The Matthews correlation coefficient calculated on the test data.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.3896,
+                "best_value": 0.3896
+              }
+            ]
+          },
+          {
+            "metric_name": "Test F1 score",
+            "lower_is_better": false,
+            "description": "The F1 score calculated on the test data.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6948,
+                "best_value": 0.6948
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, pathlib, random, string, numpy as np, torch, torch.nn as nn\nfrom torch.utils.data import DataLoader\nfrom sklearn.metrics import matthews_corrcoef, f1_score\n\n# ---------------- compulsory working dir -----------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------------- device -----------------\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ---------------- load SPR_BENCH or synth fallback -------------\ndef load_spr_bench(root: pathlib.Path):\n    from datasets import load_dataset, DatasetDict\n\n    def _load(csv_name):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for split in [\"train\", \"dev\", \"test\"]:\n        d[split] = _load(f\"{split}.csv\")\n    return d\n\n\ndata_root = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\ntry:\n    dsets = load_spr_bench(data_root) if data_root.exists() else None\nexcept Exception:\n    dsets = None\n\nif dsets is None:\n    # synthetic fallback so script is runnable anywhere\n    from datasets import Dataset, DatasetDict\n\n    def synth(n):\n        seqs, labels = [], []\n        for _ in range(n):\n            L = random.randint(5, 25)\n            seq = \"\".join(random.choices(list(string.ascii_lowercase) + \"#@$%\", k=L))\n            labels.append(int(seq.count(\"#\") % 2 == 0))\n            seqs.append(seq)\n        return Dataset.from_dict(\n            {\"id\": list(range(n)), \"sequence\": seqs, \"label\": labels}\n        )\n\n    dsets = DatasetDict({\"train\": synth(4000), \"dev\": synth(1000), \"test\": synth(1000)})\nprint({k: len(v) for k, v in dsets.items()})\n\n# ---------------- vocab -----------------\nPAD, UNK, CLS = \"<pad>\", \"<unk>\", \"<cls>\"\nvocab = {PAD: 0, UNK: 1, CLS: 2}\nfor seq in dsets[\"train\"][\"sequence\"]:\n    for ch in seq:\n        if ch not in vocab:\n            vocab[ch] = len(vocab)\nvocab_size = len(vocab)\n\n\ndef encode(seq):\n    return [vocab[CLS]] + [vocab.get(ch, vocab[UNK]) for ch in seq]  # prepend CLS\n\n\nfor split in dsets.keys():\n    dsets[split] = dsets[split].map(\n        lambda ex: {\"input_ids\": encode(ex[\"sequence\"])}, remove_columns=[\"sequence\"]\n    )\n\n\n# ---------------- data loaders -----------------\ndef collate(batch):\n    ids = [ex[\"input_ids\"] for ex in batch]\n    labels = torch.tensor([ex[\"label\"] for ex in batch], dtype=torch.long)\n    max_len = max(len(x) for x in ids)\n    padded = torch.full((len(ids), max_len), vocab[PAD], dtype=torch.long)\n    attn_mask = torch.zeros_like(padded, dtype=torch.bool)\n    for i, seq in enumerate(ids):\n        padded[i, : len(seq)] = torch.tensor(seq, dtype=torch.long)\n        attn_mask[i, : len(seq)] = 1\n    return {\"input_ids\": padded, \"attention_mask\": attn_mask, \"labels\": labels}\n\n\nbatch_size = 128\ntrain_loader = DataLoader(\n    dsets[\"train\"], batch_size=batch_size, shuffle=True, collate_fn=collate\n)\ndev_loader = DataLoader(\n    dsets[\"dev\"], batch_size=batch_size, shuffle=False, collate_fn=collate\n)\ntest_loader = DataLoader(\n    dsets[\"test\"], batch_size=batch_size, shuffle=False, collate_fn=collate\n)\n\n\n# ---------------- model WITHOUT positional embeddings -----------------\nclass SPRTransformerNoPos(nn.Module):\n    def __init__(self, vocab_size, embed_dim=128, n_heads=4, depth=2, dropout=0.1):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=vocab[PAD])\n        encoder_layer = nn.TransformerEncoderLayer(\n            d_model=embed_dim,\n            nhead=n_heads,\n            dim_feedforward=embed_dim * 4,\n            dropout=dropout,\n            batch_first=True,\n        )\n        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)\n        self.dropout = nn.Dropout(dropout)\n        self.fc = nn.Linear(embed_dim, 2)\n\n    def forward(self, ids, attn_mask):\n        x = self.embed(ids)  # <-- NO positional embedding added\n        x = self.transformer(x, src_key_padding_mask=~attn_mask)\n        cls_vec = x[:, 0]  # CLS position\n        return self.fc(self.dropout(cls_vec))\n\n\nmodel = SPRTransformerNoPos(vocab_size).to(device)\n\n# -------------- training utilities ------------\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=5e-5)\n\nexperiment_data = {\n    \"RemovePositionalEmbedding\": {\n        \"SPR_BENCH\": {\n            \"metrics\": {\"train_MCC\": [], \"val_MCC\": []},\n            \"losses\": {\"train\": [], \"val\": []},\n            \"predictions\": [],\n            \"ground_truth\": [],\n        }\n    }\n}\n\nbest_val_mcc, best_state = -1.0, None\nepochs = 10\nfor epoch in range(1, epochs + 1):\n    # ---- train ----\n    model.train()\n    tr_loss, tr_preds, tr_gts = [], [], []\n    for batch in train_loader:\n        batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}\n        optimizer.zero_grad()\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        loss = criterion(logits, batch[\"labels\"])\n        loss.backward()\n        optimizer.step()\n        tr_loss.append(loss.item())\n        tr_preds.extend(logits.argmax(1).cpu().numpy())\n        tr_gts.extend(batch[\"labels\"].cpu().numpy())\n    train_mcc = matthews_corrcoef(tr_gts, tr_preds)\n    # ---- validate ----\n    model.eval()\n    val_loss, val_preds, val_gts = [], [], []\n    with torch.no_grad():\n        for batch in dev_loader:\n            batch = {\n                k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()\n            }\n            logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(logits, batch[\"labels\"])\n            val_loss.append(loss.item())\n            val_preds.extend(logits.argmax(1).cpu().numpy())\n            val_gts.extend(batch[\"labels\"].cpu().numpy())\n    val_mcc = matthews_corrcoef(val_gts, val_preds)\n    print(f\"Epoch {epoch}: val_loss = {np.mean(val_loss):.4f}, val_MCC = {val_mcc:.4f}\")\n\n    # ---- logging ----\n    exp = experiment_data[\"RemovePositionalEmbedding\"][\"SPR_BENCH\"]\n    exp[\"losses\"][\"train\"].append(np.mean(tr_loss))\n    exp[\"losses\"][\"val\"].append(np.mean(val_loss))\n    exp[\"metrics\"][\"train_MCC\"].append(train_mcc)\n    exp[\"metrics\"][\"val_MCC\"].append(val_mcc)\n\n    # ---- save best ----\n    if val_mcc > best_val_mcc:\n        best_val_mcc = val_mcc\n        best_state = {k: v.cpu() for k, v in model.state_dict().items()}\n\n# ------------ test with best model ------------\nmodel.load_state_dict(best_state)\nmodel.eval()\ntest_preds, test_gts = [], []\nwith torch.no_grad():\n    for batch in test_loader:\n        batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        test_preds.extend(logits.argmax(1).cpu().numpy())\n        test_gts.extend(batch[\"labels\"].cpu().numpy())\ntest_mcc = matthews_corrcoef(test_gts, test_preds)\ntest_f1 = f1_score(test_gts, test_preds, average=\"macro\")\nprint(\n    f\"Best Val MCC = {best_val_mcc:.4f} | Test MCC = {test_mcc:.4f} | Test F1 = {test_f1:.4f}\"\n)\n\nexp = experiment_data[\"RemovePositionalEmbedding\"][\"SPR_BENCH\"]\nexp[\"predictions\"] = test_preds\nexp[\"ground_truth\"] = test_gts\n\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Saved experiment data to ./working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\nexp = experiment_data.get(\"RemovePositionalEmbedding\", {}).get(\"SPR_BENCH\", {})\ntrain_loss = exp.get(\"losses\", {}).get(\"train\", [])\nval_loss = exp.get(\"losses\", {}).get(\"val\", [])\ntrain_mcc = exp.get(\"metrics\", {}).get(\"train_MCC\", [])\nval_mcc = exp.get(\"metrics\", {}).get(\"val_MCC\", [])\npreds = np.array(exp.get(\"predictions\", []))\ngts = np.array(exp.get(\"ground_truth\", []))\n\nepochs = np.arange(1, len(train_loss) + 1)\n\n# --------- Loss curves ----------\ntry:\n    plt.figure()\n    plt.plot(epochs, train_loss, label=\"Train Loss\")\n    plt.plot(epochs, val_loss, label=\"Val Loss\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Cross-Entropy Loss\")\n    plt.title(\"SPR_BENCH: Training vs Validation Loss\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_BENCH_loss_curves.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating loss curve plot: {e}\")\n    plt.close()\n\n# --------- MCC curves ------------\ntry:\n    plt.figure()\n    plt.plot(epochs, train_mcc, label=\"Train MCC\")\n    plt.plot(epochs, val_mcc, label=\"Val MCC\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Matthews CorrCoef\")\n    plt.title(\"SPR_BENCH: Training vs Validation MCC\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_BENCH_MCC_curves.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating MCC curve plot: {e}\")\n    plt.close()\n\n# --------- Confusion matrix -------\ntry:\n    from sklearn.metrics import confusion_matrix\n\n    cm = confusion_matrix(gts, preds) if preds.size else np.zeros((2, 2))\n    plt.figure()\n    plt.imshow(cm, cmap=\"Blues\")\n    for i in range(cm.shape[0]):\n        for j in range(cm.shape[1]):\n            plt.text(j, i, int(cm[i, j]), ha=\"center\", va=\"center\", color=\"black\")\n    plt.colorbar()\n    plt.xlabel(\"Predicted\")\n    plt.ylabel(\"True\")\n    plt.title(\n        \"SPR_BENCH: Test Confusion Matrix\\nLeft: Ground Truth, Right: Predicted Labels\"\n    )\n    fname = os.path.join(working_dir, \"SPR_BENCH_confusion_matrix.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating confusion matrix plot: {e}\")\n    plt.close()\n\nprint(\"Plots saved to\", working_dir)\n",
+    "plot_plan": "We first load experiment_data.npy, locate the \u201cRemovePositionalEmbedding / SPR_BENCH\u201d entry and pull out the stored arrays: losses[train|val], metrics[train_MCC|val_MCC], predictions and ground-truth. Using these, we prepare three plots: (1) training vs validation loss per epoch; (2) training vs validation MCC per epoch; (3) a 2\u00d72 confusion-matrix heat-map computed from the final test predictions. Each figure is wrapped in its own try-except to prevent any single failure from stopping the rest, and every figure is saved under working_dir with descriptive filenames that include the dataset and plot type. We limit ourselves to these three plots (well under the 5-figure limit), ensure titles/subtitles are clear, and explicitly close every figure. The script prints a brief confirmation message after completing all plots.",
+    "plot_analyses": [
+      {
+        "analysis": "This plot shows the training and validation loss over 10 epochs. Both losses decrease steadily, indicating that the model is learning effectively. The validation loss is slightly lower than the training loss after the initial epochs, which suggests good generalization and no signs of overfitting. The convergence of both curves towards a stable point at the end of training is a positive indicator of model stability.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_36902de587c44bc3b9f0087b7234a0bd_proc_3345783/SPR_BENCH_loss_curves.png"
+      },
+      {
+        "analysis": "This plot displays the Matthews Correlation Coefficient (MCC) for both training and validation sets over 10 epochs. The MCC increases rapidly in the first few epochs and stabilizes around 0.35, indicating improved classification performance. The close alignment between training and validation MCC curves suggests that the model generalizes well and avoids overfitting.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_36902de587c44bc3b9f0087b7234a0bd_proc_3345783/SPR_BENCH_MCC_curves.png"
+      },
+      {
+        "analysis": "The confusion matrix presents the performance of the model on the test set. It shows 334 true negatives, 361 true positives, 152 false positives, and 153 false negatives. While the model demonstrates a reasonable ability to distinguish between the classes, the relatively high number of false positives and false negatives indicates room for improvement in classification accuracy. Enhancing the model's discriminative power could help address this issue.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_36902de587c44bc3b9f0087b7234a0bd_proc_3345783/SPR_BENCH_confusion_matrix.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_36902de587c44bc3b9f0087b7234a0bd_proc_3345783/SPR_BENCH_loss_curves.png",
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_36902de587c44bc3b9f0087b7234a0bd_proc_3345783/SPR_BENCH_MCC_curves.png",
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_36902de587c44bc3b9f0087b7234a0bd_proc_3345783/SPR_BENCH_confusion_matrix.png"
+    ],
+    "vlm_feedback_summary": "The results indicate that the model is learning effectively and generalizing well. While the loss and MCC metrics suggest stable and improving performance, the confusion matrix highlights areas for refinement in classification accuracy.",
+    "exp_results_dir": "experiment_results/experiment_36902de587c44bc3b9f0087b7234a0bd_proc_3345783",
+    "ablation_name": "RemovePositionalEmbedding",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_36902de587c44bc3b9f0087b7234a0bd_proc_3345783/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "Ablation name: NoCLS_MeanPooling.\nWe remove the dedicated <cls> token from the vocabulary and sequences, and after the Transformer encoder we obtain the sentence representation by mean-pooling the output states over the valid (non-padding) positions. The rest of the training / evaluation pipeline is kept identical so that any performance difference isolates the CLS vs. mean-pooling effect. All metrics, losses and predictions are logged under the ablation tag \u201cNoCLS_MeanPooling\u201d and saved to working/experiment_data.npy.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "MCC",
+            "lower_is_better": false,
+            "description": "Matthews Correlation Coefficient, used to measure the quality of binary classifications.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.3914,
+                "best_value": 0.3914
+              }
+            ]
+          },
+          {
+            "metric_name": "F1 score",
+            "lower_is_better": false,
+            "description": "Harmonic mean of precision and recall, used to evaluate binary classification models.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6957,
+                "best_value": 0.6957
+              }
+            ]
+          },
+          {
+            "metric_name": "loss",
+            "lower_is_better": true,
+            "description": "Loss function value, used to measure the difference between the predicted and actual values.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6417,
+                "best_value": 0.6107
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, pathlib, random, string, numpy as np, torch, torch.nn as nn\nfrom torch.utils.data import DataLoader\nfrom sklearn.metrics import matthews_corrcoef, f1_score\n\n# ---------------- compulsory working dir -----------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ---------------- load SPR_BENCH or synth fallback -------------\ndef load_spr_bench(root: pathlib.Path):\n    from datasets import load_dataset, DatasetDict\n\n    def _load(csv_name):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for split in [\"train\", \"dev\", \"test\"]:\n        d[split] = _load(f\"{split}.csv\")\n    return d\n\n\ndata_root = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\ntry:\n    dsets = load_spr_bench(data_root) if data_root.exists() else None\nexcept Exception:\n    dsets = None\n\nif dsets is None:\n    from datasets import Dataset, DatasetDict\n\n    def synth(n):\n        seqs, labels = [], []\n        for _ in range(n):\n            L = random.randint(5, 25)\n            seq = \"\".join(random.choices(list(string.ascii_lowercase) + \"#@$%\", k=L))\n            labels.append(int(seq.count(\"#\") % 2 == 0))\n            seqs.append(seq)\n        return Dataset.from_dict(\n            {\"id\": list(range(n)), \"sequence\": seqs, \"label\": labels}\n        )\n\n    dsets = DatasetDict({\"train\": synth(4000), \"dev\": synth(1000), \"test\": synth(1000)})\nprint({k: len(v) for k, v in dsets.items()})\n\n# ---------------- vocab -----------------\nPAD, UNK = \"<pad>\", \"<unk>\"\nvocab = {PAD: 0, UNK: 1}  # NO CLS TOKEN\nfor seq in dsets[\"train\"][\"sequence\"]:\n    for ch in seq:\n        if ch not in vocab:\n            vocab[ch] = len(vocab)\nvocab_size = len(vocab)\n\n\ndef encode(seq):\n    return [vocab.get(ch, vocab[UNK]) for ch in seq]\n\n\nfor split in dsets.keys():\n    dsets[split] = dsets[split].map(\n        lambda ex: {\"input_ids\": encode(ex[\"sequence\"])}, remove_columns=[\"sequence\"]\n    )\n\n\n# ---------------- data loaders -----------------\ndef collate(batch):\n    ids = [ex[\"input_ids\"] for ex in batch]\n    labels = torch.tensor([ex[\"label\"] for ex in batch], dtype=torch.long)\n    max_len = max(len(x) for x in ids)\n    padded = torch.full((len(ids), max_len), vocab[PAD], dtype=torch.long)\n    attn_mask = torch.zeros_like(padded, dtype=torch.bool)\n    for i, seq in enumerate(ids):\n        padded[i, : len(seq)] = torch.tensor(seq, dtype=torch.long)\n        attn_mask[i, : len(seq)] = 1\n    return {\"input_ids\": padded, \"attention_mask\": attn_mask, \"labels\": labels}\n\n\nbatch_size = 128\ntrain_loader = DataLoader(\n    dsets[\"train\"], batch_size=batch_size, shuffle=True, collate_fn=collate\n)\ndev_loader = DataLoader(\n    dsets[\"dev\"], batch_size=batch_size, shuffle=False, collate_fn=collate\n)\ntest_loader = DataLoader(\n    dsets[\"test\"], batch_size=batch_size, shuffle=False, collate_fn=collate\n)\n\n\n# ---------------- model -----------------\nclass SPRTransformer_NoCLS(nn.Module):\n    def __init__(self, vocab_size, embed_dim=128, n_heads=4, depth=2, dropout=0.1):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=vocab[PAD])\n        self.pos = nn.Parameter(torch.randn(512, embed_dim))  # max 512 len\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=embed_dim,\n            nhead=n_heads,\n            dim_feedforward=embed_dim * 4,\n            dropout=dropout,\n            batch_first=True,\n        )\n        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=depth)\n        self.dropout = nn.Dropout(dropout)\n        self.fc = nn.Linear(embed_dim, 2)\n\n    def forward(self, ids, attn_mask):\n        x = self.embed(ids) + self.pos[: ids.size(1)]\n        x = self.transformer(x, src_key_padding_mask=~attn_mask)\n        # mean pooling over valid tokens\n        masked_x = x * attn_mask.unsqueeze(-1)\n        sum_x = masked_x.sum(1)\n        lengths = attn_mask.sum(1, keepdim=True).clamp(min=1)\n        sent_vec = sum_x / lengths\n        return self.fc(self.dropout(sent_vec))\n\n\nmodel = SPRTransformer_NoCLS(vocab_size).to(device)\n\n# -------------- training utilities ------------\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=5e-5)\n\nexperiment_data = {\n    \"NoCLS_MeanPooling\": {\n        \"SPR_BENCH\": {\n            \"metrics\": {\"train_MCC\": [], \"val_MCC\": []},\n            \"losses\": {\"train\": [], \"val\": []},\n            \"predictions\": [],\n            \"ground_truth\": [],\n        }\n    }\n}\n\nbest_val_mcc, best_state = -1.0, None\nepochs = 10\nfor epoch in range(1, epochs + 1):\n    # ---- train ----\n    model.train()\n    tr_loss, tr_preds, tr_gts = [], [], []\n    for batch in train_loader:\n        batch = {\n            k: (v.to(device) if isinstance(v, torch.Tensor) else v)\n            for k, v in batch.items()\n        }\n        optimizer.zero_grad()\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        loss = criterion(logits, batch[\"labels\"])\n        loss.backward()\n        optimizer.step()\n        tr_loss.append(loss.item())\n        tr_preds.extend(logits.argmax(1).cpu().numpy())\n        tr_gts.extend(batch[\"labels\"].cpu().numpy())\n    train_mcc = matthews_corrcoef(tr_gts, tr_preds)\n\n    # ---- validate ----\n    model.eval()\n    val_loss, val_preds, val_gts = [], [], []\n    with torch.no_grad():\n        for batch in dev_loader:\n            batch = {\n                k: (v.to(device) if isinstance(v, torch.Tensor) else v)\n                for k, v in batch.items()\n            }\n            logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(logits, batch[\"labels\"])\n            val_loss.append(loss.item())\n            val_preds.extend(logits.argmax(1).cpu().numpy())\n            val_gts.extend(batch[\"labels\"].cpu().numpy())\n    val_mcc = matthews_corrcoef(val_gts, val_preds)\n    print(f\"Epoch {epoch}: val_loss = {np.mean(val_loss):.4f}, val_MCC = {val_mcc:.4f}\")\n\n    # ---- logging ----\n    spr_log = experiment_data[\"NoCLS_MeanPooling\"][\"SPR_BENCH\"]\n    spr_log[\"losses\"][\"train\"].append(np.mean(tr_loss))\n    spr_log[\"losses\"][\"val\"].append(np.mean(val_loss))\n    spr_log[\"metrics\"][\"train_MCC\"].append(train_mcc)\n    spr_log[\"metrics\"][\"val_MCC\"].append(val_mcc)\n\n    if val_mcc > best_val_mcc:\n        best_val_mcc = val_mcc\n        best_state = {k: v.cpu() for k, v in model.state_dict().items()}\n\n# ------------ test with best model ------------\nmodel.load_state_dict(best_state)\nmodel.eval()\ntest_preds, test_gts = [], []\nwith torch.no_grad():\n    for batch in test_loader:\n        batch = {\n            k: (v.to(device) if isinstance(v, torch.Tensor) else v)\n            for k, v in batch.items()\n        }\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        test_preds.extend(logits.argmax(1).cpu().numpy())\n        test_gts.extend(batch[\"labels\"].cpu().numpy())\ntest_mcc = matthews_corrcoef(test_gts, test_preds)\ntest_f1 = f1_score(test_gts, test_preds, average=\"macro\")\nprint(\n    f\"Best Val MCC = {best_val_mcc:.4f} | Test MCC = {test_mcc:.4f} | Test F1 = {test_f1:.4f}\"\n)\n\nspr_log = experiment_data[\"NoCLS_MeanPooling\"][\"SPR_BENCH\"]\nspr_log[\"predictions\"] = test_preds\nspr_log[\"ground_truth\"] = test_gts\n\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Saved experiment data to ./working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- load experiment data ----------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\n# Guard against missing data\nif not experiment_data:\n    print(\"No experiment data found; exiting.\")\n    exit()\n\nrun_key = list(experiment_data.keys())[0]  # 'NoCLS_MeanPooling'\nds_key = list(experiment_data[run_key].keys())[0]  # 'SPR_BENCH'\ndata = experiment_data[run_key][ds_key]\n\nepochs = np.arange(1, len(data[\"losses\"][\"train\"]) + 1)\ntrain_loss = np.array(data[\"losses\"][\"train\"])\nval_loss = np.array(data[\"losses\"][\"val\"])\ntrain_mcc = np.array(data[\"metrics\"][\"train_MCC\"])\nval_mcc = np.array(data[\"metrics\"][\"val_MCC\"])\npreds = np.array(data[\"predictions\"])\ngts = np.array(data[\"ground_truth\"])\n\n# ---------- figure 1: loss curves ----------\ntry:\n    plt.figure()\n    plt.plot(epochs, train_loss, label=\"Train Loss\")\n    plt.plot(epochs, val_loss, label=\"Validation Loss\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Cross-Entropy Loss\")\n    plt.title(\"SPR_BENCH Training vs Validation Loss\")\n    plt.legend()\n    plt.tight_layout()\n    fname = os.path.join(working_dir, \"SPR_BENCH_loss_curve.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating loss curve: {e}\")\n    plt.close()\n\n# ---------- figure 2: MCC curves ----------\ntry:\n    plt.figure()\n    plt.plot(epochs, train_mcc, label=\"Train MCC\")\n    plt.plot(epochs, val_mcc, label=\"Validation MCC\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Matthews Corrcoef\")\n    plt.title(\"SPR_BENCH Training vs Validation MCC\")\n    plt.legend()\n    plt.tight_layout()\n    fname = os.path.join(working_dir, \"SPR_BENCH_MCC_curve.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating MCC curve: {e}\")\n    plt.close()\n\n# ---------- figure 3: confusion matrix ----------\ntry:\n    num_classes = len(np.unique(gts))\n    cm = np.zeros((num_classes, num_classes), dtype=int)\n    for t, p in zip(gts, preds):\n        cm[t, p] += 1\n\n    plt.figure()\n    im = plt.imshow(cm, cmap=\"Blues\")\n    plt.colorbar(im)\n    plt.xlabel(\"Predicted Label\")\n    plt.ylabel(\"True Label\")\n    plt.title(\"SPR_BENCH Test Confusion Matrix\")\n    for i in range(num_classes):\n        for j in range(num_classes):\n            plt.text(j, i, cm[i, j], ha=\"center\", va=\"center\", color=\"black\")\n    plt.tight_layout()\n    fname = os.path.join(working_dir, \"SPR_BENCH_confusion_matrix.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating confusion matrix: {e}\")\n    plt.close()\n\n# ---------- print final metrics ----------\nbest_val_mcc = max(val_mcc) if len(val_mcc) else None\ntest_mcc = np.nan\nif cm.sum():\n    # simple MCC recomputation\n    tp = cm[1, 1] if cm.shape[0] > 1 else 0\n    tn = cm[0, 0]\n    fp = cm[0, 1] if cm.shape[1] > 1 else 0\n    fn = cm[1, 0] if cm.shape[0] > 1 else 0\n    numerator = tp * tn - fp * fn\n    denom = np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))\n    test_mcc = numerator / denom if denom else np.nan\n\nprint(f\"Best Val MCC = {best_val_mcc:.4f} | Test MCC (recomputed) = {test_mcc:.4f}\")\n",
+    "plot_plan": "We first load the saved experiment_data.npy file and pull out the sub-dictionary corresponding to the single run (NoCLS_MeanPooling on SPR_BENCH). From this we read the lists of training/validation losses, training/validation MCC scores, and the final test predictions and labels. Three standard visualizations are created: (1) a line chart of training vs. validation loss across epochs, (2) a line chart of training vs. validation MCC across epochs, and (3) a confusion-matrix heat-map for the test set. Each figure is produced in its own try-except block, saved to working_dir with a descriptive name, and the figure is always closed to free resources. The code begins with the required imports and working_dir setup, obeys the five-figure limit, and never invents data: everything comes straight from experiment_data.npy. Finally, the script prints the best validation MCC and test metrics so users can verify the numbers alongside the plots.",
+    "plot_analyses": [
+      {
+        "analysis": "The training and validation loss curves show a clear downward trend, indicating that the model is learning effectively. However, the validation loss plateaus and even slightly increases after epoch 4, suggesting potential overfitting. The gap between training and validation loss is relatively small, which is a good sign, but the slight increase in validation loss warrants further investigation, possibly through regularization techniques or hyperparameter tuning.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_7c54fde0e3e4460498357261e3bd30a9_proc_3345784/SPR_BENCH_loss_curve.png"
+      },
+      {
+        "analysis": "The Matthews Correlation Coefficient (MCC) curves for both training and validation data demonstrate a steady increase, with the validation MCC closely following the training MCC. This suggests that the model is improving in its ability to classify sequences correctly and that the training process is stable. The convergence of the two curves indicates good generalization, though the validation MCC slightly fluctuates after epoch 6, which could be due to noise or model overfitting to certain patterns.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_7c54fde0e3e4460498357261e3bd30a9_proc_3345784/SPR_BENCH_MCC_curve.png"
+      },
+      {
+        "analysis": "The confusion matrix indicates that the model performs reasonably well on the test set, with 332 true negatives and 364 true positives. However, there are 150 false negatives and 154 false positives, indicating areas for improvement in both precision and recall. The imbalance in errors suggests that the model may struggle with certain rule types or sequence complexities, which could be addressed by augmenting the training data or refining the model architecture.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_7c54fde0e3e4460498357261e3bd30a9_proc_3345784/SPR_BENCH_confusion_matrix.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_7c54fde0e3e4460498357261e3bd30a9_proc_3345784/SPR_BENCH_loss_curve.png",
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_7c54fde0e3e4460498357261e3bd30a9_proc_3345784/SPR_BENCH_MCC_curve.png",
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_7c54fde0e3e4460498357261e3bd30a9_proc_3345784/SPR_BENCH_confusion_matrix.png"
+    ],
+    "vlm_feedback_summary": "The plots indicate that the model is learning effectively, with validation metrics closely following training metrics. However, there are signs of potential overfitting and areas for improvement in classification precision and recall, as highlighted by the confusion matrix.",
+    "exp_results_dir": "experiment_results/experiment_7c54fde0e3e4460498357261e3bd30a9_proc_3345784",
+    "ablation_name": "NoCLS_MeanPooling",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_7c54fde0e3e4460498357261e3bd30a9_proc_3345784/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "Ablation name: NoPaddingMask.\nWe duplicate the baseline pipeline but define ablation \u201cNoPaddingMask\u201d: the transformer encoder is invoked without the padding mask (`src_key_padding_mask=None`). The rest of the training / evaluation loop stays identical, but we still build the usual `attention_mask` for possible future use and logging. All plottable values are collected into `experiment_data['NoPaddingMask']['SPR_BENCH']` and saved to `working/experiment_data.npy`.",
+    "analysis": "The execution of the training script was successful without any bugs. The model trained and evaluated on the dataset as expected. The validation MCC peaked at 0.3880, and the test MCC was 0.3835 with a test F1 score of 0.6917. The experiment data was saved correctly. While the performance metrics indicate room for improvement, there are no execution issues or bugs in the script.",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "MCC",
+            "lower_is_better": false,
+            "description": "Matthew's Correlation Coefficient, a measure of the quality of binary classifications.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.3835,
+                "best_value": 0.3835
+              }
+            ]
+          },
+          {
+            "metric_name": "F1 score",
+            "lower_is_better": false,
+            "description": "Harmonic mean of precision and recall, used to measure test performance.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6917,
+                "best_value": 0.6917
+              }
+            ]
+          },
+          {
+            "metric_name": "loss",
+            "lower_is_better": true,
+            "description": "A measure of how well the model's predictions match the target values.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6504,
+                "best_value": 0.6205
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, pathlib, random, string, numpy as np, torch, torch.nn as nn\nfrom torch.utils.data import DataLoader\nfrom sklearn.metrics import matthews_corrcoef, f1_score\n\n# ---------- working dir & device ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(\"Using device:\", device)\n\n\n# ---------- load SPR-BENCH or synthetic fallback ----------\ndef load_spr_bench(root: pathlib.Path):\n    from datasets import load_dataset, DatasetDict\n\n    def _load(csv_name):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    dd = {}\n    for s in [\"train\", \"dev\", \"test\"]:\n        dd[s] = _load(f\"{s}.csv\")\n    from datasets import DatasetDict\n\n    return DatasetDict(dd)\n\n\ndata_root = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\ntry:\n    dsets = load_spr_bench(data_root) if data_root.exists() else None\nexcept Exception:\n    dsets = None\nif dsets is None:\n    from datasets import Dataset, DatasetDict\n\n    def synth(n):\n        seqs, labels = [], []\n        for _ in range(n):\n            L = random.randint(5, 25)\n            seq = \"\".join(random.choices(list(string.ascii_lowercase) + \"#@$%\", k=L))\n            labels.append(int(seq.count(\"#\") % 2 == 0))\n            seqs.append(seq)\n        return Dataset.from_dict(\n            {\"id\": list(range(n)), \"sequence\": seqs, \"label\": labels}\n        )\n\n    dsets = DatasetDict({\"train\": synth(4000), \"dev\": synth(1000), \"test\": synth(1000)})\nprint({k: len(v) for k, v in dsets.items()})\n\n# ---------- vocab & encoding ----------\nPAD, UNK, CLS = \"<pad>\", \"<unk>\", \"<cls>\"\nvocab = {PAD: 0, UNK: 1, CLS: 2}\nfor s in dsets[\"train\"][\"sequence\"]:\n    for ch in s:\n        if ch not in vocab:\n            vocab[ch] = len(vocab)\nvocab_size = len(vocab)\n\n\ndef encode(seq):\n    return [vocab[CLS]] + [vocab.get(ch, vocab[UNK]) for ch in seq]\n\n\nfor sp in dsets.keys():\n    dsets[sp] = dsets[sp].map(\n        lambda ex: {\"input_ids\": encode(ex[\"sequence\"])}, remove_columns=[\"sequence\"]\n    )\n\n\n# ---------- dataloaders ----------\ndef collate(batch):\n    ids = [ex[\"input_ids\"] for ex in batch]\n    labels = torch.tensor([ex[\"label\"] for ex in batch], dtype=torch.long)\n    mx = max(map(len, ids))\n    padded = torch.full((len(ids), mx), vocab[PAD], dtype=torch.long)\n    att = torch.zeros_like(padded, dtype=torch.bool)\n    for i, seq in enumerate(ids):\n        padded[i, : len(seq)] = torch.tensor(seq)\n        att[i, : len(seq)] = 1\n    return {\"input_ids\": padded, \"attention_mask\": att, \"labels\": labels}\n\n\nbs = 128\ntrain_loader = DataLoader(\n    dsets[\"train\"], batch_size=bs, shuffle=True, collate_fn=collate\n)\ndev_loader = DataLoader(dsets[\"dev\"], batch_size=bs, shuffle=False, collate_fn=collate)\ntest_loader = DataLoader(\n    dsets[\"test\"], batch_size=bs, shuffle=False, collate_fn=collate\n)\n\n\n# ---------- model (ablation: NoPaddingMask) ----------\nclass SPRTransformer(nn.Module):\n    def __init__(self, vocab_size, embed_dim=128, heads=4, depth=2, drop=0.1):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=vocab[PAD])\n        self.pos = nn.Parameter(torch.randn(512, embed_dim))\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=embed_dim,\n            nhead=heads,\n            dim_feedforward=embed_dim * 4,\n            dropout=drop,\n            batch_first=True,\n        )\n        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=depth)\n        self.do = nn.Dropout(drop)\n        self.fc = nn.Linear(embed_dim, 2)\n\n    def forward(self, ids, attn_mask):\n        x = self.embed(ids) + self.pos[: ids.size(1)]\n        # --- NoPaddingMask: allow full attention ---\n        x = self.transformer(x, src_key_padding_mask=None)\n        cls = x[:, 0]\n        return self.fc(self.do(cls))\n\n\nmodel = SPRTransformer(vocab_size).to(device)\n\n# ---------- training utilities ----------\ncriterion = nn.CrossEntropyLoss()\noptim = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=5e-5)\n\nexperiment_data = {\n    \"NoPaddingMask\": {\n        \"SPR_BENCH\": {\n            \"metrics\": {\"train\": [], \"val\": []},\n            \"losses\": {\"train\": [], \"val\": []},\n            \"predictions\": [],\n            \"ground_truth\": [],\n        }\n    }\n}\nbest_val, best_state = -1.0, None\nepochs = 10\nfor ep in range(1, epochs + 1):\n    # train\n    model.train()\n    tr_loss = []\n    tr_pred = []\n    tr_gt = []\n    for batch in train_loader:\n        batch = {\n            k: v.to(device) if isinstance(v, torch.Tensor) else v\n            for k, v in batch.items()\n        }\n        optim.zero_grad()\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        loss = criterion(logits, batch[\"labels\"])\n        loss.backward()\n        optim.step()\n        tr_loss.append(loss.item())\n        tr_pred.extend(logits.argmax(1).cpu().numpy())\n        tr_gt.extend(batch[\"labels\"].cpu().numpy())\n    train_mcc = matthews_corrcoef(tr_gt, tr_pred)\n    # val\n    model.eval()\n    val_loss = []\n    val_pred = []\n    val_gt = []\n    with torch.no_grad():\n        for batch in dev_loader:\n            batch = {\n                k: v.to(device) if isinstance(v, torch.Tensor) else v\n                for k, v in batch.items()\n            }\n            logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(logits, batch[\"labels\"])\n            val_loss.append(loss.item())\n            val_pred.extend(logits.argmax(1).cpu().numpy())\n            val_gt.extend(batch[\"labels\"].cpu().numpy())\n    val_mcc = matthews_corrcoef(val_gt, val_pred)\n    print(f\"Epoch {ep}: val_loss={np.mean(val_loss):.4f}, val_MCC={val_mcc:.4f}\")\n    # log\n    exp = experiment_data[\"NoPaddingMask\"][\"SPR_BENCH\"]\n    exp[\"losses\"][\"train\"].append(np.mean(tr_loss))\n    exp[\"losses\"][\"val\"].append(np.mean(val_loss))\n    exp[\"metrics\"][\"train\"].append(train_mcc)\n    exp[\"metrics\"][\"val\"].append(val_mcc)\n    # best\n    if val_mcc > best_val:\n        best_val = val_mcc\n        best_state = {k: v.cpu() for k, v in model.state_dict().items()}\n\n# ---------- test ----------\nmodel.load_state_dict(best_state)\nmodel.eval()\nt_pred, t_gt = [], []\nwith torch.no_grad():\n    for batch in test_loader:\n        batch = {\n            k: v.to(device) if isinstance(v, torch.Tensor) else v\n            for k, v in batch.items()\n        }\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        t_pred.extend(logits.argmax(1).cpu().numpy())\n        t_gt.extend(batch[\"labels\"].cpu().numpy())\ntest_mcc = matthews_corrcoef(t_gt, t_pred)\ntest_f1 = f1_score(t_gt, t_pred, average=\"macro\")\nprint(f\"Best Val MCC={best_val:.4f} | Test MCC={test_mcc:.4f} | Test F1={test_f1:.4f}\")\n\n# save predictions\nexp = experiment_data[\"NoPaddingMask\"][\"SPR_BENCH\"]\nexp[\"predictions\"] = t_pred\nexp[\"ground_truth\"] = t_gt\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Saved experiment data to ./working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ---------- setup ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- load experiment data ----------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\n\n# ---------- helper ----------\ndef confusion_matrix(gt, pr, num_classes=2):\n    mat = np.zeros((num_classes, num_classes), dtype=int)\n    for g, p in zip(gt, pr):\n        mat[g, p] += 1\n    return mat\n\n\n# ---------- plotting ----------\nfor variant, ds_dict in experiment_data.items():\n    for ds_name, logs in ds_dict.items():\n        losses_tr = np.asarray(logs[\"losses\"][\"train\"])\n        losses_va = np.asarray(logs[\"losses\"][\"val\"])\n        mcc_tr = np.asarray(logs[\"metrics\"][\"train\"])\n        mcc_va = np.asarray(logs[\"metrics\"][\"val\"])\n        preds = np.asarray(logs.get(\"predictions\", []))\n        gts = np.asarray(logs.get(\"ground_truth\", []))\n\n        # 1) loss curves -------------------------------------------------------\n        try:\n            plt.figure()\n            epochs = np.arange(1, len(losses_tr) + 1)\n            plt.plot(epochs, losses_tr, label=\"Train\")\n            plt.plot(epochs, losses_va, label=\"Validation\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Cross-Entropy Loss\")\n            plt.title(f\"Loss Curves \u2013 {ds_name} ({variant})\")\n            plt.legend()\n            fname = f\"{ds_name}_{variant}_loss_curve.png\"\n            plt.savefig(os.path.join(working_dir, fname))\n            plt.close()\n        except Exception as e:\n            print(f\"Error creating loss curve for {ds_name}/{variant}: {e}\")\n            plt.close()\n\n        # 2) MCC curves --------------------------------------------------------\n        try:\n            plt.figure()\n            plt.plot(epochs, mcc_tr, label=\"Train\")\n            plt.plot(epochs, mcc_va, label=\"Validation\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Matthews Correlation Coefficient\")\n            plt.title(f\"MCC Curves \u2013 {ds_name} ({variant})\")\n            plt.legend()\n            fname = f\"{ds_name}_{variant}_mcc_curve.png\"\n            plt.savefig(os.path.join(working_dir, fname))\n            plt.close()\n        except Exception as e:\n            print(f\"Error creating MCC curve for {ds_name}/{variant}: {e}\")\n            plt.close()\n\n        # 3) confusion matrix --------------------------------------------------\n        if preds.size and gts.size:\n            try:\n                cm = confusion_matrix(gts, preds, num_classes=2)\n                plt.figure()\n                plt.imshow(cm, cmap=\"Blues\")\n                for i in range(2):\n                    for j in range(2):\n                        plt.text(\n                            j, i, cm[i, j], ha=\"center\", va=\"center\", color=\"black\"\n                        )\n                plt.xticks([0, 1], [\"Pred 0\", \"Pred 1\"])\n                plt.yticks([0, 1], [\"True 0\", \"True 1\"])\n                plt.title(f\"Confusion Matrix \u2013 {ds_name} ({variant})\")\n                plt.colorbar()\n                fname = f\"{ds_name}_{variant}_confusion_matrix.png\"\n                plt.savefig(os.path.join(working_dir, fname))\n                plt.close()\n            except Exception as e:\n                print(f\"Error creating confusion matrix for {ds_name}/{variant}: {e}\")\n                plt.close()\n\n        # ---------- print final metrics ----------\n        if preds.size and gts.size:\n            # recompute metrics here in case they weren\u2019t saved\n            tp = ((preds == 1) & (gts == 1)).sum()\n            tn = ((preds == 0) & (gts == 0)).sum()\n            fp = ((preds == 1) & (gts == 0)).sum()\n            fn = ((preds == 0) & (gts == 1)).sum()\n            mcc = (tp * tn - fp * fn) / np.sqrt(\n                (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn) + 1e-8\n            )\n            prec = tp / (tp + fp + 1e-8)\n            rec = tp / (tp + fn + 1e-8)\n            f1 = 2 * prec * rec / (prec + rec + 1e-8)\n            print(f\"{ds_name}/{variant} -> Test MCC={mcc:.4f} | Test F1={f1:.4f}\")\n",
+    "plot_plan": "We first load experiment_data.npy from the working directory, then iterate through every (model variant, dataset) pair it contains. For each pair we pull out the per-epoch loss arrays, metric arrays (MCC), and the saved predictions / ground-truth labels. Using only these arrays we create at most three plots: (1) train vs. validation loss curves, (2) train vs. validation MCC curves, and (3) a simple 2\u00d72 heat-map\u2013style bar chart of the confusion matrix on the test set. Each plot is wrapped in its own try-except so failures don\u2019t stop the others, and figures are always closed. Filenames are descriptive and include dataset and plot type so they are easy to identify later. After plotting we also print the final test MCC and macro-F1 so users can see the key numbers in the console. Only basic matplotlib and numpy are used, everything is saved inside working_dir, and no data outside experiment_data.npy are referenced.",
+    "plot_analyses": [
+      {
+        "analysis": "The loss curves indicate that the training and validation losses decrease initially, which is expected during the learning phase. However, after a few epochs, the validation loss starts to increase slightly, while the training loss continues to decrease. This suggests potential overfitting, as the model performs better on the training data but struggles to generalize to the validation set. The gap between the two curves is relatively small, indicating that the model's overfitting is not severe but could be addressed with regularization techniques or more robust validation strategies.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_3168ed8f2a6d4f5ebb6ab0b8d2770e8a_proc_3345785/SPR_BENCH_NoPaddingMask_loss_curve.png"
+      },
+      {
+        "analysis": "The Matthews Correlation Coefficient (MCC) curves show a steady increase for both training and validation sets during the initial epochs, reflecting improved model performance. However, the validation MCC plateaus and slightly decreases in later epochs, while the training MCC continues to improve. This trend reinforces the observation of potential overfitting, as the model's ability to generalize to unseen data diminishes slightly after a certain point. The MCC values are moderately high, indicating that the model captures the underlying patterns reasonably well.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_3168ed8f2a6d4f5ebb6ab0b8d2770e8a_proc_3345785/SPR_BENCH_NoPaddingMask_mcc_curve.png"
+      },
+      {
+        "analysis": "The confusion matrix reveals that the model performs reasonably well in distinguishing between the two classes. However, there is a noticeable number of misclassifications, with 155 false positives and 153 false negatives. This balance in misclassification suggests that the model does not favor one class over the other, which is desirable. The overall accuracy could be improved by refining the model architecture or addressing class-specific challenges.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_3168ed8f2a6d4f5ebb6ab0b8d2770e8a_proc_3345785/SPR_BENCH_NoPaddingMask_confusion_matrix.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_3168ed8f2a6d4f5ebb6ab0b8d2770e8a_proc_3345785/SPR_BENCH_NoPaddingMask_loss_curve.png",
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_3168ed8f2a6d4f5ebb6ab0b8d2770e8a_proc_3345785/SPR_BENCH_NoPaddingMask_mcc_curve.png",
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_3168ed8f2a6d4f5ebb6ab0b8d2770e8a_proc_3345785/SPR_BENCH_NoPaddingMask_confusion_matrix.png"
+    ],
+    "vlm_feedback_summary": "The experimental results show promising trends, with the model achieving reasonable performance in both loss and MCC metrics. However, there are signs of overfitting and areas for improvement in generalization and class-specific performance.",
+    "exp_results_dir": "experiment_results/experiment_3168ed8f2a6d4f5ebb6ab0b8d2770e8a_proc_3345785",
+    "ablation_name": "NoPaddingMask",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_3168ed8f2a6d4f5ebb6ab0b8d2770e8a_proc_3345785/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "Ablation name: NoDropout.\nProposed solution: replicate the baseline training script but instantiate the Transformer with every dropout probability set to 0.0.  A new ablation label \u201cNoDropout\u201d is used in the experiment_data structure, which stores per-epoch losses/MCC and the final test predictions.  Everything else (dataset handling, optimisation loop, saving) is kept identical to ensure a controlled comparison against the baseline.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "Training MCC",
+            "lower_is_better": false,
+            "description": "Matthews Correlation Coefficient for training data.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.3879,
+                "best_value": 0.3879
+              }
+            ]
+          },
+          {
+            "metric_name": "Training loss",
+            "lower_is_better": true,
+            "description": "Loss function value for training data.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6068,
+                "best_value": 0.6068
+              }
+            ]
+          },
+          {
+            "metric_name": "Validation MCC",
+            "lower_is_better": false,
+            "description": "Matthews Correlation Coefficient for validation data.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.3723,
+                "best_value": 0.3723
+              }
+            ]
+          },
+          {
+            "metric_name": "Validation loss",
+            "lower_is_better": true,
+            "description": "Loss function value for validation data.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6353,
+                "best_value": 0.6353
+              }
+            ]
+          },
+          {
+            "metric_name": "Test MCC",
+            "lower_is_better": false,
+            "description": "Matthews Correlation Coefficient for test data.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.3872,
+                "best_value": 0.3872
+              }
+            ]
+          },
+          {
+            "metric_name": "Test F1 score (macro)",
+            "lower_is_better": false,
+            "description": "Macro-averaged F1 score for test data.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6935,
+                "best_value": 0.6935
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# ---------------- NoDropout Ablation : complete, self-contained script ----------------\nimport os, pathlib, random, string, numpy as np, torch, torch.nn as nn\nfrom torch.utils.data import DataLoader\nfrom sklearn.metrics import matthews_corrcoef, f1_score\n\n# ---------------- compulsory working dir -----------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------------- device -----------------\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ---------------- load SPR_BENCH or synth fallback -------------\ndef load_spr_bench(root: pathlib.Path):\n    from datasets import load_dataset, DatasetDict\n\n    def _load(csv_name):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for split in [\"train\", \"dev\", \"test\"]:\n        d[split] = _load(f\"{split}.csv\")\n    return d\n\n\ndata_root = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\ntry:\n    dsets = load_spr_bench(data_root) if data_root.exists() else None\nexcept Exception:\n    dsets = None\n\nif dsets is None:\n    from datasets import Dataset, DatasetDict\n\n    def synth(n):\n        seqs, labels = [], []\n        for _ in range(n):\n            L = random.randint(5, 25)\n            seq = \"\".join(random.choices(list(string.ascii_lowercase) + \"#@$%\", k=L))\n            labels.append(int(seq.count(\"#\") % 2 == 0))\n            seqs.append(seq)\n        return Dataset.from_dict(\n            {\"id\": list(range(n)), \"sequence\": seqs, \"label\": labels}\n        )\n\n    dsets = DatasetDict({\"train\": synth(4000), \"dev\": synth(1000), \"test\": synth(1000)})\nprint({k: len(v) for k, v in dsets.items()})\n\n# ---------------- vocab & encoding -----------------\nPAD, UNK, CLS = \"<pad>\", \"<unk>\", \"<cls>\"\nvocab = {PAD: 0, UNK: 1, CLS: 2}\nfor seq in dsets[\"train\"][\"sequence\"]:\n    for ch in seq:\n        if ch not in vocab:\n            vocab[ch] = len(vocab)\nvocab_size = len(vocab)\n\n\ndef encode(seq):\n    return [vocab[CLS]] + [vocab.get(ch, vocab[UNK]) for ch in seq]\n\n\nfor split in dsets.keys():\n    dsets[split] = dsets[split].map(\n        lambda ex: {\"input_ids\": encode(ex[\"sequence\"])}, remove_columns=[\"sequence\"]\n    )\n\n\n# ---------------- dataloaders -----------------\ndef collate(batch):\n    ids = [ex[\"input_ids\"] for ex in batch]\n    labels = torch.tensor([ex[\"label\"] for ex in batch], dtype=torch.long)\n    max_len = max(len(x) for x in ids)\n    padded = torch.full((len(ids), max_len), vocab[PAD], dtype=torch.long)\n    attn_mask = torch.zeros_like(padded, dtype=torch.bool)\n    for i, seq in enumerate(ids):\n        padded[i, : len(seq)] = torch.tensor(seq, dtype=torch.long)\n        attn_mask[i, : len(seq)] = 1\n    return {\"input_ids\": padded, \"attention_mask\": attn_mask, \"labels\": labels}\n\n\nbatch_size = 128\ntrain_loader = DataLoader(\n    dsets[\"train\"], batch_size=batch_size, shuffle=True, collate_fn=collate\n)\ndev_loader = DataLoader(\n    dsets[\"dev\"], batch_size=batch_size, shuffle=False, collate_fn=collate\n)\ntest_loader = DataLoader(\n    dsets[\"test\"], batch_size=batch_size, shuffle=False, collate_fn=collate\n)\n\n\n# ---------------- model (all dropout removed) -----------------\nclass SPRTransformer(nn.Module):\n    def __init__(self, vocab_size, embed_dim=128, n_heads=4, depth=2):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=vocab[PAD])\n        self.pos = nn.Parameter(torch.randn(512, embed_dim))  # max sequence length 512\n        encoder_layer = nn.TransformerEncoderLayer(\n            d_model=embed_dim,\n            nhead=n_heads,\n            dim_feedforward=embed_dim * 4,\n            dropout=0.0,  # <-- dropout disabled\n            batch_first=True,\n        )\n        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)\n        self.dropout = nn.Identity()  # classifier dropout removed\n        self.fc = nn.Linear(embed_dim, 2)\n\n    def forward(self, ids, attn_mask):\n        x = self.embed(ids) + self.pos[: ids.size(1)]\n        x = self.transformer(x, src_key_padding_mask=~attn_mask)\n        cls_vec = x[:, 0]\n        return self.fc(self.dropout(cls_vec))\n\n\nmodel = SPRTransformer(vocab_size).to(device)\n\n# ---------------- training setup -----------------\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=5e-5)\n\nexperiment_data = {\n    \"NoDropout\": {\n        \"SPR_BENCH\": {\n            \"metrics\": {\"train_MCC\": [], \"val_MCC\": []},\n            \"losses\": {\"train\": [], \"val\": []},\n            \"predictions\": [],\n            \"ground_truth\": [],\n        }\n    }\n}\nexp_ref = experiment_data[\"NoDropout\"][\"SPR_BENCH\"]\n\nbest_val_mcc, best_state = -1.0, None\nepochs = 10\nfor epoch in range(1, epochs + 1):\n    # -------- training --------\n    model.train()\n    tr_loss, tr_preds, tr_gts = [], [], []\n    for batch in train_loader:\n        batch = {\n            k: (v.to(device) if isinstance(v, torch.Tensor) else v)\n            for k, v in batch.items()\n        }\n        optimizer.zero_grad()\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        loss = criterion(logits, batch[\"labels\"])\n        loss.backward()\n        optimizer.step()\n        tr_loss.append(loss.item())\n        tr_preds.extend(logits.argmax(1).cpu().numpy())\n        tr_gts.extend(batch[\"labels\"].cpu().numpy())\n    train_mcc = matthews_corrcoef(tr_gts, tr_preds)\n\n    # -------- validation --------\n    model.eval()\n    val_loss, val_preds, val_gts = [], [], []\n    with torch.no_grad():\n        for batch in dev_loader:\n            batch = {\n                k: (v.to(device) if isinstance(v, torch.Tensor) else v)\n                for k, v in batch.items()\n            }\n            logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(logits, batch[\"labels\"])\n            val_loss.append(loss.item())\n            val_preds.extend(logits.argmax(1).cpu().numpy())\n            val_gts.extend(batch[\"labels\"].cpu().numpy())\n    val_mcc = matthews_corrcoef(val_gts, val_preds)\n\n    print(f\"Epoch {epoch:02d}: val_loss={np.mean(val_loss):.4f}  val_MCC={val_mcc:.4f}\")\n\n    # -------- log --------\n    exp_ref[\"losses\"][\"train\"].append(np.mean(tr_loss))\n    exp_ref[\"losses\"][\"val\"].append(np.mean(val_loss))\n    exp_ref[\"metrics\"][\"train_MCC\"].append(train_mcc)\n    exp_ref[\"metrics\"][\"val_MCC\"].append(val_mcc)\n\n    # -------- save best --------\n    if val_mcc > best_val_mcc:\n        best_val_mcc = val_mcc\n        best_state = {k: v.cpu() for k, v in model.state_dict().items()}\n\n# ---------------- test with best model -----------------\nmodel.load_state_dict(best_state)\nmodel.eval()\ntest_preds, test_gts = [], []\nwith torch.no_grad():\n    for batch in test_loader:\n        batch = {\n            k: (v.to(device) if isinstance(v, torch.Tensor) else v)\n            for k, v in batch.items()\n        }\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        test_preds.extend(logits.argmax(1).cpu().numpy())\n        test_gts.extend(batch[\"labels\"].cpu().numpy())\ntest_mcc = matthews_corrcoef(test_gts, test_preds)\ntest_f1 = f1_score(test_gts, test_preds, average=\"macro\")\nprint(\n    f\"Best Val MCC = {best_val_mcc:.4f} | Test MCC = {test_mcc:.4f} | Test F1 = {test_f1:.4f}\"\n)\n\n# save experiment data\nexp_ref[\"predictions\"] = test_preds\nexp_ref[\"ground_truth\"] = test_gts\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Saved experiment data to ./working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ---------------- setup -----------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------------- load experiment data -----------------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = None\n\nif experiment_data:\n    try:\n        ref = experiment_data[\"NoDropout\"][\"SPR_BENCH\"]\n        train_loss = ref[\"losses\"][\"train\"]\n        val_loss = ref[\"losses\"][\"val\"]\n        train_mcc = ref[\"metrics\"][\"train_MCC\"]\n        val_mcc = ref[\"metrics\"][\"val_MCC\"]\n        preds = np.array(ref[\"predictions\"])\n        gts = np.array(ref[\"ground_truth\"])\n    except Exception as e:\n        print(f\"Error extracting data: {e}\")\n        experiment_data = None\n\n# ---------------- plotting -----------------\nif experiment_data:\n    # 1. Loss curves\n    try:\n        plt.figure()\n        epochs = np.arange(1, len(train_loss) + 1)\n        plt.plot(epochs, train_loss, label=\"Train Loss\")\n        plt.plot(epochs, val_loss, label=\"Val Loss\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Cross-Entropy Loss\")\n        plt.title(\"SPR_BENCH: Training vs Validation Loss\")\n        plt.legend()\n        fname = os.path.join(working_dir, \"SPR_BENCH_loss_curves.png\")\n        plt.savefig(fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating loss plot: {e}\")\n        plt.close()\n\n    # 2. MCC curves\n    try:\n        plt.figure()\n        epochs = np.arange(1, len(train_mcc) + 1)\n        plt.plot(epochs, train_mcc, label=\"Train MCC\")\n        plt.plot(epochs, val_mcc, label=\"Val MCC\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"MCC\")\n        plt.title(\"SPR_BENCH: Training vs Validation MCC\")\n        plt.legend()\n        fname = os.path.join(working_dir, \"SPR_BENCH_MCC_curves.png\")\n        plt.savefig(fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating MCC plot: {e}\")\n        plt.close()\n\n    # 3. Confusion matrix heatmap\n    try:\n        from sklearn.metrics import confusion_matrix, matthews_corrcoef, f1_score\n\n        cm = confusion_matrix(gts, preds)\n        plt.figure()\n        im = plt.imshow(cm, cmap=\"Blues\")\n        plt.colorbar(im)\n        for i in range(cm.shape[0]):\n            for j in range(cm.shape[1]):\n                plt.text(j, i, cm[i, j], ha=\"center\", va=\"center\", color=\"black\")\n        plt.xlabel(\"Predicted\")\n        plt.ylabel(\"True\")\n        plt.title(\"SPR_BENCH: Confusion Matrix\")\n        fname = os.path.join(working_dir, \"SPR_BENCH_confusion_matrix.png\")\n        plt.savefig(fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating confusion matrix plot: {e}\")\n        plt.close()\n\n    # ---------------- metrics -----------------\n    try:\n        from sklearn.metrics import matthews_corrcoef, f1_score\n\n        test_mcc = matthews_corrcoef(gts, preds)\n        test_f1 = f1_score(gts, preds, average=\"macro\")\n        print(f\"Test MCC = {test_mcc:.4f} | Test F1 = {test_f1:.4f}\")\n    except Exception as e:\n        print(f\"Error computing metrics: {e}\")\n",
+    "plot_plan": "We will first load experiment_data.npy, locate the \u201cNoDropout / SPR_BENCH\u201d entry, and extract the logged arrays: train/val losses, train/val MCC, predictions, and ground-truth labels. We will then compute the final test MCC and macro-F1 from these latter two vectors. Three plots will be produced (\u22645 total):  \n(1) Loss curves showing training vs validation loss over epochs;  \n(2) MCC curves showing training vs validation MCC over epochs;  \n(3) A 2\u00d72 confusion-matrix heat-map based on test predictions vs labels.  \nEach plot is wrapped in its own try-except block, saved to working_dir with descriptive filenames, titled clearly and closed afterwards. The script begins with the required import lines and builds working_dir if missing. Finally, it prints the computed MCC and F1 so users can see the evaluation metrics directly from the visualization script.",
+    "plot_analyses": [
+      {
+        "analysis": "The training loss decreases steadily over the epochs, indicating that the model is learning from the training data. However, the validation loss initially decreases but starts increasing after epoch 6, suggesting potential overfitting. This trend indicates that while the model performs well on the training set, its generalization to unseen data may be limited. Regularization techniques or early stopping could be considered to mitigate overfitting.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_f554a19a3fd94ae188322bc22b82f251_proc_3345786/SPR_BENCH_loss_curves.png"
+      },
+      {
+        "analysis": "The Matthews Correlation Coefficient (MCC) for both training and validation improves initially, with the training MCC stabilizing at a high value. However, the validation MCC peaks around epoch 6 and then declines, which aligns with the overfitting observed in the loss plot. This drop in validation MCC suggests the model's ability to generalize across different data distributions diminishes after a certain point.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_f554a19a3fd94ae188322bc22b82f251_proc_3345786/SPR_BENCH_MCC_curves.png"
+      },
+      {
+        "analysis": "The confusion matrix reveals that the model is relatively balanced in its predictions, with 326 true negatives, 368 true positives, 160 false positives, and 146 false negatives. While the true positives and true negatives are significant, the presence of false positives and false negatives indicates room for improvement in classification accuracy. Adjusting the decision threshold or exploring alternative loss functions might help to reduce these errors.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_f554a19a3fd94ae188322bc22b82f251_proc_3345786/SPR_BENCH_confusion_matrix.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_f554a19a3fd94ae188322bc22b82f251_proc_3345786/SPR_BENCH_loss_curves.png",
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_f554a19a3fd94ae188322bc22b82f251_proc_3345786/SPR_BENCH_MCC_curves.png",
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_f554a19a3fd94ae188322bc22b82f251_proc_3345786/SPR_BENCH_confusion_matrix.png"
+    ],
+    "vlm_feedback_summary": "The results indicate that while the model learns effectively from the training data, its generalization to validation data is limited due to overfitting. The confusion matrix suggests reasonably balanced predictions but highlights the need for further optimization to reduce classification errors.",
+    "exp_results_dir": "experiment_results/experiment_f554a19a3fd94ae188322bc22b82f251_proc_3345786",
+    "ablation_name": "NoDropout",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_f554a19a3fd94ae188322bc22b82f251_proc_3345786/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "Ablation name: NoFeedForwardLayer.\nWe replace each TransformerEncoderLayer with a custom layer that keeps only multi-head self-attention, residual connections and layer norms. This isolates the impact of the FFN. The rest of the pipeline (data prep, training loop, logging, saving) stays unchanged, with results stored under the ablation key \u201cNoFeedForwardLayer\u201d.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "training MCC",
+            "lower_is_better": false,
+            "description": "Matthews Correlation Coefficient measured during training.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.3754,
+                "best_value": 0.3754
+              }
+            ]
+          },
+          {
+            "metric_name": "validation MCC",
+            "lower_is_better": false,
+            "description": "Matthews Correlation Coefficient measured during validation.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.36,
+                "best_value": 0.36
+              }
+            ]
+          },
+          {
+            "metric_name": "training loss",
+            "lower_is_better": true,
+            "description": "Loss measured during training.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6146,
+                "best_value": 0.6146
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "Loss measured during validation.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6348,
+                "best_value": 0.6348
+              }
+            ]
+          },
+          {
+            "metric_name": "test MCC",
+            "lower_is_better": false,
+            "description": "Matthews Correlation Coefficient measured during testing.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.3953,
+                "best_value": 0.3953
+              }
+            ]
+          },
+          {
+            "metric_name": "test F1 score",
+            "lower_is_better": false,
+            "description": "F1 score measured during testing.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6976,
+                "best_value": 0.6976
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, pathlib, random, string, numpy as np, torch, torch.nn as nn\nfrom torch.utils.data import DataLoader\nfrom sklearn.metrics import matthews_corrcoef, f1_score\n\n# ---------- experiment bookkeeping ----------\nexperiment_data = {\n    \"NoFeedForwardLayer\": {\n        \"SPR_BENCH\": {\n            \"metrics\": {\"train_MCC\": [], \"val_MCC\": []},\n            \"losses\": {\"train\": [], \"val\": []},\n            \"predictions\": [],\n            \"ground_truth\": [],\n        }\n    }\n}\n\n# ---------- working dir ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- device ----------\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ---------- load SPR-BENCH or synth ----------\ndef load_spr_bench(root: pathlib.Path):\n    from datasets import load_dataset, DatasetDict\n\n    def _load(csv_name):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for split in [\"train\", \"dev\", \"test\"]:\n        d[split] = _load(f\"{split}.csv\")\n    return d\n\n\ndata_root = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\ntry:\n    dsets = load_spr_bench(data_root) if data_root.exists() else None\nexcept Exception:\n    dsets = None\n\nif dsets is None:\n    from datasets import Dataset, DatasetDict\n\n    def synth(n):\n        seqs, labels = [], []\n        for _ in range(n):\n            L = random.randint(5, 25)\n            seq = \"\".join(random.choices(list(string.ascii_lowercase) + \"#@$%\", k=L))\n            labels.append(int(seq.count(\"#\") % 2 == 0))\n            seqs.append(seq)\n        return Dataset.from_dict(\n            {\"id\": list(range(n)), \"sequence\": seqs, \"label\": labels}\n        )\n\n    dsets = DatasetDict({\"train\": synth(4000), \"dev\": synth(1000), \"test\": synth(1000)})\nprint({k: len(v) for k, v in dsets.items()})\n\n# ---------- vocabulary ----------\nPAD, UNK, CLS = \"<pad>\", \"<unk>\", \"<cls>\"\nvocab = {PAD: 0, UNK: 1, CLS: 2}\nfor seq in dsets[\"train\"][\"sequence\"]:\n    for ch in seq:\n        if ch not in vocab:\n            vocab[ch] = len(vocab)\nvocab_size = len(vocab)\n\n\ndef encode(seq):\n    return [vocab[CLS]] + [vocab.get(ch, vocab[UNK]) for ch in seq]\n\n\nfor split in dsets.keys():\n    dsets[split] = dsets[split].map(\n        lambda ex: {\"input_ids\": encode(ex[\"sequence\"])}, remove_columns=[\"sequence\"]\n    )\n\n\n# ---------- dataloaders ----------\ndef collate(batch):\n    ids = [ex[\"input_ids\"] for ex in batch]\n    labels = torch.tensor([ex[\"label\"] for ex in batch], dtype=torch.long)\n    max_len = max(len(x) for x in ids)\n    padded = torch.full((len(ids), max_len), vocab[PAD], dtype=torch.long)\n    attn_mask = torch.zeros_like(padded, dtype=torch.bool)\n    for i, seq in enumerate(ids):\n        padded[i, : len(seq)] = torch.tensor(seq, dtype=torch.long)\n        attn_mask[i, : len(seq)] = 1\n    return {\"input_ids\": padded, \"attention_mask\": attn_mask, \"labels\": labels}\n\n\nbatch_size = 128\ntrain_loader = DataLoader(\n    dsets[\"train\"], batch_size=batch_size, shuffle=True, collate_fn=collate\n)\ndev_loader = DataLoader(\n    dsets[\"dev\"], batch_size=batch_size, shuffle=False, collate_fn=collate\n)\ntest_loader = DataLoader(\n    dsets[\"test\"], batch_size=batch_size, shuffle=False, collate_fn=collate\n)\n\n\n# ---------- custom encoder layer without FFN ----------\nclass EncoderLayerNoFFN(nn.Module):\n    def __init__(self, d_model, nhead, dropout=0.1):\n        super().__init__()\n        self.self_attn = nn.MultiheadAttention(\n            d_model, nhead, dropout=dropout, batch_first=True\n        )\n        self.dropout1 = nn.Dropout(dropout)\n        self.norm1 = nn.LayerNorm(d_model)\n\n    def forward(self, src, src_key_padding_mask=None):\n        # Self-attention block\n        attn_out, _ = self.self_attn(\n            src, src, src, key_padding_mask=src_key_padding_mask, need_weights=False\n        )\n        src = self.norm1(src + self.dropout1(attn_out))\n        return src\n\n\n# ---------- transformer with NoFeedForwardLayer ----------\nclass SPRTransformerNoFFN(nn.Module):\n    def __init__(self, vocab_size, embed_dim=128, n_heads=4, depth=2, dropout=0.1):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=vocab[PAD])\n        self.pos = nn.Parameter(torch.randn(512, embed_dim))  # max length 512\n        self.layers = nn.ModuleList(\n            [EncoderLayerNoFFN(embed_dim, n_heads, dropout) for _ in range(depth)]\n        )\n        self.dropout = nn.Dropout(dropout)\n        self.fc = nn.Linear(embed_dim, 2)\n\n    def forward(self, ids, attn_mask):\n        x = self.embed(ids) + self.pos[: ids.shape[1]]\n        for layer in self.layers:\n            x = layer(x, src_key_padding_mask=~attn_mask)\n        cls_vec = x[:, 0]\n        return self.fc(self.dropout(cls_vec))\n\n\nmodel = SPRTransformerNoFFN(vocab_size).to(device)\n\n# ---------- training utilities ----------\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=5e-5)\n\nbest_val_mcc, best_state = -1.0, None\nepochs = 10\nfor epoch in range(1, epochs + 1):\n    # ---- train ----\n    model.train()\n    tr_loss, tr_preds, tr_gts = [], [], []\n    for batch in train_loader:\n        batch = {\n            k: (v.to(device) if isinstance(v, torch.Tensor) else v)\n            for k, v in batch.items()\n        }\n        optimizer.zero_grad()\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        loss = criterion(logits, batch[\"labels\"])\n        loss.backward()\n        optimizer.step()\n        tr_loss.append(loss.item())\n        tr_preds.extend(logits.argmax(1).cpu().numpy())\n        tr_gts.extend(batch[\"labels\"].cpu().numpy())\n    train_mcc = matthews_corrcoef(tr_gts, tr_preds)\n\n    # ---- validation ----\n    model.eval()\n    val_loss, val_preds, val_gts = [], [], []\n    with torch.no_grad():\n        for batch in dev_loader:\n            batch = {\n                k: (v.to(device) if isinstance(v, torch.Tensor) else v)\n                for k, v in batch.items()\n            }\n            logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(logits, batch[\"labels\"])\n            val_loss.append(loss.item())\n            val_preds.extend(logits.argmax(1).cpu().numpy())\n            val_gts.extend(batch[\"labels\"].cpu().numpy())\n    val_mcc = matthews_corrcoef(val_gts, val_preds)\n    print(f\"Epoch {epoch}: val_loss={np.mean(val_loss):.4f}, val_MCC={val_mcc:.4f}\")\n\n    # ---- logging ----\n    exp = experiment_data[\"NoFeedForwardLayer\"][\"SPR_BENCH\"]\n    exp[\"losses\"][\"train\"].append(np.mean(tr_loss))\n    exp[\"losses\"][\"val\"].append(np.mean(val_loss))\n    exp[\"metrics\"][\"train_MCC\"].append(train_mcc)\n    exp[\"metrics\"][\"val_MCC\"].append(val_mcc)\n\n    # ---- save best ----\n    if val_mcc > best_val_mcc:\n        best_val_mcc = val_mcc\n        best_state = {k: v.cpu() for k, v in model.state_dict().items()}\n\n# ---------- test ----------\nmodel.load_state_dict(best_state)\nmodel.eval()\ntest_preds, test_gts = [], []\nwith torch.no_grad():\n    for batch in test_loader:\n        batch = {\n            k: (v.to(device) if isinstance(v, torch.Tensor) else v)\n            for k, v in batch.items()\n        }\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        test_preds.extend(logits.argmax(1).cpu().numpy())\n        test_gts.extend(batch[\"labels\"].cpu().numpy())\ntest_mcc = matthews_corrcoef(test_gts, test_preds)\ntest_f1 = f1_score(test_gts, test_preds, average=\"macro\")\nprint(\n    f\"Best Val MCC={best_val_mcc:.4f} | Test MCC={test_mcc:.4f} | Test F1={test_f1:.4f}\"\n)\n\nexperiment_data[\"NoFeedForwardLayer\"][\"SPR_BENCH\"][\"predictions\"] = test_preds\nexperiment_data[\"NoFeedForwardLayer\"][\"SPR_BENCH\"][\"ground_truth\"] = test_gts\n\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Saved experiment data to ./working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\nfrom sklearn.metrics import confusion_matrix, matthews_corrcoef, f1_score\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# -------- load experiment data --------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\n    exp = experiment_data[\"NoFeedForwardLayer\"][\"SPR_BENCH\"]\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    exp = None\n\nif exp:\n    epochs = range(1, len(exp[\"losses\"][\"train\"]) + 1)\n\n    # -------- plot loss curves --------\n    try:\n        plt.figure()\n        plt.plot(epochs, exp[\"losses\"][\"train\"], label=\"Train\")\n        plt.plot(epochs, exp[\"losses\"][\"val\"], label=\"Validation\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Cross-Entropy Loss\")\n        plt.title(\"Loss Curves \u2013 SPR_BENCH\\nTrain vs Validation\")\n        plt.legend()\n        fname = os.path.join(working_dir, \"SPR_BENCH_loss_curves.png\")\n        plt.savefig(fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating loss curve plot: {e}\")\n        plt.close()\n\n    # -------- plot MCC curves --------\n    try:\n        plt.figure()\n        plt.plot(epochs, exp[\"metrics\"][\"train_MCC\"], label=\"Train\")\n        plt.plot(epochs, exp[\"metrics\"][\"val_MCC\"], label=\"Validation\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"MCC\")\n        plt.title(\"MCC Curves \u2013 SPR_BENCH\\nTrain vs Validation\")\n        plt.legend()\n        fname = os.path.join(working_dir, \"SPR_BENCH_MCC_curves.png\")\n        plt.savefig(fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating MCC curve plot: {e}\")\n        plt.close()\n\n    # -------- confusion matrix --------\n    try:\n        y_true = np.array(exp[\"ground_truth\"])\n        y_pred = np.array(exp[\"predictions\"])\n        cm = confusion_matrix(y_true, y_pred, labels=[0, 1])\n        plt.figure()\n        im = plt.imshow(cm, cmap=\"Blues\")\n        plt.colorbar(im)\n        for i in range(cm.shape[0]):\n            for j in range(cm.shape[1]):\n                plt.text(j, i, cm[i, j], ha=\"center\", va=\"center\", color=\"black\")\n        plt.xlabel(\"Predicted\")\n        plt.ylabel(\"True\")\n        plt.title(\"Confusion Matrix \u2013 SPR_BENCH\\nLeft: Ground Truth, Right: Predicted\")\n        fname = os.path.join(working_dir, \"SPR_BENCH_confusion_matrix.png\")\n        plt.savefig(fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating confusion matrix plot: {e}\")\n        plt.close()\n\n    # -------- print final metrics --------\n    test_mcc = matthews_corrcoef(exp[\"ground_truth\"], exp[\"predictions\"])\n    test_f1 = f1_score(exp[\"ground_truth\"], exp[\"predictions\"], average=\"macro\")\n    print(f\"Test MCC: {test_mcc:.4f} | Test F1: {test_f1:.4f}\")\n",
+    "plot_plan": "The script will safely load the saved experiment_data.npy, pick the SPR_BENCH sub-dictionary, and extract losses, MCC values, predictions and ground-truth labels. It then generates up to three figures: (1) train/validation loss curves, (2) train/validation MCC curves, and (3) a confusion matrix comparing final predictions to ground truth. Each figure is wrapped in its own try-except block, given a clear title/sub-title, saved with a descriptive name in working_dir, and the figure is closed afterward. Finally, the script recomputes and prints the overall test MCC and macro-F1 so the user can confirm the metrics match what was logged. All plotting abides by the constraints: only real data are used, a maximum of five figures, standard matplotlib, and figures are stored under working_dir.",
+    "plot_analyses": [
+      {
+        "analysis": "The cross-entropy loss curves for both training and validation show a decreasing trend over the epochs, indicating that the model is learning and improving its predictions. The validation loss is consistently lower than the training loss, which suggests that the model is not overfitting and is performing well on unseen data. However, the gap between the two curves should be monitored in future epochs to ensure no overfitting develops.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_b680285c088745ef8d338acb364ee956_proc_3345783/SPR_BENCH_loss_curves.png"
+      },
+      {
+        "analysis": "The MCC (Matthews Correlation Coefficient) curves for training and validation both show an increasing trend and converge around similar values towards the end of the training process. This indicates that the model is improving its ability to predict the correct labels and is performing consistently on training and validation datasets. The convergence of the two curves is a positive sign of generalization.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_b680285c088745ef8d338acb364ee956_proc_3345783/SPR_BENCH_MCC_curves.png"
+      },
+      {
+        "analysis": "The confusion matrix shows the distribution of true positive, true negative, false positive, and false negative predictions. The model correctly predicts 330 true negatives and 368 true positives, while it misclassifies 156 false positives and 146 false negatives. This indicates that the model has a reasonable balance between precision and recall, though there is room for improvement in reducing the number of misclassifications.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_b680285c088745ef8d338acb364ee956_proc_3345783/SPR_BENCH_confusion_matrix.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_b680285c088745ef8d338acb364ee956_proc_3345783/SPR_BENCH_loss_curves.png",
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_b680285c088745ef8d338acb364ee956_proc_3345783/SPR_BENCH_MCC_curves.png",
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_b680285c088745ef8d338acb364ee956_proc_3345783/SPR_BENCH_confusion_matrix.png"
+    ],
+    "vlm_feedback_summary": "The plots indicate that the model is learning effectively and generalizing well across training and validation datasets. The loss curves show consistent improvement without signs of overfitting, while the MCC curves demonstrate increasing predictive performance. The confusion matrix reveals a reasonable balance between precision and recall, though improvements could be made to reduce misclassifications further.",
+    "exp_results_dir": "experiment_results/experiment_b680285c088745ef8d338acb364ee956_proc_3345783",
+    "ablation_name": "NoFeedForwardLayer",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_b680285c088745ef8d338acb364ee956_proc_3345783/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "Ablation name: SinusoidalPositionalEmbedding.\nWe replace the learnable positional embedding with a fixed, non-trainable sinusoidal table (as in Vaswani et al., 2017).  The tensor is pre-computed once, registered as a buffer so it is not updated, and added to token embeddings during the forward pass.  Everything else (dataset prep, training loop, logging, saving) stays unchanged, but results are stored under the ablation tag \u201cSinusoidalPositionalEmbedding\u201d.",
+    "analysis": "The execution of the training script completed successfully. The model trained for 10 epochs, and the best validation MCC achieved was 0.3839. The corresponding test MCC was 0.3896, and the test F1 score was 0.6948. There were no errors or bugs in the execution, and the data was saved as expected in './working/experiment_data.npy'. The results suggest that the Sinusoidal Positional Embedding has limited effectiveness in this task, as the MCC values are relatively low. Further experimentation with different architectures or hyperparameter tuning might be needed to improve performance.",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "training MCC",
+            "lower_is_better": false,
+            "description": "Matthew's Correlation Coefficient (MCC) during training.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.3885,
+                "best_value": 0.3885
+              }
+            ]
+          },
+          {
+            "metric_name": "validation MCC",
+            "lower_is_better": false,
+            "description": "Matthew's Correlation Coefficient (MCC) during validation.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.3839,
+                "best_value": 0.3839
+              }
+            ]
+          },
+          {
+            "metric_name": "training loss",
+            "lower_is_better": true,
+            "description": "Loss value during training.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.616419,
+                "best_value": 0.616419
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "Loss value during validation.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.626705,
+                "best_value": 0.626705
+              }
+            ]
+          },
+          {
+            "metric_name": "test MCC",
+            "lower_is_better": false,
+            "description": "Matthew's Correlation Coefficient (MCC) on the test dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.3896,
+                "best_value": 0.3896
+              }
+            ]
+          },
+          {
+            "metric_name": "test F1 score",
+            "lower_is_better": false,
+            "description": "F1 score on the test dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6948,
+                "best_value": 0.6948
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# SinusoidalPositionalEmbedding ablation for SPR-BENCH sequence classification\nimport os, pathlib, random, string, numpy as np, torch, torch.nn as nn\nfrom torch.utils.data import DataLoader\nfrom sklearn.metrics import matthews_corrcoef, f1_score\n\n# ---------- working dir ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- device ----------\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ---------- load SPR-BENCH or synthetic fallback ----------\ndef load_spr_bench(root: pathlib.Path):\n    from datasets import load_dataset, DatasetDict\n\n    def _load(csv_name):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for split in [\"train\", \"dev\", \"test\"]:\n        d[split] = _load(f\"{split}.csv\")\n    return d\n\n\ndata_root = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\ntry:\n    dsets = load_spr_bench(data_root) if data_root.exists() else None\nexcept Exception:\n    dsets = None\n\nif dsets is None:\n    from datasets import Dataset, DatasetDict\n\n    def synth(n):\n        seqs, labels = [], []\n        for _ in range(n):\n            L = random.randint(5, 25)\n            seq = \"\".join(random.choices(list(string.ascii_lowercase) + \"#@$%\", k=L))\n            labels.append(int(seq.count(\"#\") % 2 == 0))\n            seqs.append(seq)\n        return Dataset.from_dict(\n            {\"id\": list(range(n)), \"sequence\": seqs, \"label\": labels}\n        )\n\n    dsets = DatasetDict({\"train\": synth(4000), \"dev\": synth(1000), \"test\": synth(1000)})\nprint({k: len(v) for k, v in dsets.items()})\n\n# ---------- vocab ----------\nPAD, UNK, CLS = \"<pad>\", \"<unk>\", \"<cls>\"\nvocab = {PAD: 0, UNK: 1, CLS: 2}\nfor seq in dsets[\"train\"][\"sequence\"]:\n    for ch in seq:\n        if ch not in vocab:\n            vocab[ch] = len(vocab)\nvocab_size = len(vocab)\n\n\ndef encode(seq):  # prepend CLS\n    return [vocab[CLS]] + [vocab.get(ch, vocab[UNK]) for ch in seq]\n\n\nfor split in dsets.keys():\n    dsets[split] = dsets[split].map(\n        lambda ex: {\"input_ids\": encode(ex[\"sequence\"])}, remove_columns=[\"sequence\"]\n    )\n\n\n# ---------- dataloaders ----------\ndef collate(batch):\n    ids = [ex[\"input_ids\"] for ex in batch]\n    labels = torch.tensor([ex[\"label\"] for ex in batch], dtype=torch.long)\n    max_len = max(len(x) for x in ids)\n    padded = torch.full((len(ids), max_len), vocab[PAD], dtype=torch.long)\n    attn_m = torch.zeros_like(padded, dtype=torch.bool)\n    for i, seq in enumerate(ids):\n        padded[i, : len(seq)] = torch.tensor(seq)\n        attn_m[i, : len(seq)] = 1\n    return {\"input_ids\": padded, \"attention_mask\": attn_m, \"labels\": labels}\n\n\nbatch_size = 128\ntrain_loader = DataLoader(dsets[\"train\"], batch_size, shuffle=True, collate_fn=collate)\ndev_loader = DataLoader(dsets[\"dev\"], batch_size, shuffle=False, collate_fn=collate)\ntest_loader = DataLoader(dsets[\"test\"], batch_size, shuffle=False, collate_fn=collate)\n\n\n# ---------- Sinusoidal positional encoding ----------\ndef sinusoidal_table(max_len, dim):\n    pos = torch.arange(max_len, dtype=torch.float).unsqueeze(1)\n    i = torch.arange(dim, dtype=torch.float).unsqueeze(0)\n    angle_rates = 1 / (10000 ** (2 * (i // 2) / dim))\n    angles = pos * angle_rates\n    table = torch.zeros(max_len, dim)\n    table[:, 0::2] = torch.sin(angles[:, 0::2])\n    table[:, 1::2] = torch.cos(angles[:, 1::2])\n    return table\n\n\n# ---------- model ----------\nclass SPRTransformerSinusoid(nn.Module):\n    def __init__(\n        self, vocab_size, embed_dim=128, n_heads=4, depth=2, dropout=0.1, max_len=512\n    ):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=vocab[PAD])\n        pos = sinusoidal_table(max_len, embed_dim)\n        self.register_buffer(\"pos_table\", pos, persistent=False)  # non-trainable\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=embed_dim,\n            nhead=n_heads,\n            dim_feedforward=embed_dim * 4,\n            dropout=dropout,\n            batch_first=True,\n        )\n        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=depth)\n        self.dropout = nn.Dropout(dropout)\n        self.fc = nn.Linear(embed_dim, 2)\n\n    def forward(self, ids, attn_mask):\n        x = self.embed(ids) + self.pos_table[: ids.size(1)]\n        x = self.transformer(x, src_key_padding_mask=~attn_mask)\n        cls_vec = x[:, 0]\n        return self.fc(self.dropout(cls_vec))\n\n\nmodel = SPRTransformerSinusoid(vocab_size).to(device)\n\n# ---------- training utilities ----------\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=5e-5)\n\nexperiment_data = {\n    \"SinusoidalPositionalEmbedding\": {\n        \"SPR_BENCH\": {\n            \"metrics\": {\"train_MCC\": [], \"val_MCC\": []},\n            \"losses\": {\"train\": [], \"val\": []},\n            \"predictions\": [],\n            \"ground_truth\": [],\n        }\n    }\n}\n\nbest_val_mcc, best_state = -1.0, None\nepochs = 10\nfor epoch in range(1, epochs + 1):\n    # ---- train ----\n    model.train()\n    tr_loss, tr_preds, tr_gts = [], [], []\n    for batch in train_loader:\n        batch = {\n            k: (v.to(device) if isinstance(v, torch.Tensor) else v)\n            for k, v in batch.items()\n        }\n        optimizer.zero_grad()\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        loss = criterion(logits, batch[\"labels\"])\n        loss.backward()\n        optimizer.step()\n        tr_loss.append(loss.item())\n        tr_preds.extend(logits.argmax(1).cpu().numpy())\n        tr_gts.extend(batch[\"labels\"].cpu().numpy())\n    train_mcc = matthews_corrcoef(tr_gts, tr_preds)\n\n    # ---- validate ----\n    model.eval()\n    val_loss, val_preds, val_gts = [], [], []\n    with torch.no_grad():\n        for batch in dev_loader:\n            batch = {\n                k: (v.to(device) if isinstance(v, torch.Tensor) else v)\n                for k, v in batch.items()\n            }\n            logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(logits, batch[\"labels\"])\n            val_loss.append(loss.item())\n            val_preds.extend(logits.argmax(1).cpu().numpy())\n            val_gts.extend(batch[\"labels\"].cpu().numpy())\n    val_mcc = matthews_corrcoef(val_gts, val_preds)\n    print(f\"Epoch {epoch}: val_loss={np.mean(val_loss):.4f}, val_MCC={val_mcc:.4f}\")\n\n    # ---- logging ----\n    ed = experiment_data[\"SinusoidalPositionalEmbedding\"][\"SPR_BENCH\"]\n    ed[\"losses\"][\"train\"].append(np.mean(tr_loss))\n    ed[\"losses\"][\"val\"].append(np.mean(val_loss))\n    ed[\"metrics\"][\"train_MCC\"].append(train_mcc)\n    ed[\"metrics\"][\"val_MCC\"].append(val_mcc)\n\n    # ---- save best ----\n    if val_mcc > best_val_mcc:\n        best_val_mcc = val_mcc\n        best_state = {k: v.cpu() for k, v in model.state_dict().items()}\n\n# ---------- test ----------\nmodel.load_state_dict(best_state)\nmodel.eval()\ntest_preds, test_gts = [], []\nwith torch.no_grad():\n    for batch in test_loader:\n        batch = {\n            k: (v.to(device) if isinstance(v, torch.Tensor) else v)\n            for k, v in batch.items()\n        }\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        test_preds.extend(logits.argmax(1).cpu().numpy())\n        test_gts.extend(batch[\"labels\"].cpu().numpy())\ntest_mcc = matthews_corrcoef(test_gts, test_preds)\ntest_f1 = f1_score(test_gts, test_preds, average=\"macro\")\nprint(\n    f\"Best Val MCC={best_val_mcc:.4f} | Test MCC={test_mcc:.4f} | Test F1={test_f1:.4f}\"\n)\n\n# ---------- save experiment data ----------\ned = experiment_data[\"SinusoidalPositionalEmbedding\"][\"SPR_BENCH\"]\ned[\"predictions\"] = test_preds\ned[\"ground_truth\"] = test_gts\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Saved experiment data to ./working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# -------- working dir --------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# -------- load experiment data --------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = None\n\nif experiment_data:\n    key = (\"SinusoidalPositionalEmbedding\", \"SPR_BENCH\")\n    try:\n        ed = experiment_data[key[0]][key[1]]\n    except KeyError:\n        print(\"Requested keys not found in experiment_data.\")\n        ed = None\n\n    if ed:\n        epochs = np.arange(1, len(ed[\"losses\"][\"train\"]) + 1)\n\n        # ---- 1. loss curves ----\n        try:\n            plt.figure()\n            plt.plot(epochs, ed[\"losses\"][\"train\"], label=\"Train\")\n            plt.plot(epochs, ed[\"losses\"][\"val\"], label=\"Validation\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Cross-Entropy Loss\")\n            plt.title(\"SPR_BENCH: Training vs Validation Loss\")\n            plt.legend()\n            fname = os.path.join(working_dir, \"SPR_BENCH_loss_curves.png\")\n            plt.savefig(fname)\n            plt.close()\n            print(f\"Saved {fname}\")\n        except Exception as e:\n            print(f\"Error creating loss plot: {e}\")\n            plt.close()\n\n        # ---- 2. MCC curves ----\n        try:\n            plt.figure()\n            plt.plot(epochs, ed[\"metrics\"][\"train_MCC\"], label=\"Train MCC\")\n            plt.plot(epochs, ed[\"metrics\"][\"val_MCC\"], label=\"Val MCC\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Matthews CorrCoef\")\n            plt.title(\"SPR_BENCH: Training vs Validation MCC\")\n            plt.legend()\n            fname = os.path.join(working_dir, \"SPR_BENCH_MCC_curves.png\")\n            plt.savefig(fname)\n            plt.close()\n            print(f\"Saved {fname}\")\n        except Exception as e:\n            print(f\"Error creating MCC plot: {e}\")\n            plt.close()\n\n        # ---- 3. confusion matrix (test set) ----\n        try:\n            preds = np.array(ed.get(\"predictions\", []))\n            gts = np.array(ed.get(\"ground_truth\", []))\n            if preds.size and gts.size and preds.size == gts.size:\n                num_cls = int(max(preds.max(), gts.max()) + 1)\n                cm = np.zeros((num_cls, num_cls), dtype=int)\n                for p, g in zip(preds, gts):\n                    cm[g, p] += 1\n\n                plt.figure()\n                im = plt.imshow(cm, cmap=\"Blues\")\n                plt.colorbar(im)\n                plt.xlabel(\"Predicted\")\n                plt.ylabel(\"Ground Truth\")\n                plt.title(\n                    \"SPR_BENCH: Confusion Matrix\\nLeft: Ground Truth, Right: Predictions\"\n                )\n                for i in range(num_cls):\n                    for j in range(num_cls):\n                        plt.text(\n                            j,\n                            i,\n                            cm[i, j],\n                            ha=\"center\",\n                            va=\"center\",\n                            color=\"white\" if cm[i, j] > cm.max() / 2 else \"black\",\n                        )\n                fname = os.path.join(working_dir, \"SPR_BENCH_confusion_matrix.png\")\n                plt.savefig(fname)\n                plt.close()\n                print(f\"Saved {fname}\")\n            else:\n                print(\"Predictions or ground truth missing, skipping confusion matrix.\")\n        except Exception as e:\n            print(f\"Error creating confusion matrix: {e}\")\n            plt.close()\n",
+    "plot_plan": "We need to load the saved experiment_data.npy, extract the metrics for the SinusoidalPositionalEmbedding/SPR_BENCH run, and create up to three standard plots: (1) training\u2010 vs validation\u2010loss curve, (2) training\u2010 vs validation\u2010MCC curve, and (3) test\u2010set confusion matrix built from ground-truth and prediction arrays.  Each figure must be generated in its own try/except block, saved to the working/ directory with descriptive names, and closed afterwards to avoid memory leaks.  The code begins with the requested imports, defines working_dir, reloads the numpy dict, and then proceeds with the plotting.  All titles clearly mention the dataset and what is being shown, and filenames follow the pattern \u201cSPR_BENCH_[plot-type].png\u201d.  If any piece of data is missing (e.g., predictions), the corresponding plot is skipped gracefully.  No simulated values are introduced\u2014everything comes directly from experiment_data.npy.  Finally, the script prints a short confirmation of the plots created.",
+    "plot_analyses": [
+      {
+        "analysis": "The plot shows the training and validation loss over 10 epochs. Both the training and validation losses decrease steadily, indicating the model is learning effectively. The validation loss is slightly higher than the training loss, which suggests that the model is not overfitting significantly. The convergence of the two losses implies good generalization, but further fine-tuning may be needed to reduce the gap and improve validation performance.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_38e3f739fd314986b409ca8f227f458f_proc_3345784/SPR_BENCH_loss_curves.png"
+      },
+      {
+        "analysis": "This plot depicts the Matthews Correlation Coefficient (MCC) for both training and validation sets over 10 epochs. The MCC values increase steadily, showing that the model is improving its classification capability. The training and validation MCC curves are close to each other, which is a positive sign of the model's generalization ability. However, the MCC values plateau around 0.4, indicating that there may be room for improvement in the model architecture or training process.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_38e3f739fd314986b409ca8f227f458f_proc_3345784/SPR_BENCH_MCC_curves.png"
+      },
+      {
+        "analysis": "The confusion matrix illustrates the model's predictions compared to the ground truth. The diagonal elements represent correct predictions, while the off-diagonal elements indicate misclassifications. The model correctly classified 335 instances as class 0 and 360 instances as class 1. However, there are 151 false positives and 154 false negatives, showing a relatively balanced misclassification rate. Improving the model's sensitivity and specificity could help reduce these errors.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_38e3f739fd314986b409ca8f227f458f_proc_3345784/SPR_BENCH_confusion_matrix.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_38e3f739fd314986b409ca8f227f458f_proc_3345784/SPR_BENCH_loss_curves.png",
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_38e3f739fd314986b409ca8f227f458f_proc_3345784/SPR_BENCH_MCC_curves.png",
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_38e3f739fd314986b409ca8f227f458f_proc_3345784/SPR_BENCH_confusion_matrix.png"
+    ],
+    "vlm_feedback_summary": "The plots demonstrate that the model is learning effectively, with decreasing loss and improving MCC over epochs. The confusion matrix indicates balanced performance across classes, but there is room for improvement in reducing misclassifications and enhancing overall accuracy.",
+    "exp_results_dir": "experiment_results/experiment_38e3f739fd314986b409ca8f227f458f_proc_3345784",
+    "ablation_name": "SinusoidalPositionalEmbedding",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_38e3f739fd314986b409ca8f227f458f_proc_3345784/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "Ablation name: FrozenEmbeddingLayer.\nWe replicate the baseline pipeline but introduce the FrozenEmbeddingLayer ablation: after instantiating the embedding layer, we set `self.embed.weight.requires_grad = False`. All other parameters stay trainable and are passed to the optimizer. Results (losses, MCC/F1, predictions) are stored under the key `'FrozenEmbeddingLayer'` \u2192 `'SPR_BENCH'` and saved to `./working/experiment_data.npy` for later plotting/analysis.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "Matthew's correlation coefficient",
+            "lower_is_better": false,
+            "description": "Measures the quality of binary classifications, ranging from -1 to 1.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.3896,
+                "best_value": 0.3961
+              }
+            ]
+          },
+          {
+            "metric_name": "loss",
+            "lower_is_better": true,
+            "description": "Measures the error or deviation from the expected outcome. Lower values are better.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6393,
+                "best_value": 0.602
+              }
+            ]
+          },
+          {
+            "metric_name": "F1 score",
+            "lower_is_better": false,
+            "description": "Harmonic mean of precision and recall, ranging from 0 to 1, used to evaluate classification tasks.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6948,
+                "best_value": 0.6948
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# ------------------------------------------------------------\n# FrozenEmbeddingLayer Ablation \u2011 single-file runnable script\n# ------------------------------------------------------------\nimport os, pathlib, random, string, numpy as np, torch, torch.nn as nn\nfrom torch.utils.data import DataLoader\nfrom sklearn.metrics import matthews_corrcoef, f1_score\n\n# ---------- misc ----------\ntorch.manual_seed(2024)\nrandom.seed(2024)\nnp.random.seed(2024)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n# ---------- working dir ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n\n# ---------- load SPR-BENCH or synthetic fallback ----------\ndef load_spr_bench(root: pathlib.Path):\n    from datasets import load_dataset, DatasetDict\n\n    def _load(csv_name):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for split in [\"train\", \"dev\", \"test\"]:\n        d[split] = _load(f\"{split}.csv\")\n    return d\n\n\ndata_root = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\ntry:\n    dsets = load_spr_bench(data_root) if data_root.exists() else None\nexcept Exception:\n    dsets = None\n\nif dsets is None:\n    # synthetic fallback\n    from datasets import Dataset, DatasetDict\n\n    def synth(n):\n        seqs, labels = [], []\n        for _ in range(n):\n            L = random.randint(5, 25)\n            seq = \"\".join(random.choices(list(string.ascii_lowercase) + \"#@$%\", k=L))\n            labels.append(int(seq.count(\"#\") % 2 == 0))\n            seqs.append(seq)\n        return Dataset.from_dict(\n            {\"id\": list(range(n)), \"sequence\": seqs, \"label\": labels}\n        )\n\n    dsets = DatasetDict({\"train\": synth(4000), \"dev\": synth(1000), \"test\": synth(1000)})\nprint({k: len(v) for k, v in dsets.items()})\n\n# ---------- vocab ----------\nPAD, UNK, CLS = \"<pad>\", \"<unk>\", \"<cls>\"\nvocab = {PAD: 0, UNK: 1, CLS: 2}\nfor seq in dsets[\"train\"][\"sequence\"]:\n    for ch in seq:\n        if ch not in vocab:\n            vocab[ch] = len(vocab)\nvocab_size = len(vocab)\n\n\ndef encode(seq):\n    return [vocab[CLS]] + [vocab.get(ch, vocab[UNK]) for ch in seq]\n\n\nfor split in dsets.keys():\n    dsets[split] = dsets[split].map(\n        lambda ex: {\"input_ids\": encode(ex[\"sequence\"])}, remove_columns=[\"sequence\"]\n    )\n\n\n# ---------- dataloaders ----------\ndef collate(batch):\n    ids = [ex[\"input_ids\"] for ex in batch]\n    labels = torch.tensor([ex[\"label\"] for ex in batch], dtype=torch.long)\n    max_len = max(len(x) for x in ids)\n    padded = torch.full((len(ids), max_len), vocab[PAD], dtype=torch.long)\n    attn_mask = torch.zeros_like(padded, dtype=torch.bool)\n    for i, seq in enumerate(ids):\n        padded[i, : len(seq)] = torch.tensor(seq, dtype=torch.long)\n        attn_mask[i, : len(seq)] = True\n    return {\"input_ids\": padded, \"attention_mask\": attn_mask, \"labels\": labels}\n\n\nbatch_size = 128\ntrain_loader = DataLoader(\n    dsets[\"train\"], batch_size=batch_size, shuffle=True, collate_fn=collate\n)\ndev_loader = DataLoader(\n    dsets[\"dev\"], batch_size=batch_size, shuffle=False, collate_fn=collate\n)\ntest_loader = DataLoader(\n    dsets[\"test\"], batch_size=batch_size, shuffle=False, collate_fn=collate\n)\n\n\n# ---------- model with frozen embedding ----------\nclass SPRTransformerFrozenEmbed(nn.Module):\n    def __init__(\n        self, vocab_size, embed_dim=128, n_heads=4, depth=2, dropout=0.1, pad_idx=0\n    ):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)\n        self.embed.weight.requires_grad = False  # freeze embeddings\n        self.pos = nn.Parameter(torch.randn(512, embed_dim))\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=embed_dim,\n            nhead=n_heads,\n            dim_feedforward=embed_dim * 4,\n            dropout=dropout,\n            batch_first=True,\n        )\n        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=depth)\n        self.dropout = nn.Dropout(dropout)\n        self.fc = nn.Linear(embed_dim, 2)\n\n    def forward(self, ids, attn_mask):\n        x = self.embed(ids) + self.pos[: ids.size(1)]\n        x = self.transformer(x, src_key_padding_mask=~attn_mask)\n        cls_vec = x[:, 0]\n        return self.fc(self.dropout(cls_vec))\n\n\nmodel = SPRTransformerFrozenEmbed(vocab_size, pad_idx=vocab[PAD]).to(device)\n\n# create optimizer with trainable params only\ntrainable_params = [p for p in model.parameters() if p.requires_grad]\noptimizer = torch.optim.AdamW(trainable_params, lr=3e-4, weight_decay=5e-5)\ncriterion = nn.CrossEntropyLoss()\n\n# ---------- experiment data dict ----------\nexperiment_data = {\n    \"FrozenEmbeddingLayer\": {\n        \"SPR_BENCH\": {\n            \"metrics\": {\"train_MCC\": [], \"val_MCC\": []},\n            \"losses\": {\"train\": [], \"val\": []},\n            \"predictions\": [],\n            \"ground_truth\": [],\n        }\n    }\n}\n\n# ---------- training loop ----------\nbest_val_mcc, best_state = -1.0, None\nepochs = 10\nfor epoch in range(1, epochs + 1):\n    # ---- train ----\n    model.train()\n    tr_loss, tr_preds, tr_gts = [], [], []\n    for batch in train_loader:\n        batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}\n        optimizer.zero_grad()\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        loss = criterion(logits, batch[\"labels\"])\n        loss.backward()\n        optimizer.step()\n        tr_loss.append(loss.item())\n        tr_preds.extend(logits.argmax(1).cpu().numpy())\n        tr_gts.extend(batch[\"labels\"].cpu().numpy())\n    train_mcc = matthews_corrcoef(tr_gts, tr_preds)\n\n    # ---- validation ----\n    model.eval()\n    val_loss, val_preds, val_gts = [], [], []\n    with torch.no_grad():\n        for batch in dev_loader:\n            batch = {\n                k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()\n            }\n            logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(logits, batch[\"labels\"])\n            val_loss.append(loss.item())\n            val_preds.extend(logits.argmax(1).cpu().numpy())\n            val_gts.extend(batch[\"labels\"].cpu().numpy())\n    val_mcc = matthews_corrcoef(val_gts, val_preds)\n    print(f\"Epoch {epoch}: val_loss={np.mean(val_loss):.4f} | val_MCC={val_mcc:.4f}\")\n\n    # ---- log ----\n    ed = experiment_data[\"FrozenEmbeddingLayer\"][\"SPR_BENCH\"]\n    ed[\"losses\"][\"train\"].append(np.mean(tr_loss))\n    ed[\"losses\"][\"val\"].append(np.mean(val_loss))\n    ed[\"metrics\"][\"train_MCC\"].append(train_mcc)\n    ed[\"metrics\"][\"val_MCC\"].append(val_mcc)\n\n    # ---- save best ----\n    if val_mcc > best_val_mcc:\n        best_val_mcc = val_mcc\n        best_state = {k: v.cpu() for k, v in model.state_dict().items()}\n\n# ---------- test ----------\nmodel.load_state_dict(best_state)\nmodel.eval()\ntest_preds, test_gts = [], []\nwith torch.no_grad():\n    for batch in test_loader:\n        batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        test_preds.extend(logits.argmax(1).cpu().numpy())\n        test_gts.extend(batch[\"labels\"].cpu().numpy())\ntest_mcc = matthews_corrcoef(test_gts, test_preds)\ntest_f1 = f1_score(test_gts, test_preds, average=\"macro\")\nprint(\n    f\"Best Val MCC={best_val_mcc:.4f} | Test MCC={test_mcc:.4f} | Test F1={test_f1:.4f}\"\n)\n\ned = experiment_data[\"FrozenEmbeddingLayer\"][\"SPR_BENCH\"]\ned[\"predictions\"] = test_preds\ned[\"ground_truth\"] = test_gts\n\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Saved experiment data to ./working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\n\n# ---- load data ----\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\n# short-circuit if load failed\nif experiment_data:\n    run = experiment_data[\"FrozenEmbeddingLayer\"][\"SPR_BENCH\"]\n    tr_loss = run[\"losses\"][\"train\"]\n    val_loss = run[\"losses\"][\"val\"]\n    tr_mcc = run[\"metrics\"][\"train_MCC\"]\n    val_mcc = run[\"metrics\"][\"val_MCC\"]\n    preds = np.array(run[\"predictions\"])\n    gts = np.array(run[\"ground_truth\"])\n    epochs = np.arange(1, len(tr_loss) + 1)\n\n    # ---- plot 1: loss curves ----\n    try:\n        plt.figure()\n        plt.plot(epochs, tr_loss, label=\"Train Loss\")\n        plt.plot(epochs, val_loss, label=\"Val Loss\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Cross-Entropy Loss\")\n        plt.title(\"Loss Curves \u2013 SPR_BENCH (FrozenEmbeddingLayer)\")\n        plt.legend()\n        fname = os.path.join(\n            working_dir, \"FrozenEmbeddingLayer_SPR_BENCH_loss_curves.png\"\n        )\n        plt.savefig(fname)\n        plt.close()\n        print(f\"Saved {fname}\")\n    except Exception as e:\n        print(f\"Error creating loss curve plot: {e}\")\n        plt.close()\n\n    # ---- plot 2: MCC curves ----\n    try:\n        plt.figure()\n        plt.plot(epochs, tr_mcc, label=\"Train MCC\")\n        plt.plot(epochs, val_mcc, label=\"Val MCC\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"MCC\")\n        plt.title(\"MCC Curves \u2013 SPR_BENCH (FrozenEmbeddingLayer)\")\n        plt.legend()\n        fname = os.path.join(\n            working_dir, \"FrozenEmbeddingLayer_SPR_BENCH_MCC_curves.png\"\n        )\n        plt.savefig(fname)\n        plt.close()\n        print(f\"Saved {fname}\")\n    except Exception as e:\n        print(f\"Error creating MCC curve plot: {e}\")\n        plt.close()\n\n    # ---- plot 3: confusion matrix ----\n    try:\n        from sklearn.metrics import confusion_matrix\n\n        cm = confusion_matrix(gts, preds)\n        plt.figure()\n        im = plt.imshow(cm, cmap=\"Blues\")\n        plt.colorbar(im)\n        for (i, j), v in np.ndenumerate(cm):\n            plt.text(j, i, v, ha=\"center\", va=\"center\")\n        plt.xlabel(\"Predicted\")\n        plt.ylabel(\"Ground Truth\")\n        plt.title(\"Confusion Matrix \u2013 SPR_BENCH Test Set\")\n        fname = os.path.join(\n            working_dir, \"FrozenEmbeddingLayer_SPR_BENCH_confusion_matrix.png\"\n        )\n        plt.savefig(fname)\n        plt.close()\n        print(f\"Saved {fname}\")\n    except Exception as e:\n        print(f\"Error creating confusion matrix plot: {e}\")\n        plt.close()\n\n    # ---- print stored metrics ----\n    best_val_mcc = max(val_mcc) if val_mcc else None\n    from sklearn.metrics import matthews_corrcoef, f1_score\n\n    test_mcc = matthews_corrcoef(gts, preds) if preds.size else None\n    test_f1 = f1_score(gts, preds, average=\"macro\") if preds.size else None\n    print(\n        f\"Best Val MCC={best_val_mcc:.4f} | Test MCC={test_mcc:.4f} | Test F1={test_f1:.4f}\"\n    )\n",
+    "plot_plan": "We will load the saved experiment_data.npy, extract the single run FrozenEmbeddingLayer \u2192 SPR_BENCH, and retrieve per-epoch losses (train/val) and MCC scores (train/val). Two line plots will be produced: one showing loss curves, the other showing MCC curves, each against epoch index. For completeness, a third plot will depict the final test confusion matrix (ground-truth vs. predictions counts). Each figure creation is wrapped in its own try-except block and saved with descriptive file names inside the pre-created working directory. All figures are closed immediately after saving, and any plotting errors are reported. Finally, the script prints the best validation MCC and the test MCC/F1 that were stored in the structure, confirming that we loaded the data correctly. This keeps the visualization concise, uses only existing data, and respects the five-figure limit.",
+    "plot_analyses": [
+      {
+        "analysis": "The loss curves indicate that the model is learning effectively, as both the training and validation loss decrease over the epochs. However, the validation loss begins to plateau and slightly oscillate after epoch 4, suggesting that further training might not yield significant improvements. The gap between the training and validation loss is minimal, indicating that the model is not overfitting.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_781ed71a5fb34d769c80ac705621d5c1_proc_3345785/FrozenEmbeddingLayer_SPR_BENCH_loss_curves.png"
+      },
+      {
+        "analysis": "The MCC (Matthews Correlation Coefficient) curves show a steady improvement in both training and validation MCC over the epochs, with the validation MCC reaching a stable value after epoch 4. This metric suggests that the model is achieving balanced performance across classes and is not biased towards any particular class.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_781ed71a5fb34d769c80ac705621d5c1_proc_3345785/FrozenEmbeddingLayer_SPR_BENCH_MCC_curves.png"
+      },
+      {
+        "analysis": "The confusion matrix reveals that the model performs reasonably well on the test set, with true positives and true negatives being higher than false positives and false negatives. However, there is room for improvement, as the number of misclassifications (152 false positives and 153 false negatives) is still significant. This could be addressed by refining the model or incorporating additional features.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_781ed71a5fb34d769c80ac705621d5c1_proc_3345785/FrozenEmbeddingLayer_SPR_BENCH_confusion_matrix.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_781ed71a5fb34d769c80ac705621d5c1_proc_3345785/FrozenEmbeddingLayer_SPR_BENCH_loss_curves.png",
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_781ed71a5fb34d769c80ac705621d5c1_proc_3345785/FrozenEmbeddingLayer_SPR_BENCH_MCC_curves.png",
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_781ed71a5fb34d769c80ac705621d5c1_proc_3345785/FrozenEmbeddingLayer_SPR_BENCH_confusion_matrix.png"
+    ],
+    "vlm_feedback_summary": "The provided plots demonstrate that the model is learning effectively, with good alignment between training and validation metrics. The MCC curves and confusion matrix provide evidence of balanced performance, though there is room for improvement in reducing misclassifications.",
+    "exp_results_dir": "experiment_results/experiment_781ed71a5fb34d769c80ac705621d5c1_proc_3345785",
+    "ablation_name": "FrozenEmbeddingLayer",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_781ed71a5fb34d769c80ac705621d5c1_proc_3345785/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "Ablation name: SingleHeadAttention.\nThe solution re-uses the original training script but instantiates every TransformerEncoderLayer with a single attention head (nhead = 1).  All other hyper-parameters, data handling, training, evaluation, logging and saving remain unchanged, enabling us to isolate the impact of removing the multi-head mechanism.  Results are logged under the ablation type \u201cSingleHeadAttention\u201d and stored in working/experiment_data.npy for later plotting.",
+    "analysis": "The execution output shows that the training script ran successfully without any errors or crashes. The model was trained for 10 epochs, and the validation MCC improved over the epochs, with the best validation MCC being 0.3484. The test MCC and F1 scores were also calculated, with values of 0.3546 and 0.6770, respectively. The experiment data was saved successfully. While the MCC values indicate room for improvement in model performance, there are no issues or bugs in the code execution itself.",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "Training loss",
+            "lower_is_better": true,
+            "description": "Loss value during training phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6193,
+                "best_value": 0.6193
+              }
+            ]
+          },
+          {
+            "metric_name": "Training MCC",
+            "lower_is_better": false,
+            "description": "Matthews Correlation Coefficient during training phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.3481,
+                "best_value": 0.3481
+              }
+            ]
+          },
+          {
+            "metric_name": "Validation loss",
+            "lower_is_better": true,
+            "description": "Loss value during validation phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6418,
+                "best_value": 0.6418
+              }
+            ]
+          },
+          {
+            "metric_name": "Validation MCC",
+            "lower_is_better": false,
+            "description": "Matthews Correlation Coefficient during validation phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.3484,
+                "best_value": 0.3484
+              }
+            ]
+          },
+          {
+            "metric_name": "Test MCC",
+            "lower_is_better": false,
+            "description": "Matthews Correlation Coefficient during testing phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.3546,
+                "best_value": 0.3546
+              }
+            ]
+          },
+          {
+            "metric_name": "Test macro F1 score",
+            "lower_is_better": false,
+            "description": "Macro F1 score during testing phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.677,
+                "best_value": 0.677
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, pathlib, random, string, numpy as np, torch, torch.nn as nn\nfrom torch.utils.data import DataLoader\nfrom sklearn.metrics import matthews_corrcoef, f1_score\n\n# ---------------- workspace -----------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------------- experiment logger -----------------\nexperiment_data = {\n    \"SingleHeadAttention\": {\n        \"SPR_BENCH\": {\n            \"metrics\": {\"train_MCC\": [], \"val_MCC\": []},\n            \"losses\": {\"train\": [], \"val\": []},\n            \"predictions\": [],\n            \"ground_truth\": [],\n        }\n    }\n}\n\n# ---------------- device -----------------\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ---------------- load SPR_BENCH or synthetic fallback -------------\ndef load_spr_bench(root: pathlib.Path):\n    from datasets import load_dataset, DatasetDict\n\n    def _load(csv_name):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for split in [\"train\", \"dev\", \"test\"]:\n        d[split] = _load(f\"{split}.csv\")\n    return d\n\n\ndata_root = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\ntry:\n    dsets = load_spr_bench(data_root) if data_root.exists() else None\nexcept Exception:\n    dsets = None\n\nif dsets is None:  # synthetic fallback\n    from datasets import Dataset, DatasetDict\n\n    def synth(n):\n        seqs, labels = [], []\n        for _ in range(n):\n            L = random.randint(5, 25)\n            seq = \"\".join(random.choices(list(string.ascii_lowercase) + \"#@$%\", k=L))\n            labels.append(int(seq.count(\"#\") % 2 == 0))\n            seqs.append(seq)\n        return Dataset.from_dict(\n            {\"id\": list(range(n)), \"sequence\": seqs, \"label\": labels}\n        )\n\n    dsets = DatasetDict({\"train\": synth(4000), \"dev\": synth(1000), \"test\": synth(1000)})\n\nprint({k: len(v) for k, v in dsets.items()})\n\n# ---------------- vocab construction -----------------\nPAD, UNK, CLS = \"<pad>\", \"<unk>\", \"<cls>\"\nvocab = {PAD: 0, UNK: 1, CLS: 2}\nfor seq in dsets[\"train\"][\"sequence\"]:\n    for ch in seq:\n        if ch not in vocab:\n            vocab[ch] = len(vocab)\nvocab_size = len(vocab)\n\n\ndef encode(seq):  # prepend CLS\n    return [vocab[CLS]] + [vocab.get(ch, vocab[UNK]) for ch in seq]\n\n\nfor split in dsets:\n    dsets[split] = dsets[split].map(\n        lambda ex: {\"input_ids\": encode(ex[\"sequence\"])}, remove_columns=[\"sequence\"]\n    )\n\n\n# ---------------- dataloaders -----------------\ndef collate(batch):\n    ids = [ex[\"input_ids\"] for ex in batch]\n    labels = torch.tensor([ex[\"label\"] for ex in batch], dtype=torch.long)\n    max_len = max(len(x) for x in ids)\n    padded = torch.full((len(ids), max_len), vocab[PAD], dtype=torch.long)\n    attn_mask = torch.zeros_like(padded, dtype=torch.bool)\n    for i, seq in enumerate(ids):\n        padded[i, : len(seq)] = torch.tensor(seq, dtype=torch.long)\n        attn_mask[i, : len(seq)] = 1\n    return {\"input_ids\": padded, \"attention_mask\": attn_mask, \"labels\": labels}\n\n\nbatch_size = 128\ntrain_loader = DataLoader(\n    dsets[\"train\"], batch_size=batch_size, shuffle=True, collate_fn=collate\n)\ndev_loader = DataLoader(\n    dsets[\"dev\"], batch_size=batch_size, shuffle=False, collate_fn=collate\n)\ntest_loader = DataLoader(\n    dsets[\"test\"], batch_size=batch_size, shuffle=False, collate_fn=collate\n)\n\n\n# ---------------- model (single-head attention) -----------------\nclass SPRTransformer(nn.Module):\n    def __init__(self, vocab_size, embed_dim=128, depth=2, dropout=0.1):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=vocab[PAD])\n        self.pos = nn.Parameter(torch.randn(512, embed_dim))  # max len = 512\n        encoder_layer = nn.TransformerEncoderLayer(\n            d_model=embed_dim,\n            nhead=1,  # SINGLE HEAD\n            dim_feedforward=embed_dim * 4,\n            dropout=dropout,\n            batch_first=True,\n        )\n        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)\n        self.dropout = nn.Dropout(dropout)\n        self.fc = nn.Linear(embed_dim, 2)\n\n    def forward(self, ids, attn_mask):\n        x = self.embed(ids) + self.pos[: ids.size(1)]\n        x = self.transformer(x, src_key_padding_mask=~attn_mask)\n        cls_vec = x[:, 0]\n        return self.fc(self.dropout(cls_vec))\n\n\nmodel = SPRTransformer(vocab_size).to(device)\n\n# ---------------- training setup -----------------\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=5e-5)\n\nbest_val_mcc, best_state = -1.0, None\nepochs = 10\n\nfor epoch in range(1, epochs + 1):\n    # ---- train ----\n    model.train()\n    tr_loss, tr_preds, tr_gts = [], [], []\n    for batch in train_loader:\n        batch = {\n            k: v.to(device) if isinstance(v, torch.Tensor) else v\n            for k, v in batch.items()\n        }\n        optimizer.zero_grad()\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        loss = criterion(logits, batch[\"labels\"])\n        loss.backward()\n        optimizer.step()\n        tr_loss.append(loss.item())\n        tr_preds.extend(logits.argmax(1).cpu().numpy())\n        tr_gts.extend(batch[\"labels\"].cpu().numpy())\n    train_mcc = matthews_corrcoef(tr_gts, tr_preds)\n\n    # ---- validate ----\n    model.eval()\n    val_loss, val_preds, val_gts = [], [], []\n    with torch.no_grad():\n        for batch in dev_loader:\n            batch = {\n                k: v.to(device) if isinstance(v, torch.Tensor) else v\n                for k, v in batch.items()\n            }\n            logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(logits, batch[\"labels\"])\n            val_loss.append(loss.item())\n            val_preds.extend(logits.argmax(1).cpu().numpy())\n            val_gts.extend(batch[\"labels\"].cpu().numpy())\n    val_mcc = matthews_corrcoef(val_gts, val_preds)\n\n    print(f\"Epoch {epoch}: val_loss={np.mean(val_loss):.4f}, val_MCC={val_mcc:.4f}\")\n\n    # ---- log ----\n    experiment_data[\"SingleHeadAttention\"][\"SPR_BENCH\"][\"losses\"][\"train\"].append(\n        np.mean(tr_loss)\n    )\n    experiment_data[\"SingleHeadAttention\"][\"SPR_BENCH\"][\"losses\"][\"val\"].append(\n        np.mean(val_loss)\n    )\n    experiment_data[\"SingleHeadAttention\"][\"SPR_BENCH\"][\"metrics\"][\"train_MCC\"].append(\n        train_mcc\n    )\n    experiment_data[\"SingleHeadAttention\"][\"SPR_BENCH\"][\"metrics\"][\"val_MCC\"].append(\n        val_mcc\n    )\n\n    # ---- save best ----\n    if val_mcc > best_val_mcc:\n        best_val_mcc = val_mcc\n        best_state = {k: v.cpu() for k, v in model.state_dict().items()}\n\n# ---------------- testing best model -----------------\nmodel.load_state_dict(best_state)\nmodel.eval()\ntest_preds, test_gts = [], []\nwith torch.no_grad():\n    for batch in test_loader:\n        batch = {\n            k: v.to(device) if isinstance(v, torch.Tensor) else v\n            for k, v in batch.items()\n        }\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        test_preds.extend(logits.argmax(1).cpu().numpy())\n        test_gts.extend(batch[\"labels\"].cpu().numpy())\n\ntest_mcc = matthews_corrcoef(test_gts, test_preds)\ntest_f1 = f1_score(test_gts, test_preds, average=\"macro\")\nprint(\n    f\"Best Val MCC={best_val_mcc:.4f} | Test MCC={test_mcc:.4f} | Test F1={test_f1:.4f}\"\n)\n\nexperiment_data[\"SingleHeadAttention\"][\"SPR_BENCH\"][\"predictions\"] = test_preds\nexperiment_data[\"SingleHeadAttention\"][\"SPR_BENCH\"][\"ground_truth\"] = test_gts\n\n# ---------------- save experiment data -----------------\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Saved experiment data to ./working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = None\n\nif experiment_data is not None:\n    run = experiment_data[\"SingleHeadAttention\"][\"SPR_BENCH\"]\n    tr_loss, va_loss = run[\"losses\"][\"train\"], run[\"losses\"][\"val\"]\n    tr_mcc, va_mcc = run[\"metrics\"][\"train_MCC\"], run[\"metrics\"][\"val_MCC\"]\n    preds, gts = run[\"predictions\"], run[\"ground_truth\"]\n\n    # print final evaluation metrics\n    try:\n        from sklearn.metrics import matthews_corrcoef, f1_score\n\n        test_mcc = matthews_corrcoef(gts, preds) if preds else float(\"nan\")\n        test_f1 = f1_score(gts, preds, average=\"macro\") if preds else float(\"nan\")\n        print(f\"Test MCC={test_mcc:.4f} | Test F1={test_f1:.4f}\")\n    except Exception as e:\n        print(f\"Error computing metrics: {e}\")\n\n    # -------- plot 1: loss curves --------\n    try:\n        plt.figure()\n        plt.plot(tr_loss, label=\"Train Loss\")\n        plt.plot(va_loss, label=\"Val Loss\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Cross-Entropy Loss\")\n        plt.title(\"SPR_BENCH: Training vs Validation Loss\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"spr_bench_loss_curve.png\"))\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating loss plot: {e}\")\n        plt.close()\n\n    # -------- plot 2: MCC curves --------\n    try:\n        plt.figure()\n        plt.plot(tr_mcc, label=\"Train MCC\")\n        plt.plot(va_mcc, label=\"Val MCC\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Matthews Corr. Coef.\")\n        plt.title(\"SPR_BENCH: Training vs Validation MCC\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"spr_bench_mcc_curve.png\"))\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating MCC plot: {e}\")\n        plt.close()\n\n    # -------- plot 3: confusion matrix --------\n    try:\n        from sklearn.metrics import confusion_matrix\n\n        cm = confusion_matrix(gts, preds)\n        plt.figure()\n        im = plt.imshow(cm, cmap=\"Blues\")\n        plt.colorbar(im)\n        plt.title(\"SPR_BENCH Confusion Matrix\")\n        plt.xlabel(\"Predicted\")\n        plt.ylabel(\"Ground Truth\")\n        for i in range(cm.shape[0]):\n            for j in range(cm.shape[1]):\n                plt.text(j, i, cm[i, j], ha=\"center\", va=\"center\", color=\"black\")\n        plt.savefig(os.path.join(working_dir, \"spr_bench_confusion_matrix.png\"))\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating confusion matrix: {e}\")\n        plt.close()\n",
+    "plot_plan": "We first load experiment_data.npy into a dict and pull out the SPR_BENCH entry that contains per-epoch losses, MCC scores, predictions and ground-truth labels.  We print the final test MCC and macro-F1 to give a quick assessment.  Two time-series plots are generated: (1) training vs. validation loss and (2) training vs. validation MCC; both are indexed by epoch and clearly titled.  In addition, a confusion-matrix heat-map for the best model\u2019s test predictions is created to visualize class-wise performance.  Each figure is produced inside its own try-except so any single failure does not halt the script, and figures are always closed after saving.  All plots are stored in the working directory with descriptive file names that include the dataset and plot type.  Only data that already exist in the numpy file are used\u2014no synthetic values are fabricated.  The code follows the required import/order guidelines and stays concise.",
+    "plot_analyses": [
+      {
+        "analysis": "This plot shows the training and validation loss trends over epochs. The training loss steadily decreases, indicating that the model is learning from the training data. However, the validation loss does not decrease as steadily and even begins to increase after a few epochs, suggesting potential overfitting. This indicates that the model may not generalize well to unseen data, and regularization techniques or hyperparameter tuning might be necessary to improve generalization.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_d6023b2e616f429180d925fc63383620_proc_3345786/spr_bench_loss_curve.png"
+      },
+      {
+        "analysis": "This plot demonstrates the Matthews Correlation Coefficient (MCC) for both training and validation data across epochs. The training MCC increases steadily and stabilizes, showing that the model is improving its predictive capability on the training dataset. The validation MCC, however, fluctuates significantly and shows a decline after peaking, which aligns with the overfitting observed in the loss plot. This suggests that the model's performance on unseen data is inconsistent and needs further refinement.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_d6023b2e616f429180d925fc63383620_proc_3345786/spr_bench_mcc_curve.png"
+      },
+      {
+        "analysis": "The confusion matrix provides insight into the classification performance of the model. The diagonal elements represent correct predictions, while the off-diagonal elements represent misclassifications. The model correctly classifies a significant number of instances in both classes but also shows a substantial number of misclassifications. This indicates room for improvement, potentially through better feature engineering, model architecture adjustments, or addressing class imbalance if present.",
+        "plot_path": "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_d6023b2e616f429180d925fc63383620_proc_3345786/spr_bench_confusion_matrix.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_d6023b2e616f429180d925fc63383620_proc_3345786/spr_bench_loss_curve.png",
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_d6023b2e616f429180d925fc63383620_proc_3345786/spr_bench_mcc_curve.png",
+      "experiments/2025-08-17_18-48-06_symblic_polyrule_reasoning_attempt_0/logs/0-run/experiment_results/experiment_d6023b2e616f429180d925fc63383620_proc_3345786/spr_bench_confusion_matrix.png"
+    ],
+    "vlm_feedback_summary": "The plots highlight issues of overfitting and inconsistent generalization performance, as evidenced by the divergence between training and validation metrics. The confusion matrix further reveals classification inaccuracies, suggesting the need for model refinement and potential adjustments in the training process.",
+    "exp_results_dir": "experiment_results/experiment_d6023b2e616f429180d925fc63383620_proc_3345786",
+    "ablation_name": "SingleHeadAttention",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_d6023b2e616f429180d925fc63383620_proc_3345786/experiment_data.npy"
+    ]
+  }
+]

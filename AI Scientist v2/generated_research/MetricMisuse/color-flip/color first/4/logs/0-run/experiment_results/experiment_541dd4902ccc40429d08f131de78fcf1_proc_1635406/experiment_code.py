@@ -1,0 +1,282 @@
+# dropout_hparam_tuning.py
+import os, pathlib, random, math, time, itertools, sys, warnings
+import numpy as np, torch
+from torch import nn
+from torch.utils.data import DataLoader
+from datasets import load_dataset, DatasetDict, Dataset
+from sklearn.cluster import KMeans
+
+# ------------- misc & GPU ----------------- #
+working_dir = os.path.join(os.getcwd(), "working")
+os.makedirs(working_dir, exist_ok=True)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+
+# ------------- dataset utils -------------- #
+def load_spr_bench(root: pathlib.Path) -> DatasetDict:
+    def _load(csv_name: str):
+        return load_dataset(
+            "csv",
+            data_files=str(root / csv_name),
+            split="train",
+            cache_dir=".cache_dsets",
+        )
+
+    return DatasetDict(
+        train=_load("train.csv"), dev=_load("dev.csv"), test=_load("test.csv")
+    )
+
+
+def try_load_dataset() -> DatasetDict:
+    default_path = pathlib.Path("/home/zxl240011/AI-Scientist-v2/SPR_BENCH/")
+    if default_path.exists():
+        print("Loading real SPR_BENCH dataset…")
+        return load_spr_bench(default_path)
+    print("Real dataset not found – generating synthetic toy data.")
+    shapes, colors = ["▲", "■", "●", "◆"], list("RGBY")
+
+    def gen(n):
+        seqs, labels, ids = [], [], []
+        for i in range(n):
+            ids.append(str(i))
+            toks = [
+                random.choice(shapes) + random.choice(colors)
+                for _ in range(random.randint(4, 10))
+            ]
+            seqs.append(" ".join(toks))
+            labels.append(random.choice(["ruleA", "ruleB", "ruleC"]))
+        return Dataset.from_dict({"id": ids, "sequence": seqs, "label": labels})
+
+    return DatasetDict(train=gen(500), dev=gen(100), test=gen(100))
+
+
+# ------------- metrics -------------------- #
+def count_color_variety(seq):
+    return len(set(tok[1] for tok in seq.split() if len(tok) > 1))
+
+
+def count_shape_variety(seq):
+    return len(set(tok[0] for tok in seq.strip().split()))
+
+
+def color_weighted_accuracy(seqs, y_true, y_pred):
+    w = [count_color_variety(s) for s in seqs]
+    c = [w_i if t == p else 0 for w_i, t, p in zip(w, y_true, y_pred)]
+    return sum(c) / sum(w) if sum(w) > 0 else 0.0
+
+
+def shape_weighted_accuracy(seqs, y_true, y_pred):
+    w = [count_shape_variety(s) for s in seqs]
+    c = [w_i if t == p else 0 for w_i, t, p in zip(w, y_true, y_pred)]
+    return sum(c) / sum(w) if sum(w) > 0 else 0.0
+
+
+def pc_weighted_accuracy(seqs, y_true, y_pred):
+    w = [count_color_variety(s) + count_shape_variety(s) for s in seqs]
+    c = [w_i if t == p else 0 for w_i, t, p in zip(w, y_true, y_pred)]
+    return sum(c) / sum(w) if sum(w) > 0 else 0.0
+
+
+# ------------- torch dataset -------------- #
+class SPRTorchDataset(torch.utils.data.Dataset):
+    def __init__(self, hf_split, stoi_dict, label2id):
+        self.seqs = hf_split["sequence"]
+        self.labels = [label2id[l] for l in hf_split["label"]]
+        self.stoi = stoi_dict
+
+    def __len__(self):
+        return len(self.seqs)
+
+    def __getitem__(self, idx):
+        ids = [self.stoi[t] for t in self.seqs[idx].split()]
+        return {
+            "input_ids": torch.tensor(ids, dtype=torch.long),
+            "labels": torch.tensor(self.labels[idx], dtype=torch.long),
+            "raw": self.seqs[idx],
+        }
+
+
+def collate_f(batch):
+    maxlen = max(len(x["input_ids"]) for x in batch)
+    input_ids = torch.stack(
+        [
+            torch.nn.functional.pad(
+                x["input_ids"], (0, maxlen - len(x["input_ids"])), value=0
+            )
+            for x in batch
+        ]
+    )
+    labels = torch.stack([x["labels"] for x in batch])
+    raw = [x["raw"] for x in batch]
+    return {"input_ids": input_ids, "labels": labels, "raw": raw}
+
+
+# ------------- model ---------------------- #
+class EncoderClassifier(nn.Module):
+    def __init__(self, vocab, embed_dim=32, hidden=64, classes=3, dropout_rate=0.0):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab, embed_dim, padding_idx=0)
+        self.rnn = nn.GRU(embed_dim, hidden, batch_first=True, bidirectional=True)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.lin = nn.Linear(hidden * 2, classes)
+
+    def forward(self, x):
+        emb = self.embedding(x)
+        _, h = self.rnn(emb)
+        h = torch.cat([h[0], h[1]], dim=1)
+        h = self.dropout(h)
+        return self.lin(h)
+
+
+# ------------- training loop -------------- #
+def run_experiment(dropout_rate, epochs=5, batch_size=64):
+    # reload dataset fresh for each run
+    spr = try_load_dataset()
+
+    # vocab & labels
+    def build_vocab(dataset):
+        vocab = set()
+        [vocab.update(s.split()) for s in dataset["sequence"]]
+        return {tok: i + 1 for i, tok in enumerate(sorted(vocab))}
+
+    stoi = build_vocab(spr["train"])
+    itos = {i: t for t, i in stoi.items()}
+    label2id = {l: i for i, l in enumerate(sorted(set(spr["train"]["label"])))}
+    num_classes = len(label2id)
+    # loaders
+    train_loader = DataLoader(
+        SPRTorchDataset(spr["train"], stoi, label2id),
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_f,
+    )
+    dev_loader = DataLoader(
+        SPRTorchDataset(spr["dev"], stoi, label2id),
+        batch_size=batch_size * 2,
+        shuffle=False,
+        collate_fn=collate_f,
+    )
+    # model
+    model = EncoderClassifier(
+        len(stoi) + 1, classes=num_classes, dropout_rate=dropout_rate
+    ).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    kmeans_done = False
+    logs = {
+        "metrics": {"train": [], "val": []},
+        "losses": {"train": [], "val": []},
+        "predictions": [],
+        "ground_truth": [],
+    }
+    for epoch in range(1, epochs + 1):
+        # ---- train ----
+        model.train()
+        total_loss = 0
+        for batch in train_loader:
+            batch_tensors = {
+                k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                for k, v in batch.items()
+            }
+            optimizer.zero_grad()
+            logits = model(batch_tensors["input_ids"])
+            loss = criterion(logits, batch_tensors["labels"])
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * batch_tensors["labels"].size(0)
+        train_loss = total_loss / len(train_loader.dataset)
+        logs["losses"]["train"].append(train_loss)
+        # ---- val ----
+        model.eval()
+        val_loss = 0
+        all_preds = []
+        all_labels = []
+        all_raw = []
+        with torch.no_grad():
+            for batch in dev_loader:
+                batch_tensors = {
+                    k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                    for k, v in batch.items()
+                }
+                logits = model(batch_tensors["input_ids"])
+                loss = criterion(logits, batch_tensors["labels"])
+                val_loss += loss.item() * batch_tensors["labels"].size(0)
+                preds = torch.argmax(logits, 1).cpu().tolist()
+                all_preds.extend(preds)
+                all_labels.extend(batch_tensors["labels"].cpu().tolist())
+                all_raw.extend(batch["raw"])
+        val_loss /= len(dev_loader.dataset)
+        acc = float(np.mean([p == l for p, l in zip(all_preds, all_labels)]))
+        cwa = color_weighted_accuracy(all_raw, all_labels, all_preds)
+        swa = shape_weighted_accuracy(all_raw, all_labels, all_preds)
+        pcwa = pc_weighted_accuracy(all_raw, all_labels, all_preds)
+        logs["losses"]["val"].append(val_loss)
+        logs["metrics"]["val"].append(
+            {"epoch": epoch, "acc": acc, "cwa": cwa, "swa": swa, "pcwa": pcwa}
+        )
+        print(
+            f"[dropout={dropout_rate}] Epoch {epoch}: train_loss={train_loss:.4f} val_loss={val_loss:.4f} ACC={acc:.3f} CWA={cwa:.3f} SWA={swa:.3f} PCWA={pcwa:.3f}"
+        )
+        # ---- latent clustering once ----
+        if (not kmeans_done) and epoch == 1:
+            print("Performing latent glyph clustering …")
+            with torch.no_grad():
+                emb_np = model.embedding.weight.detach().cpu().numpy()[1:]
+            n_clusters = min(16, emb_np.shape[0])
+            km = KMeans(n_clusters=n_clusters, n_init=10, random_state=0).fit(emb_np)
+            orig_stoi = dict(stoi)
+            token_to_cluster = {
+                tok: int(cid) + 1
+                for tok, cid in zip(
+                    sorted(orig_stoi, key=lambda t: orig_stoi[t]), km.labels_
+                )
+            }
+            new_emb = nn.Embedding(
+                n_clusters + 1, model.embedding.embedding_dim, padding_idx=0
+            ).to(device)
+            new_emb.weight.data[1:] = torch.tensor(
+                km.cluster_centers_, dtype=torch.float32, device=device
+            )
+            model.embedding = new_emb
+
+            # remap hf dataset
+            def remap_example(ex):
+                return {
+                    "sequence": " ".join(
+                        map(str, [token_to_cluster[t] for t in ex["sequence"].split()])
+                    )
+                }
+
+            for split in ["train", "dev", "test"]:
+                spr[split] = spr[split].map(
+                    remap_example, batched=False, load_from_cache_file=False
+                )
+            stoi = {str(i): i for i in range(1, n_clusters + 1)}
+            train_loader = DataLoader(
+                SPRTorchDataset(spr["train"], stoi, label2id),
+                batch_size=batch_size,
+                shuffle=True,
+                collate_fn=collate_f,
+            )
+            dev_loader = DataLoader(
+                SPRTorchDataset(spr["dev"], stoi, label2id),
+                batch_size=batch_size * 2,
+                shuffle=False,
+                collate_fn=collate_f,
+            )
+            kmeans_done = True
+            print("Clustering completed. New vocab:", n_clusters)
+    logs["predictions"] = all_preds
+    logs["ground_truth"] = all_labels
+    return logs
+
+
+# ------------- hyper-parameter sweep ----- #
+experiment_data = {"dropout_rate": {}}
+for dr in [0.0, 0.2, 0.5]:
+    experiment_data["dropout_rate"][f"{dr}"] = run_experiment(dr)
+
+# ------------- save ---------------------- #
+np.save(os.path.join(working_dir, "experiment_data.npy"), experiment_data)
+print("Saved experiment data to", os.path.join(working_dir, "experiment_data.npy"))

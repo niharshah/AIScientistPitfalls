@@ -1,0 +1,262 @@
+import os, pathlib, random, numpy as np, torch, torch.nn as nn, torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from typing import List, Dict
+from datasets import DatasetDict, load_dataset
+
+# ---------- REPRODUCIBILITY ----------
+random.seed(0)
+np.random.seed(0)
+torch.manual_seed(0)
+
+# ---------- I/O ----------
+working_dir = os.path.join(os.getcwd(), "working")
+os.makedirs(working_dir, exist_ok=True)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+
+# ---------- DATA ----------
+def load_spr_bench(root: pathlib.Path) -> DatasetDict:
+    def _load(split_csv: str):
+        return load_dataset(
+            "csv",
+            data_files=str(root / split_csv),
+            split="train",
+            cache_dir=".cache_dsets",
+        )
+
+    return DatasetDict(
+        {
+            "train": _load("train.csv"),
+            "dev": _load("dev.csv"),
+            "test": _load("test.csv"),
+        }
+    )
+
+
+DATA_PATH = pathlib.Path("/home/zxl240011/AI-Scientist-v2/SPR_BENCH/")
+dsets = load_spr_bench(DATA_PATH)
+print({k: len(v) for k, v in dsets.items()})
+
+# ---------- VOCAB (RARE N-GRAM PRUNING) ----------
+MIN_FREQ = 5  # prune all uni/bi-grams occurring < MIN_FREQ in train set
+
+
+def build_vocab_pruned(seqs: List[str], min_freq: int = MIN_FREQ) -> Dict[str, int]:
+    uni_cnt, bi_cnt = {}, {}
+    for s in seqs:
+        for c in s:
+            uni_cnt[c] = uni_cnt.get(c, 0) + 1
+        for i in range(len(s) - 1):
+            bg = s[i : i + 2]
+            bi_cnt[bg] = bi_cnt.get(bg, 0) + 1
+    vocab = [u for u, f in uni_cnt.items() if f >= min_freq] + [
+        b for b, f in bi_cnt.items() if f >= min_freq
+    ]
+    vocab = sorted(vocab)  # stable ordering
+    return {tok: i for i, tok in enumerate(vocab)}
+
+
+def vectorise(seq: str, idx: Dict[str, int]) -> np.ndarray:
+    v = np.zeros(len(idx), dtype=np.float32)
+    for c in seq:
+        if c in idx:
+            v[idx[c]] += 1.0
+    for i in range(len(seq) - 1):
+        bg = seq[i : i + 2]
+        if bg in idx:
+            v[idx[bg]] += 1.0
+    return v
+
+
+train_seqs = dsets["train"]["sequence"]
+vocab_idx = build_vocab_pruned(train_seqs, MIN_FREQ)
+num_feats = len(vocab_idx)
+print("Feature size after pruning:", num_feats)
+
+# ---------- LABELS ----------
+labels = sorted(list(set(dsets["train"]["label"])))
+label2id = {l: i for i, l in enumerate(labels)}
+num_classes = len(labels)
+print("Classes:", labels)
+
+
+def encode_split(split):
+    X = np.stack([vectorise(s, vocab_idx) for s in dsets[split]["sequence"]])
+    y = np.array([label2id[l] for l in dsets[split]["label"]], dtype=np.int64)
+    return X, y
+
+
+X_train, y_train = encode_split("train")
+X_dev, y_dev = encode_split("dev")
+X_test, y_test = encode_split("test")
+
+
+# ---------- DATASETS ----------
+class NgramDataset(Dataset):
+    def __init__(self, X, y):
+        self.X, self.y = X, y
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return {"x": torch.from_numpy(self.X[idx]), "y": torch.tensor(self.y[idx])}
+
+
+batch_size = 128
+train_loader = DataLoader(
+    NgramDataset(X_train, y_train), batch_size=batch_size, shuffle=True
+)
+dev_loader = DataLoader(NgramDataset(X_dev, y_dev), batch_size=batch_size)
+test_loader = DataLoader(NgramDataset(X_test, y_test), batch_size=batch_size)
+
+
+# ---------- MODEL ----------
+class LogReg(nn.Module):
+    def __init__(self, in_dim, num_classes):
+        super().__init__()
+        self.linear = nn.Linear(in_dim, num_classes, bias=True)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+criterion = nn.CrossEntropyLoss()
+
+# ---------- EXPERIMENT DATA ----------
+experiment_data = {
+    "rare_ngram_pruning": {
+        "SPR_BENCH": {
+            "configs": [],
+            "metrics": {"train_acc": [], "val_acc": [], "rule_fidelity": []},
+            "losses": {"train": [], "val": []},
+            "predictions": [],
+            "ground_truth": y_test.tolist(),
+            "best_config": "",
+        }
+    }
+}
+
+
+# ---------- HELPERS ----------
+def evaluate(model, loader):
+    model.eval()
+    correct, total, loss_sum = 0, 0, 0.0
+    all_logits = []
+    with torch.no_grad():
+        for batch in loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            logits = model(batch["x"])
+            loss = criterion(logits, batch["y"])
+            _, preds = torch.max(logits, 1)
+            correct += (preds == batch["y"]).sum().item()
+            total += batch["y"].size(0)
+            loss_sum += loss.item() * batch["y"].size(0)
+            all_logits.append(logits.cpu())
+    return correct / total, loss_sum / total, torch.cat(all_logits)
+
+
+# ---------- TRAIN ----------
+grid = [("adam", None)] + [("sgd", m) for m in (0.0, 0.5, 0.9)]
+lr_map = {"adam": 1e-3, "sgd": 0.1}
+epochs, top_k = 10, 10
+
+best_val_acc, best_pred, best_cfg_name = -1.0, None, ""
+
+for opt_name, momentum in grid:
+    cfg_name = opt_name if opt_name == "adam" else f"sgd_m{momentum}"
+    experiment_data["rare_ngram_pruning"]["SPR_BENCH"]["configs"].append(cfg_name)
+    print(f"\n=== Training ({cfg_name}) ===")
+    model = LogReg(num_feats, num_classes).to(device)
+    optimizer = (
+        optim.Adam(model.parameters(), lr=lr_map["adam"])
+        if opt_name == "adam"
+        else optim.SGD(model.parameters(), lr=lr_map["sgd"], momentum=momentum)
+    )
+
+    run_train_acc, run_val_acc, run_rule_fid = [], [], []
+    run_train_loss, run_val_loss = [], []
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        seen, correct, running_loss = 0, 0, 0.0
+        for batch in train_loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            optimizer.zero_grad()
+            logits = model(batch["x"])
+            loss = criterion(logits, batch["y"])
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * batch["y"].size(0)
+            _, preds = torch.max(logits, 1)
+            correct += (preds == batch["y"]).sum().item()
+            seen += batch["y"].size(0)
+
+        train_loss = running_loss / seen
+        train_acc = correct / seen
+        val_acc, val_loss, _ = evaluate(model, dev_loader)
+
+        # rule fidelity (top-k truncated weights vs full weights)
+        W = model.linear.weight.detach().cpu().numpy()
+        b = model.linear.bias.detach().cpu().numpy()
+        W_trunc = np.zeros_like(W)
+        for c in range(num_classes):
+            top_idx = np.argsort(-np.abs(W[c]))[:top_k]
+            W_trunc[c, top_idx] = W[c, top_idx]
+        lin_full = torch.from_numpy((X_dev @ W.T) + b)
+        lin_trunc = torch.from_numpy((X_dev @ W_trunc.T) + b)
+        rule_fid = (
+            (torch.argmax(lin_trunc, 1) == torch.argmax(lin_full, 1))
+            .float()
+            .mean()
+            .item()
+        )
+
+        # store
+        run_train_acc.append(train_acc)
+        run_val_acc.append(val_acc)
+        run_rule_fid.append(rule_fid)
+        run_train_loss.append(train_loss)
+        run_val_loss.append(val_loss)
+
+        print(
+            f"Epoch {epoch}: train_acc={train_acc:.3f} val_acc={val_acc:.3f} rule_fid={rule_fid:.3f}"
+        )
+
+    # aggregate
+    ed = experiment_data["rare_ngram_pruning"]["SPR_BENCH"]
+    ed["metrics"]["train_acc"].append(run_train_acc)
+    ed["metrics"]["val_acc"].append(run_val_acc)
+    ed["metrics"]["rule_fidelity"].append(run_rule_fid)
+    ed["losses"]["train"].append(run_train_loss)
+    ed["losses"]["val"].append(run_val_loss)
+
+    if run_val_acc[-1] > best_val_acc:
+        best_val_acc = run_val_acc[-1]
+        best_cfg_name = cfg_name
+        test_acc, test_loss, test_logits = evaluate(model, test_loader)
+        best_pred = torch.argmax(test_logits, 1).cpu().numpy()
+        print(f"*** New best cfg={cfg_name}  test_acc={test_acc:.3f}")
+
+# ---------- SAVE ----------
+ed = experiment_data["rare_ngram_pruning"]["SPR_BENCH"]
+ed["predictions"] = best_pred.tolist()
+ed["best_config"] = best_cfg_name
+
+
+def to_np(obj):
+    return np.array(obj, dtype=object)
+
+
+for k in ["train_acc", "val_acc", "rule_fidelity"]:
+    ed["metrics"][k] = to_np(ed["metrics"][k])
+for k in ["train", "val"]:
+    ed["losses"][k] = to_np(ed["losses"][k])
+ed["predictions"] = np.array(ed["predictions"])
+ed["ground_truth"] = np.array(ed["ground_truth"])
+
+np.save(os.path.join(working_dir, "experiment_data.npy"), experiment_data)
+print(f"\nBest configuration: {best_cfg_name} (dev_acc={best_val_acc:.3f})")
+print("Results saved to", os.path.join(working_dir, "experiment_data.npy"))

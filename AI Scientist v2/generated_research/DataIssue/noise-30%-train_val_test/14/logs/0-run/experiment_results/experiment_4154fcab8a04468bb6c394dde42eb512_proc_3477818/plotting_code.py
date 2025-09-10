@@ -1,0 +1,4 @@
+import matplotlib.pyplot as plt
+import numpy as np
+
+We will load experiment_data.npy, iterate over the three SPR_BENCH variants, and extract per-epoch losses and metrics. Four separate figures are generated: (1) training vs. validation loss, (2) macro-F1, (3) MCC, and (4) accuracy, each containing a line for every model so we stay within the 5-figure budget. In every case we wrap the plotting logic in a try-except block, give clear titles/subtitles, save to working_dir with descriptive names, and close the figure. After plotting, the script prints the final validation macro-F1 for quick numerical inspection. No fabricated data are used—everything is pulled directly from the stored numpy dict.

@@ -1,0 +1,553 @@
+[
+  {
+    "overall_plan": "The overall plan initially targeted hyperparameter tuning, specifically focusing on identifying optimal hidden dimension sizes for the SimpleSPRModel by evaluating various configurations (64, 128, 256, 512) and recording detailed statistics for performance analysis. This systematic tuning aimed to enhance model capacity and generalization. Subsequently, the plan includes an ablation study to investigate the impact of removing backward-context by switching to a unidirectional GRU encoder, allowing for a comparative assessment against the bidirectional baseline. This component-level analysis provides insights into the architectural significance of backward-context in the model's performance. Together, these initiatives combine quantitative parameter optimization with qualitative architectural evaluation to improve and understand the model's efficiency and effectiveness.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "train accuracy",
+            "lower_is_better": false,
+            "description": "The accuracy of the model on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.9991,
+                "best_value": 0.9997
+              }
+            ]
+          },
+          {
+            "metric_name": "validation accuracy",
+            "lower_is_better": false,
+            "description": "The accuracy of the model on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.998,
+                "best_value": 0.9994
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "The loss of the model on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.0055,
+                "best_value": 0.0039
+              }
+            ]
+          },
+          {
+            "metric_name": "test ZSRTA accuracy",
+            "lower_is_better": false,
+            "description": "The accuracy of the model on the test ZSRTA dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": null,
+                "best_value": null
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# unidirectional_gru_ablation.py\n# -------------------------------------------------------------\n# UniDirectional-GRU ablation for SPR-BENCH\n# -------------------------------------------------------------\nimport os, pathlib, time, random, json, math, numpy as np, torch\nfrom torch import nn\nfrom torch.utils.data import DataLoader, Dataset\nfrom datasets import DatasetDict, load_dataset\nfrom typing import List, Dict\n\n# -------------------------------------------------------------\n# reproducibility\nSEED = 42\nrandom.seed(SEED)\nnp.random.seed(SEED)\ntorch.manual_seed(SEED)\ntorch.backends.cudnn.deterministic = True\ntorch.backends.cudnn.benchmark = False\n\n# -------------------------------------------------------------\n# experiment container\nexperiment_data = {\"UniDirectional_GRU\": {\"SPR_BENCH\": {}}}\n\n# -------------------------------------------------------------\n# working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# -------------------------------------------------------------\n# device\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# -------------------------------------------------------------\n# util helpers\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(fname: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / fname),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    out = DatasetDict()\n    out[\"train\"] = _load(\"train.csv\")\n    out[\"dev\"] = _load(\"dev.csv\")\n    out[\"test\"] = _load(\"test.csv\")\n    return out\n\n\ndef count_shape_variety(sequence: str) -> int:\n    return len(set(tok[0] for tok in sequence.strip().split() if tok))\n\n\ndef count_color_variety(sequence: str) -> int:\n    return len(set(tok[1] for tok in sequence.strip().split() if len(tok) > 1))\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    c = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) else 0.0\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    c = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) else 0.0\n\n\n# -------------------------------------------------------------\n# load dataset (adjust path if needed)\nDATA_PATH = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\nspr = load_spr_bench(DATA_PATH)\nprint({k: len(v) for k, v in spr.items()})\n\n\n# -------------------------------------------------------------\n# vocab & label mapping\ndef build_vocab(ds) -> Dict[str, int]:\n    vocab = {\"<pad>\": 0, \"<unk>\": 1}\n    for seq in ds[\"sequence\"]:\n        for tok in seq.strip().split():\n            if tok not in vocab:\n                vocab[tok] = len(vocab)\n    return vocab\n\n\nvocab = build_vocab(spr[\"train\"])\nprint(f\"Vocab size: {len(vocab)}\")\n\ntrain_labels = sorted(set(spr[\"train\"][\"label\"]))\nlabel2id = {l: i for i, l in enumerate(train_labels)}\nid2label = {i: l for l, i in label2id.items()}\nnum_labels = len(label2id)\nprint(f\"# seen rule labels: {num_labels}\")\n\n\ndef encode_seq(seq: str, vocab: Dict[str, int]) -> List[int]:\n    return [vocab.get(tok, vocab[\"<unk>\"]) for tok in seq.strip().split()]\n\n\n# -------------------------------------------------------------\n# torch dataset / collate\nclass SPRTorchDataset(Dataset):\n    def __init__(self, split, vocab, label2id, train_mode=True):\n        self.seq_enc = [encode_seq(s, vocab) for s in split[\"sequence\"]]\n        self.labels = split[\"label\"]\n        self.train_mode = train_mode\n        self.label2id = label2id\n\n    def __len__(self):\n        return len(self.seq_enc)\n\n    def __getitem__(self, idx):\n        x = torch.tensor(self.seq_enc[idx], dtype=torch.long)\n        if self.train_mode:\n            y = torch.tensor(self.label2id[self.labels[idx]], dtype=torch.long)\n            return {\"input\": x, \"label\": y}\n        else:\n            return {\"input\": x, \"label_str\": self.labels[idx]}\n\n\ndef collate(batch):\n    xs = [b[\"input\"] for b in batch]\n    lens = torch.tensor([len(x) for x in xs], dtype=torch.long)\n    xs_pad = nn.utils.rnn.pad_sequence(xs, batch_first=True, padding_value=0)\n    out = {\"input\": xs_pad, \"lengths\": lens}\n    if \"label\" in batch[0]:\n        out[\"label\"] = torch.stack([b[\"label\"] for b in batch])\n    else:\n        out[\"label_str\"] = [b[\"label_str\"] for b in batch]\n    return out\n\n\ntrain_ds = SPRTorchDataset(spr[\"train\"], vocab, label2id, True)\ndev_ds = SPRTorchDataset(spr[\"dev\"], vocab, label2id, True)\ntest_ds = SPRTorchDataset(spr[\"test\"], vocab, label2id, False)\n\ntrain_loader = DataLoader(train_ds, batch_size=128, shuffle=True, collate_fn=collate)\ndev_loader = DataLoader(dev_ds, batch_size=256, shuffle=False, collate_fn=collate)\ntest_loader = DataLoader(test_ds, batch_size=256, shuffle=False, collate_fn=collate)\n\n\n# -------------------------------------------------------------\n# model (UniDirectional GRU)\nclass SimpleSPRModel(nn.Module):\n    def __init__(self, vocab_size: int, emb_dim: int, hidden_dim: int, num_labels: int):\n        super().__init__()\n        self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=0)\n        # Uni-directional GRU\n        self.gru = nn.GRU(emb_dim, hidden_dim, batch_first=True, bidirectional=False)\n        # Linear takes only hidden_dim (not doubled)\n        self.lin = nn.Linear(hidden_dim, num_labels)\n\n    def forward(self, x, lengths):\n        e = self.emb(x)\n        packed = nn.utils.rnn.pack_padded_sequence(\n            e, lengths.cpu(), batch_first=True, enforce_sorted=False\n        )\n        _, h = self.gru(packed)  # h shape: (1, B, H)\n        h = h.squeeze(0)  # (B, H)\n        return self.lin(h)\n\n\n# -------------------------------------------------------------\n# training helpers\ndef run_epoch(model, loader, criterion, opt=None):\n    train_mode = opt is not None\n    model.train() if train_mode else model.eval()\n    tot_loss = tot_ok = tot = 0\n    with torch.set_grad_enabled(train_mode):\n        for batch in loader:\n            inp = batch[\"input\"].to(device)\n            lens = batch[\"lengths\"].to(device)\n            lbl = batch[\"label\"].to(device)\n            logits = model(inp, lens)\n            loss = criterion(logits, lbl)\n            if train_mode:\n                opt.zero_grad()\n                loss.backward()\n                opt.step()\n            tot_loss += loss.item() * inp.size(0)\n            preds = logits.argmax(1)\n            tot_ok += (preds == lbl).sum().item()\n            tot += inp.size(0)\n    return tot_loss / tot, tot_ok / tot\n\n\ndef evaluate_test(model):\n    model.eval()\n    preds, gold, seqs = [], [], []\n    with torch.no_grad():\n        for batch in test_loader:\n            inp = batch[\"input\"].to(device)\n            lens = batch[\"lengths\"].to(device)\n            logits = model(inp, lens)\n            p = logits.argmax(1).cpu().tolist()\n            preds.extend([id2label.get(i, \"UNK\") for i in p])\n            gold.extend(batch[\"label_str\"])\n            seqs.extend(\n                [\n                    \" \".join(\n                        [list(vocab.keys())[tok] for tok in s.tolist() if tok != 0]\n                    )\n                    for s in batch[\"input\"]\n                ]\n            )\n    overall = np.mean([p == g for p, g in zip(preds, gold)])\n    swa = shape_weighted_accuracy(seqs, gold, preds)\n    cwa = color_weighted_accuracy(seqs, gold, preds)\n    seen = set(train_labels)\n    zs_idx = [i for i, g in enumerate(gold) if g not in seen]\n    zs_acc = np.mean([preds[i] == gold[i] for i in zs_idx]) if zs_idx else float(\"nan\")\n    return overall, swa, cwa, zs_acc, preds, gold\n\n\n# -------------------------------------------------------------\n# hyper-parameter tuning\nhidden_dims = [64, 128, 256, 512]\nEPOCHS = 5\nfor hd in hidden_dims:\n    print(f\"\\n=== UniDir GRU | hidden_dim={hd} ===\")\n    model = SimpleSPRModel(len(vocab), 64, hd, num_labels).to(device)\n    opt = torch.optim.Adam(model.parameters(), lr=1e-3)\n    criterion = nn.CrossEntropyLoss()\n    mdata = {\n        \"metrics\": {\"train_acc\": [], \"val_acc\": [], \"val_loss\": [], \"ZSRTA\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n        \"timestamps\": [],\n    }\n    for epoch in range(1, EPOCHS + 1):\n        tr_loss, tr_acc = run_epoch(model, train_loader, criterion, opt)\n        val_loss, val_acc = run_epoch(model, dev_loader, criterion)\n        mdata[\"metrics\"][\"train_acc\"].append(tr_acc)\n        mdata[\"metrics\"][\"val_acc\"].append(val_acc)\n        mdata[\"metrics\"][\"val_loss\"].append(val_loss)\n        mdata[\"losses\"][\"train\"].append(tr_loss)\n        mdata[\"losses\"][\"val\"].append(val_loss)\n        mdata[\"timestamps\"].append(time.time())\n        print(\n            f\"Epoch {epoch}: train_acc={tr_acc:.4f} val_acc={val_acc:.4f} val_loss={val_loss:.4f}\"\n        )\n    # final test\n    overall, swa, cwa, zs_acc, all_preds, all_gold = evaluate_test(model)\n    mdata[\"metrics\"][\"ZSRTA\"].append(zs_acc)\n    mdata[\"predictions\"] = all_preds\n    mdata[\"ground_truth\"] = all_gold\n    print(\n        f\"TEST Acc={overall:.4f} | SWA={swa:.4f} | CWA={cwa:.4f} | ZSRTA={zs_acc:.4f}\"\n    )\n    experiment_data[\"UniDirectional_GRU\"][\"SPR_BENCH\"][f\"hidden_{hd}\"] = mdata\n\n# -------------------------------------------------------------\n# save\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(f\"Saved experiment data to {working_dir}/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# -------------------- load experiment data --------------------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\nspr_runs = experiment_data.get(\"UniDirectional_GRU\", {}).get(\"SPR_BENCH\", {})\nhidden_keys = sorted(\n    spr_runs.keys(), key=lambda k: int(k.split(\"_\")[-1])\n)  # e.g. ['hidden_64', ...]\n\n# quick containers for printing\nsummary_vals, summary_zs = [], []\n\n# -------------------- Figure 1: Accuracy curves --------------------\ntry:\n    plt.figure()\n    for hk in hidden_keys:\n        metrics = spr_runs[hk][\"metrics\"]\n        epochs = range(1, len(metrics[\"train_acc\"]) + 1)\n        plt.plot(epochs, metrics[\"train_acc\"], label=f\"{hk}-train\", linestyle=\"--\")\n        plt.plot(epochs, metrics[\"val_acc\"], label=f\"{hk}-val\")\n        summary_vals.append(metrics[\"val_acc\"][-1])\n        summary_zs.append(metrics[\"ZSRTA\"][-1] if metrics[\"ZSRTA\"] else np.nan)\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Accuracy\")\n    plt.title(\"SPR_BENCH Accuracy Curves\\nLeft: Training, Right: Validation\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_BENCH_accuracy_curves.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating accuracy plot: {e}\")\n    plt.close()\n\n# -------------------- Figure 2: Loss curves --------------------\ntry:\n    plt.figure()\n    for hk in hidden_keys:\n        losses = spr_runs[hk][\"losses\"]\n        epochs = range(1, len(losses[\"train\"]) + 1)\n        plt.plot(epochs, losses[\"train\"], label=f\"{hk}-train\", linestyle=\"--\")\n        plt.plot(epochs, losses[\"val\"], label=f\"{hk}-val\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Cross-Entropy Loss\")\n    plt.title(\"SPR_BENCH Loss Curves\\nLeft: Training, Right: Validation\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_BENCH_loss_curves.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating loss plot: {e}\")\n    plt.close()\n\n# -------------------- Figure 3: ZSRTA bar chart --------------------\ntry:\n    plt.figure()\n    xs = np.arange(len(hidden_keys))\n    plt.bar(xs, summary_zs, color=\"skyblue\")\n    plt.xticks(xs, hidden_keys)\n    plt.ylabel(\"ZSRTA\")\n    plt.title(\"Zero-Shot Rule Transfer Accuracy (ZSRTA)\\nDataset: SPR_BENCH\")\n    fname = os.path.join(working_dir, \"SPR_BENCH_ZSRTA_bar.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating ZSRTA plot: {e}\")\n    plt.close()\n\n# -------------------- Print summary table --------------------\nprint(\"HiddenDim\\tFinalValAcc\\tZSRTA\")\nfor hk, v_acc, zs in zip(hidden_keys, summary_vals, summary_zs):\n    print(f\"{hk}\\t{v_acc:.4f}\\t{zs:.4f}\")\n",
+    "plot_plan": "The script first loads the saved experiment_data.npy, then extracts per-epoch training/validation accuracies and losses as well as the zero-shot rule transfer accuracies (ZSRTA) for every hidden-dimensional setting that was tested. Three figures are generated: (i) a multi-line plot comparing train vs. validation accuracy across epochs for all hidden sizes, (ii) a similar plot for train vs. validation loss, and (iii) a bar chart summarizing ZSRTA for each model. Each plot is wrapped in its own try-except block, saved with descriptive filenames in the working directory, and the figure is always closed afterward. Only data that actually exists inside experiment_data.npy are visualised, with a maximum of three figures (<5 limit). After plotting, the script prints a concise table showing the final validation accuracy and ZSRTA for every hidden size so the user can quickly gauge model quality without opening the plots. All requirements regarding imports, directory handling, and figure titling/naming conventions are respected. The entire workflow is contained in a single, concise Python script as requested.",
+    "plot_analyses": [
+      {
+        "analysis": "The accuracy curves indicate that the model's performance improves with increasing hidden layer sizes (64, 128, 256, 512). Both training and validation accuracies converge to near-perfect levels by epoch 5, suggesting that the model can effectively learn and generalize across the dataset. Larger hidden layer sizes (256 and 512) show slightly faster convergence, particularly in validation accuracy, which may indicate improved generalization capabilities for these configurations. However, the differences in final accuracy values between hidden layer sizes are minimal, implying that smaller architectures might suffice for this task.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_b79b0948b227485f946b2cfe64539468_proc_319695/SPR_BENCH_accuracy_curves.png"
+      },
+      {
+        "analysis": "The loss curves show a consistent decrease in cross-entropy loss for all configurations, with larger hidden layer sizes (256 and 512) showing faster convergence and lower final loss values. This pattern aligns with the accuracy curves and suggests that larger hidden layers enable the model to learn the task more efficiently. The validation loss closely follows the training loss for all configurations, which indicates a low risk of overfitting. The diminishing returns on loss reduction for hidden sizes larger than 256 suggest a potential trade-off between model complexity and performance.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_b79b0948b227485f946b2cfe64539468_proc_319695/SPR_BENCH_loss_curves.png"
+      },
+      {
+        "analysis": "The Zero-Shot Rule Transfer Accuracy (ZSRTA) plot appears to be empty, indicating that no meaningful results were obtained for this metric across the tested hidden layer sizes. This could imply an issue with the experimental setup, the metric calculation, or the model's ability to generalize to zero-shot tasks. Further investigation is needed to understand why ZSRTA results are absent and whether the model design or evaluation process needs adjustments.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_b79b0948b227485f946b2cfe64539468_proc_319695/SPR_BENCH_ZSRTA_bar.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_b79b0948b227485f946b2cfe64539468_proc_319695/SPR_BENCH_accuracy_curves.png",
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_b79b0948b227485f946b2cfe64539468_proc_319695/SPR_BENCH_loss_curves.png",
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_b79b0948b227485f946b2cfe64539468_proc_319695/SPR_BENCH_ZSRTA_bar.png"
+    ],
+    "vlm_feedback_summary": "The experimental results show that increasing hidden layer sizes improves model performance in terms of accuracy and loss, with diminishing returns beyond a certain size. However, the zero-shot evaluation metric (ZSRTA) yielded no results, indicating a potential issue that requires further investigation.",
+    "exp_results_dir": "experiment_results/experiment_b79b0948b227485f946b2cfe64539468_proc_319695",
+    "ablation_name": "UniDirectional-GRU",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_b79b0948b227485f946b2cfe64539468_proc_319695/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "The overall research plan consists of two key components: hyperparameter tuning of hidden dimensions and an ablation study on embedding fine-tuning. Initially, the plan involves iterating over various hidden-state sizes (64, 128, 256, 512) to build and train a SimpleSPRModel for each size, with performance metrics recorded and saved in an experiment_data dictionary. This establishes a baseline for understanding the impact of model capacity on performance. The subsequent plan introduces the Frozen-Embedding Ablation, where the baseline pipeline is reused with a crucial modification: the embedding layer's gradients are disabled, preventing it from being updated during training. This allows for an examination of the effects of embedding fine-tuning, utilizing the same set of hidden-state sizes for consistency. Together, these plans aim to provide a comprehensive understanding of both hidden dimension tuning and the necessity of embedding layer updates, offering valuable insights into model performance and guiding future research directions.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "train accuracy",
+            "lower_is_better": false,
+            "description": "Measures the accuracy of the model on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH (hidden_64)",
+                "final_value": 0.998,
+                "best_value": 0.998
+              },
+              {
+                "dataset_name": "SPR_BENCH (hidden_128)",
+                "final_value": 0.9993,
+                "best_value": 0.9993
+              },
+              {
+                "dataset_name": "SPR_BENCH (hidden_256)",
+                "final_value": 1.0,
+                "best_value": 1.0
+              },
+              {
+                "dataset_name": "SPR_BENCH (hidden_512)",
+                "final_value": 1.0,
+                "best_value": 1.0
+              }
+            ]
+          },
+          {
+            "metric_name": "validation accuracy",
+            "lower_is_better": false,
+            "description": "Measures the accuracy of the model on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH (hidden_64)",
+                "final_value": 0.9978,
+                "best_value": 0.9978
+              },
+              {
+                "dataset_name": "SPR_BENCH (hidden_128)",
+                "final_value": 0.9988,
+                "best_value": 0.9988
+              },
+              {
+                "dataset_name": "SPR_BENCH (hidden_256)",
+                "final_value": 1.0,
+                "best_value": 1.0
+              },
+              {
+                "dataset_name": "SPR_BENCH (hidden_512)",
+                "final_value": 0.9998,
+                "best_value": 0.9998
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "Measures the loss of the model on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH (hidden_64)",
+                "final_value": 0.0085,
+                "best_value": 0.0085
+              },
+              {
+                "dataset_name": "SPR_BENCH (hidden_128)",
+                "final_value": 0.0047,
+                "best_value": 0.0047
+              },
+              {
+                "dataset_name": "SPR_BENCH (hidden_256)",
+                "final_value": 0.0009,
+                "best_value": 0.0009
+              },
+              {
+                "dataset_name": "SPR_BENCH (hidden_512)",
+                "final_value": 0.0009,
+                "best_value": 0.0009
+              }
+            ]
+          },
+          {
+            "metric_name": "zero-shot rule transfer accuracy",
+            "lower_is_better": false,
+            "description": "Measures the model's accuracy in transferring rules without prior training on the specific dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH (hidden_64)",
+                "final_value": null,
+                "best_value": null
+              },
+              {
+                "dataset_name": "SPR_BENCH (hidden_128)",
+                "final_value": null,
+                "best_value": null
+              },
+              {
+                "dataset_name": "SPR_BENCH (hidden_256)",
+                "final_value": null,
+                "best_value": null
+              },
+              {
+                "dataset_name": "SPR_BENCH (hidden_512)",
+                "final_value": null,
+                "best_value": null
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# frozen_embedding_ablation.py\nimport os, pathlib, time, random, json, math, numpy as np, torch\nfrom torch import nn\nfrom torch.utils.data import DataLoader, Dataset\nfrom datasets import DatasetDict, load_dataset\nfrom typing import List, Dict\n\n# ----------------------------------------------------------------------\n# reproducibility\nSEED = 42\nrandom.seed(SEED)\nnp.random.seed(SEED)\ntorch.manual_seed(SEED)\ntorch.backends.cudnn.deterministic = True\ntorch.backends.cudnn.benchmark = False\n# ----------------------------------------------------------------------\n# experiment container --------------------------------------------------\nexperiment_data = {\"frozen_embedding_ablation\": {\"SPR_BENCH\": {}}}\n# ----------------------------------------------------------------------\n# working dir / save path ----------------------------------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n# ----------------------------------------------------------------------\n# device ----------------------------------------------------------------\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ----------------------------------------------------------------------\n# util functions --------------------------------------------------------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(csv_name: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    d[\"train\"] = _load(\"train.csv\")\n    d[\"dev\"] = _load(\"dev.csv\")\n    d[\"test\"] = _load(\"test.csv\")\n    return d\n\n\ndef count_shape_variety(sequence: str) -> int:\n    return len(set(tok[0] for tok in sequence.strip().split() if tok))\n\n\ndef count_color_variety(sequence: str) -> int:\n    return len(set(tok[1] for tok in sequence.strip().split() if len(tok) > 1))\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    c = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) > 0 else 0.0\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    c = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) > 0 else 0.0\n\n\n# ----------------------------------------------------------------------\n# load data -------------------------------------------------------------\n# change to your path if necessary\nDATA_PATH = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\nspr = load_spr_bench(DATA_PATH)\nprint({k: len(v) for k, v in spr.items()})\n\n\n# ----------------------------------------------------------------------\n# vocab + label mapping -------------------------------------------------\ndef build_vocab(dataset) -> Dict[str, int]:\n    vocab = {\"<pad>\": 0, \"<unk>\": 1}\n    for seq in dataset[\"sequence\"]:\n        for tok in seq.strip().split():\n            if tok not in vocab:\n                vocab[tok] = len(vocab)\n    return vocab\n\n\nvocab: Dict[str, int] = build_vocab(spr[\"train\"])\nprint(f\"Vocab size: {len(vocab)}\")\n\n\ndef encode_seq(seq: str, vocab: Dict[str, int]) -> List[int]:\n    return [vocab.get(tok, vocab[\"<unk>\"]) for tok in seq.strip().split()]\n\n\ntrain_labels = sorted(set(spr[\"train\"][\"label\"]))\nlabel2id = {l: i for i, l in enumerate(train_labels)}\nid2label = {i: l for l, i in label2id.items()}\nnum_labels = len(label2id)\nprint(f\"# seen rule labels: {num_labels}\")\n\n\n# ----------------------------------------------------------------------\n# Torch dataset ---------------------------------------------------------\nclass SPRTorchDataset(Dataset):\n    def __init__(self, split, vocab, label2id, train_mode=True):\n        self.seq_enc = [encode_seq(s, vocab) for s in split[\"sequence\"]]\n        self.labels = split[\"label\"]\n        self.train_mode = train_mode\n        self.label2id = label2id\n\n    def __len__(self):\n        return len(self.seq_enc)\n\n    def __getitem__(self, idx):\n        x = torch.tensor(self.seq_enc[idx], dtype=torch.long)\n        if self.train_mode:\n            y = torch.tensor(self.label2id[self.labels[idx]], dtype=torch.long)\n            return {\"input\": x, \"label\": y}\n        else:\n            return {\"input\": x, \"label_str\": self.labels[idx]}\n\n\ndef collate(batch):\n    xs = [b[\"input\"] for b in batch]\n    lens = [len(x) for x in xs]\n    xs_pad = nn.utils.rnn.pad_sequence(xs, batch_first=True, padding_value=0)\n    out = {\"input\": xs_pad, \"lengths\": torch.tensor(lens, dtype=torch.long)}\n    if \"label\" in batch[0]:\n        out[\"label\"] = torch.stack([b[\"label\"] for b in batch])\n    else:\n        out[\"label_str\"] = [b[\"label_str\"] for b in batch]\n    return out\n\n\n# loaders\ntrain_ds = SPRTorchDataset(spr[\"train\"], vocab, label2id, True)\ndev_ds = SPRTorchDataset(spr[\"dev\"], vocab, label2id, True)\ntest_ds = SPRTorchDataset(spr[\"test\"], vocab, label2id, False)\ntrain_loader = DataLoader(train_ds, batch_size=128, shuffle=True, collate_fn=collate)\ndev_loader = DataLoader(dev_ds, batch_size=256, shuffle=False, collate_fn=collate)\ntest_loader = DataLoader(test_ds, batch_size=256, shuffle=False, collate_fn=collate)\n\n\n# ----------------------------------------------------------------------\n# Model ----------------------------------------------------------------\nclass SimpleSPRModel(nn.Module):\n    def __init__(self, vocab_size, emb_dim, hidden_dim, num_labels, freeze_emb=False):\n        super().__init__()\n        self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=0)\n        # random init is default; just freeze if requested\n        if freeze_emb:\n            self.emb.weight.requires_grad = False\n        self.gru = nn.GRU(emb_dim, hidden_dim, batch_first=True, bidirectional=True)\n        self.lin = nn.Linear(hidden_dim * 2, num_labels)\n\n    def forward(self, x, lengths):\n        e = self.emb(x)\n        packed = nn.utils.rnn.pack_padded_sequence(\n            e, lengths.cpu(), batch_first=True, enforce_sorted=False\n        )\n        _, h = self.gru(packed)\n        h_cat = torch.cat([h[0], h[1]], dim=-1)\n        return self.lin(h_cat)\n\n\n# ----------------------------------------------------------------------\n# training / eval helpers ----------------------------------------------\ndef run_epoch(model, loader, criterion, opt=None):\n    training = opt is not None\n    model.train() if training else model.eval()\n    tot_loss = tot_ok = tot = 0\n    with torch.set_grad_enabled(training):\n        for batch in loader:\n            inp = batch[\"input\"].to(device)\n            lens = batch[\"lengths\"].to(device)\n            lbl = batch[\"label\"].to(device)\n            logits = model(inp, lens)\n            loss = criterion(logits, lbl)\n            if training:\n                opt.zero_grad()\n                loss.backward()\n                opt.step()\n            tot_loss += loss.item() * inp.size(0)\n            preds = logits.argmax(1)\n            tot_ok += (preds == lbl).sum().item()\n            tot += inp.size(0)\n    return tot_loss / tot, tot_ok / tot\n\n\ndef evaluate_test(model):\n    model.eval()\n    all_preds, all_labels, all_seqs = [], [], []\n    with torch.no_grad():\n        for batch in test_loader:\n            inp = batch[\"input\"].to(device)\n            lens = batch[\"lengths\"].to(device)\n            logits = model(inp, lens)\n            preds = logits.argmax(1).cpu().tolist()\n            label_strs = batch[\"label_str\"]\n            all_preds.extend([id2label.get(p, \"UNK\") for p in preds])\n            all_labels.extend(label_strs)\n            all_seqs.extend(\n                [\n                    \" \".join(\n                        [list(vocab.keys())[tok] for tok in seq.tolist() if tok != 0]\n                    )\n                    for seq in batch[\"input\"]\n                ]\n            )\n    overall_acc = np.mean([p == t for p, t in zip(all_preds, all_labels)])\n    swa = shape_weighted_accuracy(all_seqs, all_labels, all_preds)\n    cwa = color_weighted_accuracy(all_seqs, all_labels, all_preds)\n    seen_rules = set(train_labels)\n    zs_idx = [i for i, lbl in enumerate(all_labels) if lbl not in seen_rules]\n    zs_acc = (\n        np.mean([all_preds[i] == all_labels[i] for i in zs_idx])\n        if zs_idx\n        else float(\"nan\")\n    )\n    return overall_acc, swa, cwa, zs_acc, all_preds, all_labels\n\n\n# ----------------------------------------------------------------------\n# hyperparameter search -------------------------------------------------\nhidden_dims = [64, 128, 256, 512]\nEPOCHS = 5\nfor hd in hidden_dims:\n    print(f\"\\n=== Frozen-Embedding Ablation | hidden_dim={hd} ===\")\n    model = SimpleSPRModel(\n        len(vocab), emb_dim=64, hidden_dim=hd, num_labels=num_labels, freeze_emb=True\n    ).to(device)\n    # only train parameters that require grad\n    optim_params = [p for p in model.parameters() if p.requires_grad]\n    opt = torch.optim.Adam(optim_params, lr=1e-3)\n    criterion = nn.CrossEntropyLoss()\n\n    mdata = {\n        \"metrics\": {\"train_acc\": [], \"val_acc\": [], \"val_loss\": [], \"ZSRTA\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n        \"timestamps\": [],\n    }\n\n    for epoch in range(1, EPOCHS + 1):\n        tr_loss, tr_acc = run_epoch(model, train_loader, criterion, opt)\n        val_loss, val_acc = run_epoch(model, dev_loader, criterion)\n        mdata[\"metrics\"][\"train_acc\"].append(tr_acc)\n        mdata[\"metrics\"][\"val_acc\"].append(val_acc)\n        mdata[\"metrics\"][\"val_loss\"].append(val_loss)\n        mdata[\"losses\"][\"train\"].append(tr_loss)\n        mdata[\"losses\"][\"val\"].append(val_loss)\n        mdata[\"timestamps\"].append(time.time())\n        print(\n            f\"Epoch {epoch}: train_acc={tr_acc:.4f}  val_acc={val_acc:.4f}  val_loss={val_loss:.4f}\"\n        )\n\n    overall_acc, swa, cwa, zs_acc, all_preds, all_labels = evaluate_test(model)\n    mdata[\"metrics\"][\"ZSRTA\"].append(zs_acc)\n    mdata[\"predictions\"] = all_preds\n    mdata[\"ground_truth\"] = all_labels\n\n    print(\n        f\"TEST: Acc={overall_acc:.4f} | SWA={swa:.4f} | CWA={cwa:.4f} | ZSRTA={zs_acc:.4f}\"\n    )\n    experiment_data[\"frozen_embedding_ablation\"][\"SPR_BENCH\"][f\"hidden_{hd}\"] = mdata\n\n# ----------------------------------------------------------------------\n# save ------------------------------------------------------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(f\"\\nSaved experiment data to {working_dir}/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# working directory ----------------------------------------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ----------------------------------------------------------------------\n# load experiment data -------------------------------------------------\ntry:\n    exp_path = os.path.join(working_dir, \"experiment_data.npy\")\n    experiment_data = np.load(exp_path, allow_pickle=True).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\n\n# ----------------------------------------------------------------------\n# helper to fetch metrics ----------------------------------------------\ndef get_hidden_runs(exp_dict):\n    runs = exp_dict.get(\"frozen_embedding_ablation\", {}).get(\"SPR_BENCH\", {})\n    return {k: v for k, v in runs.items()}\n\n\nruns = get_hidden_runs(experiment_data)\n\nsummary = {}  # store metrics to print later\n\n# ----------------------------------------------------------------------\n# per-run accuracy / loss curves ---------------------------------------\nfor run_name, mdata in runs.items():\n    epochs = list(range(1, len(mdata[\"metrics\"][\"train_acc\"]) + 1))\n    # -------- accuracy plot ----------\n    try:\n        plt.figure()\n        plt.plot(epochs, mdata[\"metrics\"][\"train_acc\"], label=\"Train\")\n        plt.plot(epochs, mdata[\"metrics\"][\"val_acc\"], label=\"Validation\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Accuracy\")\n        plt.title(f\"SPR_BENCH Accuracy Curves ({run_name})\\nTrain vs Validation\")\n        plt.legend()\n        fname = os.path.join(working_dir, f\"SPR_BENCH_{run_name}_accuracy.png\")\n        plt.savefig(fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating accuracy plot for {run_name}: {e}\")\n        plt.close()\n    # -------- loss plot ----------\n    try:\n        plt.figure()\n        plt.plot(epochs, mdata[\"losses\"][\"train\"], label=\"Train\")\n        plt.plot(epochs, mdata[\"losses\"][\"val\"], label=\"Validation\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Loss\")\n        plt.title(f\"SPR_BENCH Loss Curves ({run_name})\\nTrain vs Validation\")\n        plt.legend()\n        fname = os.path.join(working_dir, f\"SPR_BENCH_{run_name}_loss.png\")\n        plt.savefig(fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating loss plot for {run_name}: {e}\")\n        plt.close()\n    # gather summary numbers\n    last_val_acc = (\n        mdata[\"metrics\"][\"val_acc\"][-1] if mdata[\"metrics\"][\"val_acc\"] else np.nan\n    )\n    zsrta = mdata[\"metrics\"][\"ZSRTA\"][0] if mdata[\"metrics\"][\"ZSRTA\"] else np.nan\n    summary[run_name] = (last_val_acc, zsrta)\n\n# ----------------------------------------------------------------------\n# summary ZSRTA bar plot -----------------------------------------------\ntry:\n    plt.figure()\n    names = list(summary.keys())\n    zs_vals = [summary[n][1] for n in names]\n    plt.bar(range(len(names)), zs_vals, tick_label=names)\n    plt.ylabel(\"ZSRTA\")\n    plt.title(\"SPR_BENCH Zero-Shot Rule Transfer Accuracy\\nAcross Hidden Dimensions\")\n    fname = os.path.join(working_dir, f\"SPR_BENCH_ZSRTA_comparison.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating ZSRTA bar plot: {e}\")\n    plt.close()\n\n# ----------------------------------------------------------------------\n# print summary --------------------------------------------------------\nprint(\"\\n=== Validation Accuracy & ZSRTA Summary ===\")\nfor run_name, (val_acc, zsrta) in summary.items():\n    print(f\"{run_name:15s} | ValAcc: {val_acc:.4f} | ZSRTA: {zsrta:.4f}\")\n",
+    "plot_plan": "We first load experiment_data.npy from the working directory and extract the metrics stored under frozen_embedding_ablation \u2192 SPR_BENCH. For each hidden-dimensionality setting we build epoch indices and retrieve the train/validation accuracy and loss arrays. Two separate line plots (accuracy curve and loss curve) are created per hidden size, each wrapped in its own try-except so failures don\u2019t block later plots; figures are titled with the dataset name and an explanatory subtitle (\u201cTrain vs Validation\u201d). After that, a single bar plot summarises the Zero-Shot Rule Transfer Accuracy (ZSRTA) across the different hidden sizes. All plots are saved to working_dir with descriptive filenames and every figure is explicitly closed. Finally, the script prints a concise table listing the last epoch\u2019s validation accuracy and the ZSRTA for each hidden dimension so users can read the key numbers without opening the plots.",
+    "plot_analyses": [
+      {
+        "analysis": "The accuracy curves for the hidden_64 configuration show a steady improvement for both training and validation sets over the epochs. The validation accuracy surpasses the training accuracy, which may indicate a well-generalizing model. The curves converge to nearly 100% accuracy by the fifth epoch, suggesting effective learning dynamics.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_hidden_64_accuracy.png"
+      },
+      {
+        "analysis": "The loss curves for the hidden_64 configuration show a rapid decrease in both training and validation loss over the epochs. The validation loss is consistently lower than the training loss, which aligns with the observed higher validation accuracy. This suggests that the model is not overfitting and is learning effectively.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_hidden_64_loss.png"
+      },
+      {
+        "analysis": "The accuracy curves for the hidden_128 configuration mirror the trends observed in the hidden_64 configuration. Both training and validation accuracies improve steadily and converge to nearly 100% by the fifth epoch. This indicates that increasing the hidden dimension does not negatively impact generalization.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_hidden_128_accuracy.png"
+      },
+      {
+        "analysis": "The loss curves for the hidden_128 configuration show a similar trend to the hidden_64 configuration, with rapid decreases in loss for both training and validation sets. The validation loss remains slightly lower than the training loss, indicating good generalization and no signs of overfitting.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_hidden_128_loss.png"
+      },
+      {
+        "analysis": "The accuracy curves for the hidden_256 configuration demonstrate consistent improvement for both training and validation sets. The curves converge to nearly perfect accuracy by the fifth epoch, indicating effective learning. The validation accuracy slightly surpasses the training accuracy, which suggests good generalization.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_hidden_256_accuracy.png"
+      },
+      {
+        "analysis": "The loss curves for the hidden_256 configuration show rapid decreases in loss for both training and validation sets. The validation loss remains marginally lower than the training loss, which is consistent with the observed high validation accuracy and suggests that the model is not overfitting.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_hidden_256_loss.png"
+      },
+      {
+        "analysis": "The accuracy curves for the hidden_512 configuration show a consistent improvement in both training and validation accuracies, with convergence to nearly perfect accuracy by the fifth epoch. The validation accuracy slightly surpasses the training accuracy, indicating strong generalization capabilities.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_hidden_512_accuracy.png"
+      },
+      {
+        "analysis": "The loss curves for the hidden_512 configuration indicate a rapid decline in both training and validation losses over the epochs. The validation loss remains slightly lower than the training loss, which suggests that the model is learning effectively without overfitting.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_hidden_512_loss.png"
+      },
+      {
+        "analysis": "The plot for zero-shot rule transfer accuracy (ZSRTA) across hidden dimensions appears to be empty or lacks data. No conclusions can be drawn from this plot.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_ZSRTA_comparison.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_hidden_64_accuracy.png",
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_hidden_64_loss.png",
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_hidden_128_accuracy.png",
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_hidden_128_loss.png",
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_hidden_256_accuracy.png",
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_hidden_256_loss.png",
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_hidden_512_accuracy.png",
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_hidden_512_loss.png",
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/SPR_BENCH_ZSRTA_comparison.png"
+    ],
+    "vlm_feedback_summary": "The plots demonstrate consistent improvements in accuracy and reductions in loss across different hidden dimensions, with all configurations achieving nearly perfect accuracy and low loss values by the fifth epoch. This indicates effective learning and generalization. However, the zero-shot rule transfer accuracy plot lacks data, preventing any analysis of ZSRTA performance.",
+    "exp_results_dir": "experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696",
+    "ablation_name": "Frozen-Embedding Ablation (No Embedding Fine-Tuning)",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_90e58e783df640db9bf95c97bd0f9aba_proc_319696/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "The overall plan encompasses two main phases. Initially, the focus was on hyperparameter tuning, specifically optimizing the hidden state size for a SimpleSPRModel by evaluating different configurations (64, 128, 256, 512) and recording relevant performance statistics for each. This was aimed at identifying the optimal model complexity for improved performance. The current phase expands the exploration to an ablation study involving multi-dataset training. This involves augmenting the original dataset by creating two synthetic variants (noise-perturbed and long-sequence) and training a model on the combined dataset to assess robustness and generalization. Metrics, losses, and predictions are collected for each hidden-dim setting and dataset, providing insights into the model's adaptability across different data conditions. This comprehensive plan seeks to optimize the model's internal parameters and evaluate its performance under varied data scenarios, aiming for a more robust and generalizable solution.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "test accuracy",
+            "lower_is_better": false,
+            "description": "The accuracy of the model on the test dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6903,
+                "best_value": 0.6903
+              },
+              {
+                "dataset_name": "NOISE",
+                "final_value": 0.6758,
+                "best_value": 0.6758
+              },
+              {
+                "dataset_name": "LONG",
+                "final_value": 0.7014,
+                "best_value": 0.7014
+              }
+            ]
+          },
+          {
+            "metric_name": "shape weighted accuracy",
+            "lower_is_better": false,
+            "description": "The accuracy of the model with a focus on shape weighting.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6458,
+                "best_value": 0.6458
+              },
+              {
+                "dataset_name": "NOISE",
+                "final_value": 0.6418,
+                "best_value": 0.6418
+              },
+              {
+                "dataset_name": "LONG",
+                "final_value": 0.6542,
+                "best_value": 0.6542
+              }
+            ]
+          },
+          {
+            "metric_name": "color weighted accuracy",
+            "lower_is_better": false,
+            "description": "The accuracy of the model with a focus on color weighting.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6909,
+                "best_value": 0.6909
+              },
+              {
+                "dataset_name": "NOISE",
+                "final_value": 0.6759,
+                "best_value": 0.6759
+              },
+              {
+                "dataset_name": "LONG",
+                "final_value": 0.702,
+                "best_value": 0.702
+              }
+            ]
+          },
+          {
+            "metric_name": "zero-shot rule transfer accuracy",
+            "lower_is_better": false,
+            "description": "The accuracy of the model in transferring rules to unseen scenarios (zero-shot).",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": null,
+                "best_value": null
+              },
+              {
+                "dataset_name": "NOISE",
+                "final_value": null,
+                "best_value": null
+              },
+              {
+                "dataset_name": "LONG",
+                "final_value": null,
+                "best_value": null
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# multi_synth_ablation.py\nimport os, pathlib, time, random, json, math, numpy as np, torch\nfrom torch import nn\nfrom torch.utils.data import DataLoader, Dataset\nfrom datasets import (\n    DatasetDict,\n    load_dataset,\n    Dataset as HFDataset,\n    concatenate_datasets,\n)\nfrom typing import List, Dict\n\n# -------------------- reproducibility ---------------------------------\nSEED = 42\nrandom.seed(SEED)\nnp.random.seed(SEED)\ntorch.manual_seed(SEED)\ntorch.backends.cudnn.deterministic = True\ntorch.backends.cudnn.benchmark = False\n\n# -------------------- experiment container ----------------------------\nexperiment_data = {\"multi_dataset_training\": {\"SPR_BENCH\": {}, \"NOISE\": {}, \"LONG\": {}}}\n\n# -------------------- working dir -------------------------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# -------------------- device ------------------------------------------\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# -------------------- helpers for accuracies --------------------------\ndef count_shape_variety(sequence: str) -> int:\n    return len(set(tok[0] for tok in sequence.strip().split() if tok))\n\n\ndef count_color_variety(sequence: str) -> int:\n    return len(set(tok[1] for tok in sequence.strip().split() if len(tok) > 1))\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    c = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) > 0 else 0.0\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    c = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) > 0 else 0.0\n\n\n# -------------------- load canonical SPR_BENCH ------------------------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(csv_name: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    d[\"train\"] = _load(\"train.csv\")\n    d[\"dev\"] = _load(\"dev.csv\")\n    d[\"test\"] = _load(\"test.csv\")\n    return d\n\n\nDATA_PATH = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\nspr = load_spr_bench(DATA_PATH)\nprint(\"SPR_BENCH sizes:\", {k: len(v) for k, v in spr.items()})\n\n\n# -------------------- create synthetic variants -----------------------\ndef create_noise_variant(ref: DatasetDict, token_pool: List[str], p=0.1) -> DatasetDict:\n    out = DatasetDict()\n    for split in [\"train\", \"dev\", \"test\"]:\n        seqs, labels = [], []\n        for s, lbl in zip(ref[split][\"sequence\"], ref[split][\"label\"]):\n            toks = s.strip().split()\n            toks = [\n                t if random.random() > p else random.choice(token_pool) for t in toks\n            ]\n            seqs.append(\" \".join(toks))\n            labels.append(lbl)\n        out[split] = HFDataset.from_dict({\"sequence\": seqs, \"label\": labels})\n    return out\n\n\ndef create_long_variant(ref: DatasetDict, min_rep=2, max_rep=4) -> DatasetDict:\n    out = DatasetDict()\n    for split in [\"train\", \"dev\", \"test\"]:\n        seqs, labels = [], []\n        for s, lbl in zip(ref[split][\"sequence\"], ref[split][\"label\"]):\n            toks = s.strip().split()\n            rep = random.randint(min_rep, max_rep)\n            seqs.append(\" \".join(toks * rep))\n            labels.append(lbl)\n        out[split] = HFDataset.from_dict({\"sequence\": seqs, \"label\": labels})\n    return out\n\n\ntoken_pool = list(\n    {tok for seq in spr[\"train\"][\"sequence\"] for tok in seq.strip().split()}\n)\nnoise_ds = create_noise_variant(spr, token_pool, p=0.1)\nlong_ds = create_long_variant(spr, 2, 4)\nprint(\"NOISE sizes:\", {k: len(v) for k, v in noise_ds.items()})\nprint(\"LONG sizes :\", {k: len(v) for k, v in long_ds.items()})\n\n# -------------------- joint train/val splits --------------------------\ncombo = DatasetDict()\ncombo[\"train\"] = concatenate_datasets(\n    [spr[\"train\"], noise_ds[\"train\"], long_ds[\"train\"]]\n)\ncombo[\"dev\"] = concatenate_datasets([spr[\"dev\"], noise_ds[\"dev\"], long_ds[\"dev\"]])\n\n\n# -------------------- vocab / label mapping on combined ---------------\ndef build_vocab(dataset) -> Dict[str, int]:\n    v = {\"<pad>\": 0, \"<unk>\": 1}\n    for seq in dataset[\"sequence\"]:\n        for tok in seq.strip().split():\n            if tok not in v:\n                v[tok] = len(v)\n    return v\n\n\nvocab = build_vocab(combo[\"train\"])\nid2tok = {i: t for t, i in vocab.items()}\nprint(f\"Combined vocab size: {len(vocab)}\")\n\ntrain_labels = sorted(set(combo[\"train\"][\"label\"]))\nlabel2id = {l: i for i, l in enumerate(train_labels)}\nid2label = {i: l for l, i in label2id.items()}\nnum_labels = len(label2id)\nprint(f\"# rule labels: {num_labels}\")\n\n\n# -------------------- Torch dataset / dataloaders ---------------------\ndef encode_seq(seq: str, vocab: Dict[str, int]) -> List[int]:\n    return [vocab.get(tok, vocab[\"<unk>\"]) for tok in seq.strip().split()]\n\n\nclass SPRTorchDataset(Dataset):\n    def __init__(self, split, vocab, label2id, train_mode=True):\n        self.seq_enc = [encode_seq(s, vocab) for s in split[\"sequence\"]]\n        self.labels = split[\"label\"]\n        self.train_mode = train_mode\n        self.label2id = label2id\n\n    def __len__(self):\n        return len(self.seq_enc)\n\n    def __getitem__(self, idx):\n        x = torch.tensor(self.seq_enc[idx], dtype=torch.long)\n        if self.train_mode:\n            return {\n                \"input\": x,\n                \"label\": torch.tensor(\n                    self.label2id[self.labels[idx]], dtype=torch.long\n                ),\n            }\n        return {\"input\": x, \"label_str\": self.labels[idx]}\n\n\ndef collate(batch):\n    xs = [b[\"input\"] for b in batch]\n    lens = torch.tensor([len(x) for x in xs], dtype=torch.long)\n    xs_pad = nn.utils.rnn.pad_sequence(xs, batch_first=True, padding_value=0)\n    out = {\"input\": xs_pad, \"lengths\": lens}\n    if \"label\" in batch[0]:\n        out[\"label\"] = torch.stack([b[\"label\"] for b in batch])\n    else:\n        out[\"label_str\"] = [b[\"label_str\"] for b in batch]\n    return out\n\n\ntrain_loader = DataLoader(\n    SPRTorchDataset(combo[\"train\"], vocab, label2id, True),\n    batch_size=128,\n    shuffle=True,\n    collate_fn=collate,\n)\ndev_loader = DataLoader(\n    SPRTorchDataset(combo[\"dev\"], vocab, label2id, True),\n    batch_size=256,\n    shuffle=False,\n    collate_fn=collate,\n)\n\n# test loaders per corpus\ntest_loaders = {\n    \"SPR_BENCH\": DataLoader(\n        SPRTorchDataset(spr[\"test\"], vocab, label2id, False),\n        batch_size=256,\n        shuffle=False,\n        collate_fn=collate,\n    ),\n    \"NOISE\": DataLoader(\n        SPRTorchDataset(noise_ds[\"test\"], vocab, label2id, False),\n        batch_size=256,\n        shuffle=False,\n        collate_fn=collate,\n    ),\n    \"LONG\": DataLoader(\n        SPRTorchDataset(long_ds[\"test\"], vocab, label2id, False),\n        batch_size=256,\n        shuffle=False,\n        collate_fn=collate,\n    ),\n}\n\n\n# -------------------- Model -------------------------------------------\nclass SimpleSPRModel(nn.Module):\n    def __init__(self, vocab_size, emb_dim, hidden_dim, num_labels):\n        super().__init__()\n        self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=0)\n        self.gru = nn.GRU(emb_dim, hidden_dim, batch_first=True, bidirectional=True)\n        self.lin = nn.Linear(hidden_dim * 2, num_labels)\n\n    def forward(self, x, lengths):\n        e = self.emb(x)\n        packed = nn.utils.rnn.pack_padded_sequence(\n            e, lengths.cpu(), batch_first=True, enforce_sorted=False\n        )\n        _, h = self.gru(packed)\n        h_cat = torch.cat([h[0], h[1]], dim=-1)\n        return self.lin(h_cat)\n\n\n# -------------------- train / eval helpers ----------------------------\ndef run_epoch(model, loader, criterion, opt=None):\n    training = opt is not None\n    model.train() if training else model.eval()\n    tot_loss = tot_ok = tot = 0\n    with torch.set_grad_enabled(training):\n        for batch in loader:\n            inp = batch[\"input\"].to(device)\n            lens = batch[\"lengths\"].to(device)\n            lbl = batch[\"label\"].to(device)\n            logits = model(inp, lens)\n            loss = criterion(logits, lbl)\n            if training:\n                opt.zero_grad()\n                loss.backward()\n                opt.step()\n            tot_loss += loss.item() * inp.size(0)\n            tot_ok += (logits.argmax(1) == lbl).sum().item()\n            tot += inp.size(0)\n    return tot_loss / tot, tot_ok / tot\n\n\ndef evaluate_test(model, loader):\n    model.eval()\n    all_preds, all_labels, all_seqs = [], [], []\n    with torch.no_grad():\n        for batch in loader:\n            inp = batch[\"input\"].to(device)\n            lens = batch[\"lengths\"].to(device)\n            logits = model(inp, lens)\n            preds = logits.argmax(1).cpu().tolist()\n            all_preds.extend([id2label[p] for p in preds])\n            all_labels.extend(batch[\"label_str\"])\n            for seq in batch[\"input\"]:\n                toks = [id2tok[tok] for tok in seq.tolist() if tok != 0]\n                all_seqs.append(\" \".join(toks))\n    acc = np.mean([p == t for p, t in zip(all_preds, all_labels)])\n    swa = shape_weighted_accuracy(all_seqs, all_labels, all_preds)\n    cwa = color_weighted_accuracy(all_seqs, all_labels, all_preds)\n    seen_rules = set(train_labels)\n    zs_idx = [i for i, lbl in enumerate(all_labels) if lbl not in seen_rules]\n    zs_acc = (\n        np.mean([all_preds[i] == all_labels[i] for i in zs_idx])\n        if zs_idx\n        else float(\"nan\")\n    )\n    return acc, swa, cwa, zs_acc, all_preds, all_labels\n\n\n# -------------------- hyper-parameter loop ----------------------------\nhidden_dims = [64, 128, 256, 512]\nEPOCHS = 5\nfor hd in hidden_dims:\n    print(f\"\\n=== Hidden dim {hd} ===\")\n    model = SimpleSPRModel(len(vocab), 64, hd, num_labels).to(device)\n    opt = torch.optim.Adam(model.parameters(), lr=1e-3)\n    crit = nn.CrossEntropyLoss()\n    history = {\n        \"metrics\": {\"train_acc\": [], \"val_acc\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"timestamps\": [],\n    }\n    # training\n    for ep in range(1, EPOCHS + 1):\n        tr_loss, tr_acc = run_epoch(model, train_loader, crit, opt)\n        val_loss, val_acc = run_epoch(model, dev_loader, crit)\n        history[\"metrics\"][\"train_acc\"].append(tr_acc)\n        history[\"metrics\"][\"val_acc\"].append(val_acc)\n        history[\"losses\"][\"train\"].append(tr_loss)\n        history[\"losses\"][\"val\"].append(val_loss)\n        history[\"timestamps\"].append(time.time())\n        print(f\"Ep{ep}: train_acc={tr_acc:.4f} val_acc={val_acc:.4f}\")\n    # evaluation on each corpus\n    for dname, loader in test_loaders.items():\n        acc, swa, cwa, zs_acc, preds, gt = evaluate_test(model, loader)\n        print(f\"[{dname}] ACC={acc:.4f} SWA={swa:.4f} CWA={cwa:.4f} ZSRTA={zs_acc:.4f}\")\n        exp_entry = {\n            \"hidden_dim\": hd,\n            \"metrics\": {\"test_acc\": acc, \"SWA\": swa, \"CWA\": cwa, \"ZSRTA\": zs_acc},\n            \"predictions\": preds,\n            \"ground_truth\": gt,\n            \"train_curve\": history,\n        }\n        experiment_data[\"multi_dataset_training\"][dname][f\"hidden_{hd}\"] = exp_entry\n\n# -------------------- save --------------------------------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(f\"Saved experiment data to {working_dir}/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# -------------------- setup --------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# -------------------- load data ----------------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\n\n# Helper to gather hidden dims available\ndef get_hidden_dims(dct):\n    return sorted(int(k.split(\"_\")[-1]) for k in dct.keys())\n\n\n# -------------------- 1. training / val curves --------------------\ntry:\n    ds_name = \"SPR_BENCH\"\n    ds_runs = experiment_data[\"multi_dataset_training\"][ds_name]\n    hds = get_hidden_dims(ds_runs)\n    plt.figure()\n    for hd in hds:\n        hist = ds_runs[f\"hidden_{hd}\"][\"train_curve\"]\n        tr = hist[\"metrics\"][\"train_acc\"]\n        val = hist[\"metrics\"][\"val_acc\"]\n        epochs = np.arange(1, len(tr) + 1)\n        plt.plot(epochs, tr, label=f\"train_hd{hd}\")\n        plt.plot(epochs, val, \"--\", label=f\"val_hd{hd}\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Accuracy\")\n    plt.title(\"SPR_BENCH Training vs Validation Accuracy\")\n    plt.legend()\n    fname = os.path.join(working_dir, f\"SPR_BENCH_train_val_curves.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating train/val plot: {e}\")\n    plt.close()\n\n# -------------------- 2. Test ACC vs hidden dim --------------------\ntry:\n    plt.figure()\n    for ds_name in experiment_data[\"multi_dataset_training\"].keys():\n        ds_runs = experiment_data[\"multi_dataset_training\"][ds_name]\n        hds = get_hidden_dims(ds_runs)\n        accs = [ds_runs[f\"hidden_{hd}\"][\"metrics\"][\"test_acc\"] for hd in hds]\n        plt.plot(hds, accs, marker=\"o\", label=ds_name)\n    plt.xlabel(\"Hidden Dimension\")\n    plt.ylabel(\"Test Accuracy\")\n    plt.title(\"Test Accuracy vs Hidden Dimension across Datasets\")\n    plt.legend()\n    plt.savefig(os.path.join(working_dir, \"AllDatasets_test_accuracy.png\"))\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating ACC plot: {e}\")\n    plt.close()\n\n# -------------------- 3. SWA and 4. CWA vs hidden dim (combined) ----\nfor metric, fname_stub in [\n    (\"SWA\", \"shape_weighted_accuracy\"),\n    (\"CWA\", \"color_weighted_accuracy\"),\n]:\n    try:\n        plt.figure()\n        for ds_name in experiment_data[\"multi_dataset_training\"].keys():\n            ds_runs = experiment_data[\"multi_dataset_training\"][ds_name]\n            hds = get_hidden_dims(ds_runs)\n            vals = [ds_runs[f\"hidden_{hd}\"][\"metrics\"][metric] for hd in hds]\n            plt.plot(hds, vals, marker=\"o\", label=ds_name)\n        plt.xlabel(\"Hidden Dimension\")\n        plt.ylabel(metric)\n        plt.title(f\"{metric} vs Hidden Dimension across Datasets\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, f\"AllDatasets_{fname_stub}.png\"))\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating {metric} plot: {e}\")\n        plt.close()\n\n# -------------------- 5. Print best configuration summary ----------\nprint(\"\\nBest hidden dimension per dataset (highest test accuracy):\")\nfor ds_name, ds_runs in experiment_data.get(\"multi_dataset_training\", {}).items():\n    best_hd, best_acc = None, -1\n    for hd in get_hidden_dims(ds_runs):\n        acc = ds_runs[f\"hidden_{hd}\"][\"metrics\"][\"test_acc\"]\n        if acc > best_acc:\n            best_acc, best_hd = acc, hd\n    if best_hd is not None:\n        met = ds_runs[f\"hidden_{best_hd}\"][\"metrics\"]\n        print(\n            f\"{ds_name}: hd={best_hd}, ACC={met['test_acc']:.4f}, \"\n            f\"SWA={met['SWA']:.4f}, CWA={met['CWA']:.4f}, ZSRTA={met['ZSRTA']:.4f}\"\n        )\n",
+    "plot_plan": "We first load experiment_data.npy, confirm its structure, and automatically collect all hidden-dim runs available for each dataset. For the main training curves we pick any single dataset (SPR_BENCH) because the `train_curve` object is identical across datasets, and we overlay the four hidden-dim runs\u2019 train/val accuracy trajectories (\u22645 lines). Next we summarise generalisation ability by plotting, for every dataset (SPR_BENCH, NOISE, LONG), test accuracy versus hidden dimension on a single figure; similar figures are created for SWA and CWA, yielding at most four plots total. Each figure is wrapped in its own try-except block, titled clearly, saved to working_dir with descriptive filenames, and then closed. Finally the script prints a compact table of the best hidden dimension (highest test accuracy) per dataset together with its metric scores so the user can inspect them immediately in the console. All plotting follows plain matplotlib without extra styles and uses only data actually stored in experiment_data.npy.",
+    "plot_analyses": [
+      {
+        "analysis": "This plot compares training and validation accuracy across different hidden dimensions (64, 128, 256, 512) over 5 epochs. It shows that increasing the hidden dimension improves training accuracy consistently across all epochs, with larger hidden dimensions (256, 512) achieving the highest accuracy. However, validation accuracy plateaus or slightly decreases with larger hidden dimensions, indicating potential overfitting. Specifically, the gap between training and validation accuracy becomes more pronounced as the hidden dimension increases. This suggests that while larger hidden dimensions enhance model capacity, they may reduce generalization performance.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_0e1b852adea34a3196b776afb126ee75_proc_319697/SPR_BENCH_train_val_curves.png"
+      },
+      {
+        "analysis": "This plot shows test accuracy as a function of hidden dimension across three datasets: SPR_BENCH, NOISE, and LONG. The SPR_BENCH dataset achieves higher test accuracy than NOISE but lower than LONG across all hidden dimensions. While LONG maintains stable performance, SPR_BENCH shows a slight decline in accuracy as the hidden dimension increases, indicating diminishing returns from larger hidden dimensions. NOISE exhibits the lowest accuracy and significant fluctuations, suggesting that it may be a more challenging or less structured dataset for the model.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_0e1b852adea34a3196b776afb126ee75_proc_319697/AllDatasets_test_accuracy.png"
+      },
+      {
+        "analysis": "This plot examines Shape-Weighted Accuracy (SWA) across hidden dimensions for the three datasets. Similar to test accuracy, LONG achieves the highest SWA and remains stable, while SPR_BENCH shows a gradual decline in SWA with increasing hidden dimensions. NOISE has the lowest SWA and fluctuates similarly to its test accuracy, indicating that the dataset might not benefit from larger hidden dimensions. The results suggest that increasing model capacity does not consistently improve performance on SPR_BENCH or NOISE, possibly due to overfitting or dataset-specific challenges.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_0e1b852adea34a3196b776afb126ee75_proc_319697/AllDatasets_shape_weighted_accuracy.png"
+      },
+      {
+        "analysis": "This plot evaluates Color-Weighted Accuracy (CWA) across hidden dimensions for the three datasets. The trends are consistent with the SWA plot: LONG achieves the highest and most stable CWA, while SPR_BENCH shows a slight decline with increasing hidden dimensions. NOISE again exhibits the lowest performance and significant fluctuations. These results reinforce the observation that larger hidden dimensions do not universally improve performance and may even degrade generalization for certain datasets, particularly SPR_BENCH and NOISE.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_0e1b852adea34a3196b776afb126ee75_proc_319697/AllDatasets_color_weighted_accuracy.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_0e1b852adea34a3196b776afb126ee75_proc_319697/SPR_BENCH_train_val_curves.png",
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_0e1b852adea34a3196b776afb126ee75_proc_319697/AllDatasets_test_accuracy.png",
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_0e1b852adea34a3196b776afb126ee75_proc_319697/AllDatasets_shape_weighted_accuracy.png",
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_0e1b852adea34a3196b776afb126ee75_proc_319697/AllDatasets_color_weighted_accuracy.png"
+    ],
+    "vlm_feedback_summary": "The plots reveal that while increasing hidden dimensions improves training accuracy, it does not consistently enhance validation or test performance, particularly for SPR_BENCH and NOISE. Overfitting emerges as a concern with larger hidden dimensions, as evidenced by the widening gap between training and validation accuracy. Performance on metrics like SWA and CWA also declines slightly for SPR_BENCH as hidden dimensions increase, suggesting that larger model capacity may not translate to better generalization in zero-shot reasoning tasks. Dataset-specific challenges likely play a role in these outcomes.",
+    "exp_results_dir": "experiment_results/experiment_0e1b852adea34a3196b776afb126ee75_proc_319697",
+    "ablation_name": "Multi-Synthetic-Dataset Training Ablation",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_0e1b852adea34a3196b776afb126ee75_proc_319697/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "The research plan is twofold: First, it involves hyperparameter tuning of the SimpleSPRModel by experimenting with various hidden-state sizes (64, 128, 256, 512) to identify the optimal configuration for better model performance. This process involves training the model for each hidden size, evaluating its performance, and recording the results in a structured format. Second, the plan includes an ablation study named No-Length-Masking Ablation, which tests the effect of removing the `pack_padded_sequence` function from the encoder. This ablation aims to determine the impact of treating `<pad>` tokens as genuine time-steps on model performance. Both plans are integrated by rerunning the hyperparameter sweep without length masking, allowing for a direct comparison of models with and without this feature. The comprehensive effort seeks to optimize model architecture and elucidate the role of length-aware masking in GRU-based sequence models.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "train accuracy",
+            "lower_is_better": false,
+            "description": "Measures how well the model performs on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "hidden_64",
+                "final_value": 0.9982,
+                "best_value": 0.9982
+              },
+              {
+                "dataset_name": "hidden_128",
+                "final_value": 0.9993,
+                "best_value": 0.9993
+              },
+              {
+                "dataset_name": "hidden_256",
+                "final_value": 1.0,
+                "best_value": 1.0
+              },
+              {
+                "dataset_name": "hidden_512",
+                "final_value": 1.0,
+                "best_value": 1.0
+              }
+            ]
+          },
+          {
+            "metric_name": "validation accuracy",
+            "lower_is_better": false,
+            "description": "Measures how well the model generalizes to unseen validation data.",
+            "data": [
+              {
+                "dataset_name": "hidden_64",
+                "final_value": 0.9986,
+                "best_value": 0.9986
+              },
+              {
+                "dataset_name": "hidden_128",
+                "final_value": 0.9992,
+                "best_value": 0.9992
+              },
+              {
+                "dataset_name": "hidden_256",
+                "final_value": 1.0,
+                "best_value": 1.0
+              },
+              {
+                "dataset_name": "hidden_512",
+                "final_value": 1.0,
+                "best_value": 1.0
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "Measures the error on the validation dataset. Lower values indicate better performance.",
+            "data": [
+              {
+                "dataset_name": "hidden_64",
+                "final_value": 0.0071,
+                "best_value": 0.0071
+              },
+              {
+                "dataset_name": "hidden_128",
+                "final_value": 0.0039,
+                "best_value": 0.0039
+              },
+              {
+                "dataset_name": "hidden_256",
+                "final_value": 0.0007,
+                "best_value": 0.0007
+              },
+              {
+                "dataset_name": "hidden_512",
+                "final_value": 0.0004,
+                "best_value": 0.0004
+              }
+            ]
+          },
+          {
+            "metric_name": "zero-shot rule transfer accuracy",
+            "lower_is_better": false,
+            "description": "Measures the model's ability to generalize to new rules without training.",
+            "data": [
+              {
+                "dataset_name": "hidden_64",
+                "final_value": null,
+                "best_value": null
+              },
+              {
+                "dataset_name": "hidden_128",
+                "final_value": null,
+                "best_value": null
+              },
+              {
+                "dataset_name": "hidden_256",
+                "final_value": null,
+                "best_value": null
+              },
+              {
+                "dataset_name": "hidden_512",
+                "final_value": null,
+                "best_value": null
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# no_length_masking_ablation.py\nimport os, pathlib, time, random, json, math, numpy as np, torch\nfrom torch import nn\nfrom torch.utils.data import DataLoader, Dataset\nfrom datasets import DatasetDict, load_dataset\nfrom typing import List, Dict\n\n# ----------------------------------------------------------------------\n# reproducibility -------------------------------------------------------\nSEED = 42\nrandom.seed(SEED)\nnp.random.seed(SEED)\ntorch.manual_seed(SEED)\ntorch.backends.cudnn.deterministic = True\ntorch.backends.cudnn.benchmark = False\n# ----------------------------------------------------------------------\n# experiment container --------------------------------------------------\nexperiment_data = {\"no_length_masking\": {\"SPR_BENCH\": {}}}\n# ----------------------------------------------------------------------\n# working dir / save path ----------------------------------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n# ----------------------------------------------------------------------\n# device ----------------------------------------------------------------\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ----------------------------------------------------------------------\n# util functions --------------------------------------------------------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(csv_name: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    return DatasetDict(\n        {\n            \"train\": _load(\"train.csv\"),\n            \"dev\": _load(\"dev.csv\"),\n            \"test\": _load(\"test.csv\"),\n        }\n    )\n\n\ndef count_shape_variety(sequence: str) -> int:\n    return len(set(tok[0] for tok in sequence.strip().split() if tok))\n\n\ndef count_color_variety(sequence: str) -> int:\n    return len(set(tok[1] for tok in sequence.strip().split() if len(tok) > 1))\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    corr = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if sum(w) else 0.0\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    corr = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]\n    return sum(corr) / sum(w) if sum(w) else 0.0\n\n\n# ----------------------------------------------------------------------\n# load data -------------------------------------------------------------\nDATA_PATH = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\nspr = load_spr_bench(DATA_PATH)\nprint({k: len(v) for k, v in spr.items()})\n\n\n# ----------------------------------------------------------------------\n# vocab + label mapping -------------------------------------------------\ndef build_vocab(dataset) -> Dict[str, int]:\n    vocab = {\"<pad>\": 0, \"<unk>\": 1}\n    for seq in dataset[\"sequence\"]:\n        for tok in seq.strip().split():\n            if tok not in vocab:\n                vocab[tok] = len(vocab)\n    return vocab\n\n\nvocab = build_vocab(spr[\"train\"])\nprint(f\"Vocab size: {len(vocab)}\")\n\n\ndef encode_seq(seq: str, vocab: Dict[str, int]) -> List[int]:\n    return [vocab.get(tok, vocab[\"<unk>\"]) for tok in seq.strip().split()]\n\n\ntrain_labels = sorted(set(spr[\"train\"][\"label\"]))\nlabel2id = {l: i for i, l in enumerate(train_labels)}\nid2label = {i: l for l, i in label2id.items()}\nnum_labels = len(label2id)\nprint(f\"# seen rule labels: {num_labels}\")\n\n\n# ----------------------------------------------------------------------\n# Torch dataset ---------------------------------------------------------\nclass SPRTorchDataset(Dataset):\n    def __init__(self, split, vocab, label2id, train_mode=True):\n        self.seq_enc = [encode_seq(s, vocab) for s in split[\"sequence\"]]\n        self.labels = split[\"label\"]\n        self.train_mode = train_mode\n        self.label2id = label2id\n\n    def __len__(self):\n        return len(self.seq_enc)\n\n    def __getitem__(self, idx):\n        x = torch.tensor(self.seq_enc[idx], dtype=torch.long)\n        if self.train_mode:\n            y = torch.tensor(self.label2id[self.labels[idx]], dtype=torch.long)\n            return {\"input\": x, \"label\": y}\n        else:\n            return {\"input\": x, \"label_str\": self.labels[idx]}\n\n\ndef collate(batch):\n    xs = [b[\"input\"] for b in batch]\n    lens = [len(x) for x in xs]\n    xs_pad = nn.utils.rnn.pad_sequence(xs, batch_first=True, padding_value=0)\n    out = {\"input\": xs_pad, \"lengths\": torch.tensor(lens, dtype=torch.long)}\n    if \"label\" in batch[0]:\n        out[\"label\"] = torch.stack([b[\"label\"] for b in batch])\n    else:\n        out[\"label_str\"] = [b[\"label_str\"] for b in batch]\n    return out\n\n\n# loaders (reuse across experiments)\ntrain_loader = DataLoader(\n    SPRTorchDataset(spr[\"train\"], vocab, label2id, True),\n    batch_size=128,\n    shuffle=True,\n    collate_fn=collate,\n)\ndev_loader = DataLoader(\n    SPRTorchDataset(spr[\"dev\"], vocab, label2id, True),\n    batch_size=256,\n    shuffle=False,\n    collate_fn=collate,\n)\ntest_loader = DataLoader(\n    SPRTorchDataset(spr[\"test\"], vocab, label2id, False),\n    batch_size=256,\n    shuffle=False,\n    collate_fn=collate,\n)\n\n\n# ----------------------------------------------------------------------\n# Model without length masking -----------------------------------------\nclass SimpleSPRModelNoMask(nn.Module):\n    def __init__(self, vocab_size, emb_dim, hidden_dim, num_labels):\n        super().__init__()\n        self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=0)\n        self.gru = nn.GRU(emb_dim, hidden_dim, batch_first=True, bidirectional=True)\n        self.lin = nn.Linear(hidden_dim * 2, num_labels)\n\n    def forward(self, x, lengths=None):  # lengths kept for signature compatibility\n        e = self.emb(x)  # [B,T,E]\n        _, h = self.gru(e)  # no pack_padded_sequence\n        h_cat = torch.cat([h[0], h[1]], dim=-1)  # [B, 2H]\n        return self.lin(h_cat)\n\n\n# ----------------------------------------------------------------------\n# training / eval helpers ----------------------------------------------\ndef run_epoch(model, loader, criterion, opt=None):\n    training = opt is not None\n    model.train() if training else model.eval()\n    tot_loss = tot_ok = tot = 0\n    with torch.set_grad_enabled(training):\n        for batch in loader:\n            inp = batch[\"input\"].to(device)\n            lens = batch[\"lengths\"].to(device)  # not used but passed\n            lbl = batch[\"label\"].to(device)\n            logits = model(inp, lens)\n            loss = criterion(logits, lbl)\n            if training:\n                opt.zero_grad()\n                loss.backward()\n                opt.step()\n            tot_loss += loss.item() * inp.size(0)\n            preds = logits.argmax(1)\n            tot_ok += (preds == lbl).sum().item()\n            tot += inp.size(0)\n    return tot_loss / tot, tot_ok / tot\n\n\ndef evaluate_test(model):\n    model.eval()\n    preds_all, labels_all, seqs_all = [], [], []\n    with torch.no_grad():\n        for batch in test_loader:\n            inp = batch[\"input\"].to(device)\n            lens = batch[\"lengths\"].to(device)\n            logits = model(inp, lens)\n            preds = logits.argmax(1).cpu().tolist()\n            labels_all.extend(batch[\"label_str\"])\n            preds_all.extend([id2label.get(p, \"UNK\") for p in preds])\n            for seq in batch[\"input\"]:\n                seqs_all.append(\n                    \" \".join(\n                        [list(vocab.keys())[tok] for tok in seq.tolist() if tok != 0]\n                    )\n                )\n    oa = np.mean([p == t for p, t in zip(preds_all, labels_all)])\n    swa = shape_weighted_accuracy(seqs_all, labels_all, preds_all)\n    cwa = color_weighted_accuracy(seqs_all, labels_all, preds_all)\n    zs_idx = [i for i, l in enumerate(labels_all) if l not in train_labels]\n    zs_acc = (\n        np.mean([preds_all[i] == labels_all[i] for i in zs_idx])\n        if zs_idx\n        else float(\"nan\")\n    )\n    return oa, swa, cwa, zs_acc, preds_all, labels_all\n\n\n# ----------------------------------------------------------------------\n# hyperparameter sweep --------------------------------------------------\nhidden_dims = [64, 128, 256, 512]\nEPOCHS = 5\nfor hd in hidden_dims:\n    print(f\"\\n=== No-masking run: hidden_dim={hd} ===\")\n    model = SimpleSPRModelNoMask(len(vocab), 64, hd, num_labels).to(device)\n    criterion = nn.CrossEntropyLoss()\n    opt = torch.optim.Adam(model.parameters(), lr=1e-3)\n\n    mdata = {\n        \"metrics\": {\"train_acc\": [], \"val_acc\": [], \"val_loss\": [], \"ZSRTA\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n        \"timestamps\": [],\n    }\n\n    for epoch in range(1, EPOCHS + 1):\n        tr_loss, tr_acc = run_epoch(model, train_loader, criterion, opt)\n        val_loss, val_acc = run_epoch(model, dev_loader, criterion)\n        mdata[\"metrics\"][\"train_acc\"].append(tr_acc)\n        mdata[\"metrics\"][\"val_acc\"].append(val_acc)\n        mdata[\"metrics\"][\"val_loss\"].append(val_loss)\n        mdata[\"losses\"][\"train\"].append(tr_loss)\n        mdata[\"losses\"][\"val\"].append(val_loss)\n        mdata[\"timestamps\"].append(time.time())\n        print(\n            f\"Epoch {epoch}: train_acc={tr_acc:.4f} val_acc={val_acc:.4f} val_loss={val_loss:.4f}\"\n        )\n\n    overall_acc, swa, cwa, zs_acc, preds_all, labels_all = evaluate_test(model)\n    mdata[\"metrics\"][\"ZSRTA\"].append(zs_acc)\n    mdata[\"predictions\"] = preds_all\n    mdata[\"ground_truth\"] = labels_all\n    print(\n        f\"TEST Acc={overall_acc:.4f} | SWA={swa:.4f} | CWA={cwa:.4f} | ZSRTA={zs_acc:.4f}\"\n    )\n    experiment_data[\"no_length_masking\"][\"SPR_BENCH\"][f\"hidden_{hd}\"] = mdata\n\n# ----------------------------------------------------------------------\n# save ------------------------------------------------------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(f\"\\nSaved experiment data to {working_dir}/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ------------------------------------------------------------------\n# load stored results\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\nruns = experiment_data.get(\"no_length_masking\", {}).get(\"SPR_BENCH\", {})\nhidden_dims = sorted(runs.keys(), key=lambda x: int(x.split(\"_\")[-1]))\n\n\n# helper to fetch metric list\ndef metric_per_run(metric_name):\n    return [runs[h][\"metrics\"][metric_name] for h in hidden_dims]\n\n\n# ------------------------------------------------------------------\n# 1) Accuracy curves -------------------------------------------------\ntry:\n    train_accs = metric_per_run(\"train_acc\")\n    val_accs = metric_per_run(\"val_acc\")\n    epochs = [range(1, len(a) + 1) for a in train_accs]\n\n    plt.figure(figsize=(10, 4))\n    plt.suptitle(\n        \"SPR_BENCH Accuracy Curves (No Length Masking)\\n\"\n        \"Left: Train Acc, Right: Validation Acc\"\n    )\n    # left subplot: train\n    plt.subplot(1, 2, 1)\n    for ep, acc, hid in zip(epochs, train_accs, hidden_dims):\n        plt.plot(ep, acc, label=hid)\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Accuracy\")\n    plt.title(\"Train\")\n    plt.legend()\n\n    # right subplot: val\n    plt.subplot(1, 2, 2)\n    for ep, acc, hid in zip(epochs, val_accs, hidden_dims):\n        plt.plot(ep, acc, label=hid)\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Accuracy\")\n    plt.title(\"Validation\")\n    plt.legend()\n\n    fname = os.path.join(working_dir, \"spr_bench_accuracy_curves_no_length_masking.png\")\n    plt.savefig(fname, dpi=150, bbox_inches=\"tight\")\n    plt.close()\n    print(f\"Saved {fname}\")\nexcept Exception as e:\n    print(f\"Error creating accuracy plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------\n# 2) Loss curves -----------------------------------------------------\ntry:\n    train_losses = (\n        metric_per_run(\"losses\")[\"train\"]\n        if False\n        else [runs[h][\"losses\"][\"train\"] for h in hidden_dims]\n    )\n    val_losses = [runs[h][\"losses\"][\"val\"] for h in hidden_dims]\n    epochs = [range(1, len(l) + 1) for l in train_losses]\n\n    plt.figure(figsize=(10, 4))\n    plt.suptitle(\n        \"SPR_BENCH Loss Curves (No Length Masking)\\n\"\n        \"Left: Train Loss, Right: Validation Loss\"\n    )\n    plt.subplot(1, 2, 1)\n    for ep, ls, hid in zip(epochs, train_losses, hidden_dims):\n        plt.plot(ep, ls, label=hid)\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.title(\"Train\")\n    plt.legend()\n\n    plt.subplot(1, 2, 2)\n    for ep, ls, hid in zip(epochs, val_losses, hidden_dims):\n        plt.plot(ep, ls, label=hid)\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.title(\"Validation\")\n    plt.legend()\n\n    fname = os.path.join(working_dir, \"spr_bench_loss_curves_no_length_masking.png\")\n    plt.savefig(fname, dpi=150, bbox_inches=\"tight\")\n    plt.close()\n    print(f\"Saved {fname}\")\nexcept Exception as e:\n    print(f\"Error creating loss plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------\n# 3) ZSRTA bar chart --------------------------------------------------\ntry:\n    zsrta_vals = [\n        runs[h][\"metrics\"][\"ZSRTA\"][0] if runs[h][\"metrics\"][\"ZSRTA\"] else np.nan\n        for h in hidden_dims\n    ]\n\n    plt.figure(figsize=(6, 4))\n    plt.title(\"SPR_BENCH Zero-Shot Rule-Transfer Accuracy (No Length Masking)\")\n    bars = plt.bar(hidden_dims, zsrta_vals, color=\"skyblue\")\n    plt.ylabel(\"ZSRTA\")\n    plt.ylim(0, 1)\n    for b, v in zip(bars, zsrta_vals):\n        plt.text(\n            b.get_x() + b.get_width() / 2,\n            v + 0.01,\n            f\"{v:.2f}\",\n            ha=\"center\",\n            va=\"bottom\",\n            fontsize=8,\n        )\n    fname = os.path.join(working_dir, \"spr_bench_zsrta_bars_no_length_masking.png\")\n    plt.savefig(fname, dpi=150, bbox_inches=\"tight\")\n    plt.close()\n    print(f\"Saved {fname}\")\nexcept Exception as e:\n    print(f\"Error creating ZSRTA bar plot: {e}\")\n    plt.close()\n",
+    "plot_plan": "The script first loads the saved experiment_data.npy, then collects all hidden-dimension runs stored under the \u201cno_length_masking / SPR_BENCH\u201d key.  It builds three visualizations: (1) a two-panel figure with per-epoch training accuracies on the left and validation accuracies on the right; (2) an analogous two-panel figure for training/validation losses; and (3) a bar chart comparing the zero-shot rule-transfer accuracy (ZSRTA) attained by each hidden size.  Every figure is wrapped in its own try/except block, saved to the common working directory with descriptive names that include the dataset and plot type, given clear titles/sub-titles, and properly closed to free resources.  The code respects the \u201cplot only what exists\u201d rule by extracting only those arrays present in experiment_data, and it limits itself to the three essential figures (\u2264 5).  Finally, each plotting block prints a short confirmation so users can verify that the plots were written successfully.  All requirements\u2014imports, working_dir setup, error handling, and closing figures\u2014are satisfied concisely.",
+    "plot_analyses": [
+      {
+        "analysis": "The accuracy curves for both training and validation show a consistent upward trend across all hidden layer sizes (64, 128, 256, 512). The larger hidden layer sizes (256 and 512) converge faster and achieve slightly higher accuracy, indicating that models with larger hidden layers are better at capturing the complexity of the task. The validation accuracy closely follows the training accuracy, suggesting minimal overfitting.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_7bd39f3e106141618f9c65ae14e1a84b_proc_319694/spr_bench_accuracy_curves_no_length_masking.png"
+      },
+      {
+        "analysis": "The loss curves for both training and validation decrease steadily across epochs for all hidden layer sizes. Similar to the accuracy curves, models with larger hidden layers (256 and 512) demonstrate faster convergence and lower final loss values. This further supports the hypothesis that larger hidden layers improve model performance. The alignment between training and validation loss indicates good generalization.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_7bd39f3e106141618f9c65ae14e1a84b_proc_319694/spr_bench_loss_curves_no_length_masking.png"
+      },
+      {
+        "analysis": "The zero-shot rule-transfer accuracy (ZSRTA) plot is empty, which indicates either an issue with the experimental setup or a lack of results for this metric. This absence prevents us from analyzing the model's zero-shot capabilities, which is a critical aspect of the research hypothesis. Addressing this gap should be a priority for subsequent experiments.",
+        "plot_path": "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_7bd39f3e106141618f9c65ae14e1a84b_proc_319694/spr_bench_zsrta_bars_no_length_masking.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_7bd39f3e106141618f9c65ae14e1a84b_proc_319694/spr_bench_accuracy_curves_no_length_masking.png",
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_7bd39f3e106141618f9c65ae14e1a84b_proc_319694/spr_bench_loss_curves_no_length_masking.png",
+      "experiments/2025-07-27_23-49-14_neural_symbolic_zero_shot_spr_attempt_0/logs/0-run/experiment_results/experiment_7bd39f3e106141618f9c65ae14e1a84b_proc_319694/spr_bench_zsrta_bars_no_length_masking.png"
+    ],
+    "vlm_feedback_summary": "The results show that larger hidden layers lead to better performance in terms of accuracy and loss. However, the absence of zero-shot rule-transfer accuracy results is a significant limitation that needs to be addressed to evaluate the model's zero-shot reasoning capabilities effectively.",
+    "exp_results_dir": "experiment_results/experiment_7bd39f3e106141618f9c65ae14e1a84b_proc_319694",
+    "ablation_name": "No-Length-Masking Ablation (Remove `pack_padded_sequence`)",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_7bd39f3e106141618f9c65ae14e1a84b_proc_319694/experiment_data.npy"
+    ]
+  }
+]

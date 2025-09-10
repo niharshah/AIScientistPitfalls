@@ -1,0 +1,4 @@
+import matplotlib.pyplot as plt
+import numpy as np
+
+We load the saved `experiment_data.npy`, pull the learning‐rate experiments for the SPR_BENCH dataset, and extract per-epoch arrays of train/val accuracy, loss, and rule-based accuracy (RBA). Five concise figures are generated: (1) train vs. validation accuracy curves for every learning rate; (2) train vs. validation loss curves; (3) RBA curves; (4) a bar chart of final test accuracies; (5) a bar chart of final test RBA scores. Each figure is wrapped in its own try-except block, saved into `working_dir` with a descriptive name, titled clearly, closed afterwards, and only uses data present in the file. We plot at most one figure per metric group, staying within the five-figure limit.

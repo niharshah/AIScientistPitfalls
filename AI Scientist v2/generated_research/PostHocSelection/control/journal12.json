@@ -1,0 +1,867 @@
+{
+    "nodes": [
+        {
+            "code": "import os, math, pathlib, random, time\nfrom typing import Dict, List\n\nimport numpy as np\nimport torch\nfrom torch import nn\nfrom torch.utils.data import Dataset, DataLoader\nfrom sklearn.metrics import f1_score\n\n# ------------------------------------------------------------------ paths / bookkeeping\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\nexperiment_data = {\n    \"SPR_BENCH_hybrid\": {\n        \"metrics\": {\"train_macro_f1\": [], \"val_macro_f1\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"epochs\": [],\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n}\n\n# ------------------------------------------------------------------ device & seed\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\ndef set_seed(seed: int = 42):\n    random.seed(seed)\n    np.random.seed(seed)\n    torch.manual_seed(seed)\n    torch.cuda.manual_seed_all(seed)\n\n\nset_seed(2024)\n\n# ------------------------------------------------------------------ data\nfrom datasets import load_dataset, DatasetDict\n\n\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(csv):\n        return load_dataset(\n            \"csv\", data_files=str(root / csv), split=\"train\", cache_dir=\".cache_dsets\"\n        )\n\n    return DatasetDict(\n        train=_load(\"train.csv\"), dev=_load(\"dev.csv\"), test=_load(\"test.csv\")\n    )\n\n\nDATA_PATH = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\nspr = load_spr_bench(DATA_PATH)\nprint({k: len(v) for k, v in spr.items()})\n\n# ------------------------------- vocab & encoding (whitespace tokenizer)\nPAD, UNK = \"<pad>\", \"<unk>\"\n\n\ndef build_vocab(seqs: List[str]) -> Dict[str, int]:\n    vocab = {PAD: 0, UNK: 1}\n    for s in seqs:\n        for tok in s.split():\n            if tok not in vocab:\n                vocab[tok] = len(vocab)\n    return vocab\n\n\nvocab = build_vocab(spr[\"train\"][\"sequence\"])\nvocab_size = len(vocab)\nprint(\"vocab_size\", vocab_size)\n\n\ndef encode(seq: str, max_len: int) -> List[int]:\n    ids = [vocab.get(tok, vocab[UNK]) for tok in seq.split()][:max_len]\n    ids += [vocab[PAD]] * (max_len - len(ids))\n    return ids\n\n\nmax_len = min(max(len(s.split()) for s in spr[\"train\"][\"sequence\"]), 64)\nlabel2id = {l: i for i, l in enumerate(sorted(set(spr[\"train\"][\"label\"])))}\nnum_labels = len(label2id)\n\n\n# ------------------------------- dataset\nclass SPRDataset(Dataset):\n    def __init__(self, split):\n        self.seqs = split[\"sequence\"]\n        self.labs = [label2id[l] for l in split[\"label\"]]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def _symbolic_feats(self, seq_tokens):\n        L = len(seq_tokens)\n        uniq = len(set(seq_tokens))\n        rep = (L - uniq) / L if L > 0 else 0\n        return [L / max_len, uniq / max_len, rep]  # simple scale 0-1\n\n    def __getitem__(self, idx):\n        tokens = self.seqs[idx].split()\n        return {\n            \"input_ids\": torch.tensor(\n                encode(self.seqs[idx], max_len), dtype=torch.long\n            ),\n            \"sym_feats\": torch.tensor(self._symbolic_feats(tokens), dtype=torch.float),\n            \"labels\": torch.tensor(self.labs[idx], dtype=torch.long),\n        }\n\n\nbatch_size = 64\ntrain_loader = DataLoader(SPRDataset(spr[\"train\"]), batch_size=batch_size, shuffle=True)\nval_loader = DataLoader(SPRDataset(spr[\"dev\"]), batch_size=batch_size, shuffle=False)\ntest_loader = DataLoader(SPRDataset(spr[\"test\"]), batch_size=batch_size, shuffle=False)\n\n\n# ------------------------------- model\nclass PositionalEncoding(nn.Module):\n    def __init__(self, d_model, max_len=5000):\n        super().__init__()\n        pe = torch.zeros(max_len, d_model)\n        pos = torch.arange(0, max_len).unsqueeze(1)\n        div_term = torch.exp(\n            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)\n        )\n        pe[:, 0::2] = torch.sin(pos * div_term)\n        pe[:, 1::2] = torch.cos(pos * div_term)\n        self.register_buffer(\"pe\", pe.unsqueeze(0))\n\n    def forward(self, x):\n        return x + self.pe[:, : x.size(1)]\n\n\nclass HybridTransformer(nn.Module):\n    def __init__(\n        self, vocab_size, emb_dim, nhead, n_layers, num_labels, sym_dim=3, dropout=0.1\n    ):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, emb_dim, padding_idx=0)\n        self.pos = PositionalEncoding(emb_dim, max_len)\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=emb_dim, nhead=nhead, dropout=dropout, batch_first=True\n        )\n        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)\n        self.cls = nn.Linear(emb_dim + sym_dim, num_labels)\n\n    def forward(self, input_ids, sym_feats):\n        mask = input_ids == 0\n        x = self.embed(input_ids)\n        x = self.pos(x)\n        x = self.encoder(x, src_key_padding_mask=mask)\n        x = x.masked_fill(mask.unsqueeze(-1), 0).mean(1)  # mean pool\n        x = torch.cat([x, sym_feats], dim=-1)\n        return self.cls(x)\n\n\nmodel = HybridTransformer(vocab_size, 128, 8, 2, num_labels).to(device)\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n\n\n# ------------------------------- train / eval\ndef run_epoch(loader, train_flag=True):\n    model.train() if train_flag else model.eval()\n    tot_loss, preds, trues = 0.0, [], []\n    for batch in loader:\n        batch = {\n            k: v.to(device) if isinstance(v, torch.Tensor) else v\n            for k, v in batch.items()\n        }\n        if train_flag:\n            optimizer.zero_grad()\n        with torch.set_grad_enabled(train_flag):\n            logits = model(batch[\"input_ids\"], batch[\"sym_feats\"])\n            loss = criterion(logits, batch[\"labels\"])\n            if train_flag:\n                loss.backward()\n                optimizer.step()\n        tot_loss += loss.item() * batch[\"labels\"].size(0)\n        preds.extend(logits.argmax(-1).cpu().numpy())\n        trues.extend(batch[\"labels\"].cpu().numpy())\n    return (\n        tot_loss / len(loader.dataset),\n        f1_score(trues, preds, average=\"macro\"),\n        preds,\n        trues,\n    )\n\n\n# ------------------------------- training loop\nnum_epochs = 8\nfor epoch in range(1, num_epochs + 1):\n    t0 = time.time()\n    tr_loss, tr_f1, _, _ = run_epoch(train_loader, True)\n    val_loss, val_f1, _, _ = run_epoch(val_loader, False)\n\n    experiment_data[\"SPR_BENCH_hybrid\"][\"losses\"][\"train\"].append(tr_loss)\n    experiment_data[\"SPR_BENCH_hybrid\"][\"losses\"][\"val\"].append(val_loss)\n    experiment_data[\"SPR_BENCH_hybrid\"][\"metrics\"][\"train_macro_f1\"].append(tr_f1)\n    experiment_data[\"SPR_BENCH_hybrid\"][\"metrics\"][\"val_macro_f1\"].append(val_f1)\n    experiment_data[\"SPR_BENCH_hybrid\"][\"epochs\"].append(epoch)\n\n    print(\n        f\"Epoch {epoch}: train_loss={tr_loss:.4f} val_loss={val_loss:.4f} \"\n        f\"train_F1={tr_f1:.4f} val_F1={val_f1:.4f}  ({time.time()-t0:.1f}s)\"\n    )\n\n# ------------------------------- final test\ntest_loss, test_f1, test_preds, test_trues = run_epoch(test_loader, False)\nexperiment_data[\"SPR_BENCH_hybrid\"][\"test_macro_f1\"] = test_f1\nexperiment_data[\"SPR_BENCH_hybrid\"][\"test_loss\"] = test_loss\nexperiment_data[\"SPR_BENCH_hybrid\"][\"predictions\"] = test_preds\nexperiment_data[\"SPR_BENCH_hybrid\"][\"ground_truth\"] = test_trues\nprint(f\"Test: loss={test_loss:.4f} macro_F1={test_f1:.4f}\")\n\n# ------------------------------- save\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"Saved metrics to\", os.path.join(working_dir, \"experiment_data.npy\"))\n",
+            "plan": "We add a light “symbolic-feature” branch that computes three hand-crafted rule-oriented statistics for every sequence (length, unique-token ratio, repetition ratio).  \nA transformer encoder produces a contextual vector; the symbolic branch outputs a 3-D vector; the two are concatenated and classified.  \nThis hybrid neural-symbolic model is trained and evaluated on SPR_BENCH while tracking loss and macro-F1 per epoch, then its test score is reported and all metrics are saved.",
+            "overall_plan": "",
+            "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\nfrom sklearn.metrics import confusion_matrix\n\n# ------------------------------------------------------------------ setup & load\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\ndatasets = experiment_data  # treat every top-level key as a dataset\nsummary = {}\n\n# -------- Figure 1 : Macro-F1 curves -----------------------------------------\ntry:\n    fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True)\n    fig.suptitle(\"Macro-F1 over Epochs\\nLeft: Train  Right: Validation\", fontsize=14)\n    for name, rec in datasets.items():\n        epochs = rec.get(\"epochs\", [])\n        axes[0].plot(epochs, rec[\"metrics\"][\"train_macro_f1\"], label=name)\n        axes[1].plot(epochs, rec[\"metrics\"][\"val_macro_f1\"], label=name)\n    for ax, ttl in zip(axes, [\"Train Macro-F1\", \"Validation Macro-F1\"]):\n        ax.set_title(ttl)\n        ax.set_xlabel(\"Epoch\")\n        ax.set_ylabel(\"Macro-F1\")\n        ax.legend()\n    plt.savefig(os.path.join(working_dir, \"macro_f1_curves.png\"))\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating Macro-F1 plot: {e}\")\n    plt.close()\n\n# -------- Figure 2 : Loss curves ---------------------------------------------\ntry:\n    fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True)\n    fig.suptitle(\n        \"Cross-Entropy Loss over Epochs\\nLeft: Train  Right: Validation\", fontsize=14\n    )\n    for name, rec in datasets.items():\n        epochs = rec.get(\"epochs\", [])\n        axes[0].plot(epochs, rec[\"losses\"][\"train\"], label=name)\n        axes[1].plot(epochs, rec[\"losses\"][\"val\"], label=name)\n    for ax, ttl in zip(axes, [\"Train Loss\", \"Validation Loss\"]):\n        ax.set_title(ttl)\n        ax.set_xlabel(\"Epoch\")\n        ax.set_ylabel(\"Loss\")\n        ax.legend()\n    plt.savefig(os.path.join(working_dir, \"loss_curves.png\"))\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating Loss plot: {e}\")\n    plt.close()\n\n# -------- Figure 3 : Final Test Macro-F1 bar chart ----------------------------\ntry:\n    keys, test_f1s = [], []\n    for name, rec in datasets.items():\n        keys.append(name)\n        test_f1s.append(rec.get(\"test_macro_f1\", 0.0))\n        summary[name] = rec.get(\"test_macro_f1\", 0.0)\n    fig = plt.figure(figsize=(8, 5))\n    plt.bar(keys, test_f1s, color=\"skyblue\")\n    plt.title(\"Final Test Macro-F1 by Dataset\")\n    plt.ylabel(\"Macro-F1\")\n    plt.xticks(rotation=45, ha=\"right\")\n    plt.tight_layout()\n    plt.savefig(os.path.join(working_dir, \"test_macro_f1_bar.png\"))\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating Test Macro-F1 bar plot: {e}\")\n    plt.close()\n\n# -------- Figure 4 : Confusion Matrix (first 5 datasets) ----------------------\ntry:\n    for idx, (name, rec) in enumerate(list(datasets.items())[:5]):\n        preds = rec.get(\"predictions\", [])\n        trues = rec.get(\"ground_truth\", [])\n        if len(preds) == len(trues) and len(preds) > 0:\n            cm = confusion_matrix(trues, preds, normalize=\"true\")\n            plt.figure(figsize=(6, 5))\n            plt.imshow(cm, cmap=\"Blues\")\n            plt.colorbar()\n            plt.title(f\"{name} : Normalized Confusion Matrix\")\n            plt.xlabel(\"Predicted\")\n            plt.ylabel(\"True\")\n            plt.tight_layout()\n            fname = os.path.join(working_dir, f\"{name}_confusion_matrix.png\")\n            plt.savefig(fname)\n            plt.close()\nexcept Exception as e:\n    print(f\"Error creating Confusion Matrix: {e}\")\n    plt.close()\n\n# -------- Console summary -----------------------------------------------------\nprint(\"\\nFinal Test Macro-F1 Scores:\")\nfor k, v in summary.items():\n    print(f\"{k:25s}: {v:.4f}\")\n",
+            "plot_plan": "We will load experiment_data.npy into a Python dict and treat each top-level key (e.g. “SPR_BENCH_hybrid”) as a separate dataset entry. For every dataset we will extract epochs, train/validation macro-F1, train/validation losses, final test macro-F1, predictions and ground-truth. Using matplotlib we will then: (1) draw side-by-side train/val macro-F1 curves; (2) draw side-by-side train/val loss curves; (3) make a bar chart comparing final test macro-F1 across all datasets; (4) if predictions & labels exist, plot a normalized confusion matrix, limiting to at most the first five datasets to avoid overcrowding. Each figure creation is wrapped in a try-except block, saved to working_dir with clear, descriptive filenames, and closed afterwards. The script also prints a concise console summary of test macro-F1 for every dataset. Only data present in experiment_data.npy is used—no synthetic values are generated. The code is self-contained, starts with the required imports, and follows the prescribed directory conventions.",
+            "step": 2,
+            "id": "6b62d6adc7ad4c75aa54151c8b603abe",
+            "ctime": 1755493347.3655405,
+            "parse_metrics_plan": "We first load the saved NumPy dictionary from the working directory, then loop over every dataset entry it contains. For each dataset we read the recorded training/validation losses and F1 scores, identify the best (minimum) loss and the best (maximum) F1 across all epochs, and finally fetch the single test‐set metrics that were stored after training. The script prints the dataset name followed by clearly-named lines for each best or final metric value so the output is immediately interpretable. No plots or additional wrappers are used and everything runs directly at import.",
+            "parse_metrics_code": "import os\nimport numpy as np\n\n# ------------------------------------------------------------------ load file\nworking_dir = os.path.join(os.getcwd(), \"working\")\nfile_path = os.path.join(working_dir, \"experiment_data.npy\")\nexperiment_data = np.load(file_path, allow_pickle=True).item()\n\n\n# ------------------------------------------------------------------ helper\ndef safe_best(values, mode=\"min\"):\n    \"\"\"Return best value given a list; mode 'min' or 'max'.\"\"\"\n    if not values:\n        return None\n    return min(values) if mode == \"min\" else max(values)\n\n\n# ------------------------------------------------------------------ print metrics\nfor dataset_name, data in experiment_data.items():\n    print(f\"\\n{dataset_name}\")  # dataset title\n\n    # Training/validation losses\n    train_losses = data.get(\"losses\", {}).get(\"train\", [])\n    val_losses = data.get(\"losses\", {}).get(\"val\", [])\n    best_train_loss = safe_best(train_losses, mode=\"min\")\n    best_val_loss = safe_best(val_losses, mode=\"min\")\n\n    # Training/validation F1\n    train_f1s = data.get(\"metrics\", {}).get(\"train_macro_f1\", [])\n    val_f1s = data.get(\"metrics\", {}).get(\"val_macro_f1\", [])\n    best_train_f1 = safe_best(train_f1s, mode=\"max\")\n    best_val_f1 = safe_best(val_f1s, mode=\"max\")\n\n    # Test metrics (single values)\n    test_loss = data.get(\"test_loss\")\n    test_f1 = data.get(\"test_macro_f1\")\n\n    # ---------------------- print with explicit names\n    if best_train_loss is not None:\n        print(f\"Best training loss: {best_train_loss:.4f}\")\n    if best_val_loss is not None:\n        print(f\"Best validation loss: {best_val_loss:.4f}\")\n    if best_train_f1 is not None:\n        print(f\"Best training macro F1 score: {best_train_f1:.4f}\")\n    if best_val_f1 is not None:\n        print(f\"Best validation macro F1 score: {best_val_f1:.4f}\")\n    if test_loss is not None:\n        print(f\"Test loss: {test_loss:.4f}\")\n    if test_f1 is not None:\n        print(f\"Test macro F1 score: {test_f1:.4f}\")\n",
+            "parse_exc_type": null,
+            "parse_exc_info": null,
+            "parse_exc_stack": null,
+            "exec_time": 4.721819877624512,
+            "exc_type": null,
+            "exc_info": null,
+            "exc_stack": null,
+            "analysis": "",
+            "exp_results_dir": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_6b62d6adc7ad4c75aa54151c8b603abe_proc_3470354",
+            "metric": {
+                "value": {
+                    "metric_names": [
+                        {
+                            "metric_name": "training loss",
+                            "lower_is_better": true,
+                            "description": "The loss value during the training phase.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_hybrid",
+                                    "final_value": 0.00164,
+                                    "best_value": 0.00164
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "validation loss",
+                            "lower_is_better": true,
+                            "description": "The loss value during the validation phase.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_hybrid",
+                                    "final_value": 0.5452,
+                                    "best_value": 0.5452
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "training macro F1 score",
+                            "lower_is_better": false,
+                            "description": "The macro F1 score during the training phase.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_hybrid",
+                                    "final_value": 0.9955,
+                                    "best_value": 0.9955
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "validation macro F1 score",
+                            "lower_is_better": false,
+                            "description": "The macro F1 score during the validation phase.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_hybrid",
+                                    "final_value": 0.798,
+                                    "best_value": 0.798
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "test loss",
+                            "lower_is_better": true,
+                            "description": "The loss value during the testing phase.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_hybrid",
+                                    "final_value": 1.1347,
+                                    "best_value": 1.1347
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "test macro F1 score",
+                            "lower_is_better": false,
+                            "description": "The macro F1 score during the testing phase.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_hybrid",
+                                    "final_value": 0.802,
+                                    "best_value": 0.802
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "maximize": null,
+                "name": null,
+                "description": null
+            },
+            "is_buggy": false,
+            "is_buggy_plots": false,
+            "parent_id": null,
+            "children": [],
+            "plot_data": {},
+            "plots_generated": false,
+            "plots": [
+                "../../logs/0-run/experiment_results/experiment_6b62d6adc7ad4c75aa54151c8b603abe_proc_3470354/macro_f1_curves.png",
+                "../../logs/0-run/experiment_results/experiment_6b62d6adc7ad4c75aa54151c8b603abe_proc_3470354/loss_curves.png",
+                "../../logs/0-run/experiment_results/experiment_6b62d6adc7ad4c75aa54151c8b603abe_proc_3470354/test_macro_f1_bar.png",
+                "../../logs/0-run/experiment_results/experiment_6b62d6adc7ad4c75aa54151c8b603abe_proc_3470354/SPR_BENCH_hybrid_confusion_matrix.png"
+            ],
+            "plot_paths": [
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_6b62d6adc7ad4c75aa54151c8b603abe_proc_3470354/macro_f1_curves.png",
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_6b62d6adc7ad4c75aa54151c8b603abe_proc_3470354/loss_curves.png",
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_6b62d6adc7ad4c75aa54151c8b603abe_proc_3470354/test_macro_f1_bar.png",
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_6b62d6adc7ad4c75aa54151c8b603abe_proc_3470354/SPR_BENCH_hybrid_confusion_matrix.png"
+            ],
+            "plot_analyses": [
+                {
+                    "analysis": "The training Macro-F1 score improves rapidly during the first few epochs, reaching near-perfect performance by epoch 4 and stabilizing thereafter. This suggests that the model learns effectively from the training data. However, the validation Macro-F1 score exhibits a slower improvement trend and fluctuates slightly after epoch 4, indicating potential overfitting or sensitivity to validation data variations.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_6b62d6adc7ad4c75aa54151c8b603abe_proc_3470354/macro_f1_curves.png"
+                },
+                {
+                    "analysis": "The training loss decreases sharply in the first two epochs and approaches zero by epoch 4, indicating successful minimization of the objective function on the training data. Conversely, the validation loss decreases initially but begins to increase after epoch 4, which is a classic sign of overfitting, where the model performs well on the training data but struggles to generalize to unseen validation data.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_6b62d6adc7ad4c75aa54151c8b603abe_proc_3470354/loss_curves.png"
+                },
+                {
+                    "analysis": "The final test Macro-F1 score for the SPR_BENCH_hybrid model is approximately 0.7. This matches the state-of-the-art benchmark performance, indicating that the proposed model is competitive but does not surpass the benchmark.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_6b62d6adc7ad4c75aa54151c8b603abe_proc_3470354/test_macro_f1_bar.png"
+                },
+                {
+                    "analysis": "The normalized confusion matrix reveals that the model has a relatively balanced performance across the classes. However, there is room for improvement in reducing misclassifications, as some entries in the matrix indicate confusion between certain classes.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_6b62d6adc7ad4c75aa54151c8b603abe_proc_3470354/SPR_BENCH_hybrid_confusion_matrix.png"
+                }
+            ],
+            "vlm_feedback_summary": "The plots indicate that the model performs well on the training data but shows signs of overfitting on the validation data. While the final test Macro-F1 score matches the state-of-the-art benchmark, the model does not surpass it. Further optimization and experimentation are needed to enhance generalization and overall performance.",
+            "datasets_successfully_tested": [
+                "\"\""
+            ],
+            "ablation_name": null,
+            "hyperparam_name": null,
+            "is_seed_node": false,
+            "is_seed_agg_node": false,
+            "exec_time_feedback": "",
+            "ranking": 0
+        },
+        {
+            "code": "import os, math, random, time, pathlib\nfrom typing import Dict, List, Tuple\n\nimport numpy as np\nimport torch\nfrom torch import nn\nfrom torch.utils.data import Dataset, DataLoader\nfrom sklearn.metrics import f1_score\nfrom datasets import load_dataset, DatasetDict\n\n# --- working dir ----------------------------------------------------------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# --- experiment data holder -----------------------------------------------------------\nexperiment_data = {\n    \"SPR_BENCH_MLM\": {\n        \"metrics\": {\"train_macro_f1\": [], \"val_macro_f1\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n        \"epochs\": [],\n    }\n}\n\n\n# --- reproducibility ------------------------------------------------------------------\ndef set_seed(seed: int = 42):\n    random.seed(seed)\n    np.random.seed(seed)\n    torch.manual_seed(seed)\n    torch.cuda.manual_seed_all(seed)\n    torch.backends.cudnn.deterministic = True\n    torch.backends.cudnn.benchmark = False\n\n\nset_seed(42)\n\n# --- device ---------------------------------------------------------------------------\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# --- load SPR_BENCH -------------------------------------------------------------------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(split_csv: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / split_csv),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    dd = DatasetDict()\n    for sp, fn in zip([\"train\", \"dev\", \"test\"], [\"train.csv\", \"dev.csv\", \"test.csv\"]):\n        dd[sp] = _load(fn)\n    return dd\n\n\ndata_root = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\nspr = load_spr_bench(data_root)\nprint({k: len(v) for k, v in spr.items()})\n\n# --- vocabulary -----------------------------------------------------------------------\nPAD, UNK, CLS, MSK = \"<pad>\", \"<unk>\", \"<cls>\", \"<mask>\"\n\n\ndef build_vocab(seqs: List[str]) -> Dict[str, int]:\n    vocab = {PAD: 0, UNK: 1, CLS: 2, MSK: 3}\n    for s in seqs:\n        for tok in s.strip().split():\n            if tok not in vocab:\n                vocab[tok] = len(vocab)\n    return vocab\n\n\nvocab = build_vocab(spr[\"train\"][\"sequence\"])\nvocab_size = len(vocab)\npad_id, unk_id, cls_id, msk_id = vocab[PAD], vocab[UNK], vocab[CLS], vocab[MSK]\nprint(f\"Vocab size: {vocab_size}\")\n\n\ndef encode(seq: str, max_len: int) -> List[int]:\n    tokens = [CLS] + seq.strip().split()\n    ids = [vocab.get(tok, unk_id) for tok in tokens][:max_len]\n    ids += [pad_id] * (max_len - len(ids))\n    return ids\n\n\nmax_len = min(\n    max(len(s.split()) for s in spr[\"train\"][\"sequence\"]) + 1, 64\n)  # +1 for CLS\nprint(f\"max_len: {max_len}\")\n\n# --- labels ---------------------------------------------------------------------------\nlabel_set = sorted(set(spr[\"train\"][\"label\"]))\nlabel2id = {lab: i for i, lab in enumerate(label_set)}\nnum_labels = len(label2id)\nprint(f\"num_labels: {num_labels}\")\n\n\n# --- dataset --------------------------------------------------------------------------\nclass SPRDataset(Dataset):\n    def __init__(self, split, do_mlm: bool):\n        self.seqs = split[\"sequence\"]\n        self.labels = [label2id[l] for l in split[\"label\"]]\n        self.do_mlm = do_mlm\n\n    def random_mask(self, ids: List[int]) -> Tuple[List[int], List[int]]:\n        \"\"\"BERT-style random masking (15% of tokens, excluding PAD & CLS).\"\"\"\n        ids = ids.copy()\n        labels = [-100] * len(ids)\n        for i in range(1, len(ids)):  # skip CLS at position 0\n            if ids[i] == pad_id:\n                continue\n            if random.random() < 0.15:\n                labels[i] = ids[i]\n                prob = random.random()\n                if prob < 0.8:\n                    ids[i] = msk_id\n                elif prob < 0.9:\n                    ids[i] = random.randrange(vocab_size)\n                # 10% keep unchanged\n        return ids, labels\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        input_ids = encode(self.seqs[idx], max_len)\n        mlm_labels = [-100] * max_len\n        if self.do_mlm:\n            input_ids, mlm_labels = self.random_mask(input_ids)\n        return {\n            \"input_ids\": torch.tensor(input_ids, dtype=torch.long),\n            \"labels\": torch.tensor(self.labels[idx], dtype=torch.long),\n            \"mlm_labels\": torch.tensor(mlm_labels, dtype=torch.long),\n        }\n\n\nbatch_size = 64\ntrain_loader = DataLoader(\n    SPRDataset(spr[\"train\"], do_mlm=True), batch_size=batch_size, shuffle=True\n)\nval_loader = DataLoader(\n    SPRDataset(spr[\"dev\"], do_mlm=False), batch_size=batch_size, shuffle=False\n)\ntest_loader = DataLoader(\n    SPRDataset(spr[\"test\"], do_mlm=False), batch_size=batch_size, shuffle=False\n)\n\n\n# --- model ----------------------------------------------------------------------------\nclass PositionalEncoding(nn.Module):\n    def __init__(self, d_model, max_len=5000):\n        super().__init__()\n        pe = torch.zeros(max_len, d_model)\n        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)\n        div_term = torch.exp(\n            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)\n        )\n        pe[:, 0::2] = torch.sin(position * div_term)\n        pe[:, 1::2] = torch.cos(position * div_term)\n        self.register_buffer(\"pe\", pe.unsqueeze(0))\n\n    def forward(self, x):\n        return x + self.pe[:, : x.size(1)]\n\n\nclass SPRTransformer(nn.Module):\n    def __init__(self, vocab_size, emb_dim, nhead, nlayers, num_labels, dropout=0.1):\n        super().__init__()\n        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=pad_id)\n        self.posenc = PositionalEncoding(emb_dim, max_len)\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=emb_dim, nhead=nhead, dropout=dropout, batch_first=True\n        )\n        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=nlayers)\n        self.cls_head = nn.Linear(emb_dim, num_labels)\n        self.mlm_head = nn.Linear(emb_dim, vocab_size)\n\n    def forward(self, input_ids):\n        mask = input_ids == pad_id\n        x = self.embedding(input_ids)\n        x = self.posenc(x)\n        x = self.encoder(x, src_key_padding_mask=mask)\n        cls_vec = x[:, 0, :]  # embedding of <cls>\n        return self.cls_head(cls_vec), self.mlm_head(x)\n\n\n# --- training / evaluation ------------------------------------------------------------\ndef run_epoch(\n    model, loader, criterion_cls, criterion_mlm, optimizer=None, mlm_weight=0.5\n):\n    train_mode = optimizer is not None\n    model.train() if train_mode else model.eval()\n    total_loss, total_cls_loss, total_mlm_loss = 0, 0, 0\n    all_preds, all_trues = [], []\n    for batch in loader:\n        batch = {\n            k: v.to(device) if isinstance(v, torch.Tensor) else v\n            for k, v in batch.items()\n        }\n        if train_mode:\n            optimizer.zero_grad()\n        with torch.set_grad_enabled(train_mode):\n            cls_logits, mlm_logits = model(batch[\"input_ids\"])\n            cls_loss = criterion_cls(cls_logits, batch[\"labels\"])\n            mlm_loss = torch.tensor(0.0, device=device)\n            if train_mode:  # MLM used only during training\n                mlm_loss = criterion_mlm(\n                    mlm_logits.view(-1, vocab_size), batch[\"mlm_labels\"].view(-1)\n                )\n            loss = cls_loss + mlm_weight * mlm_loss\n            if train_mode:\n                loss.backward()\n                optimizer.step()\n        total_loss += loss.item() * batch[\"labels\"].size(0)\n        total_cls_loss += cls_loss.item() * batch[\"labels\"].size(0)\n        total_mlm_loss += mlm_loss.item() * batch[\"labels\"].size(0)\n        all_preds.extend(cls_logits.argmax(dim=-1).cpu().numpy())\n        all_trues.extend(batch[\"labels\"].cpu().numpy())\n    avg_loss = total_loss / len(loader.dataset)\n    macro_f1 = f1_score(all_trues, all_preds, average=\"macro\")\n    return avg_loss, macro_f1\n\n\n# --- hyper-params ---------------------------------------------------------------------\nemb_dim = 128\nnhead = 8\nnlayers = 2\ndropout = 0.1\nlr = 1e-3\nnum_epochs = 10\nmlm_weight = 0.5\n\n# --- initialise -----------------------------------------------------------------------\nmodel = SPRTransformer(vocab_size, emb_dim, nhead, nlayers, num_labels, dropout).to(\n    device\n)\ncriterion_cls = nn.CrossEntropyLoss()\ncriterion_mlm = nn.CrossEntropyLoss(ignore_index=-100)\noptimizer = torch.optim.Adam(model.parameters(), lr=lr)\n\n# --- train / validate -----------------------------------------------------------------\nrecord = experiment_data[\"SPR_BENCH_MLM\"]\nfor epoch in range(1, num_epochs + 1):\n    t0 = time.time()\n    train_loss, train_f1 = run_epoch(\n        model, train_loader, criterion_cls, criterion_mlm, optimizer, mlm_weight\n    )\n    val_loss, val_f1 = run_epoch(\n        model, val_loader, criterion_cls, criterion_mlm, optimizer=None\n    )\n    record[\"losses\"][\"train\"].append(train_loss)\n    record[\"losses\"][\"val\"].append(val_loss)\n    record[\"metrics\"][\"train_macro_f1\"].append(train_f1)\n    record[\"metrics\"][\"val_macro_f1\"].append(val_f1)\n    record[\"epochs\"].append(epoch)\n    print(\n        f\"Epoch {epoch}: val_loss = {val_loss:.4f}, val_macro_f1 = {val_f1:.4f} \"\n        f\"(train_macro_f1 = {train_f1:.4f}, time {time.time()-t0:.1f}s)\"\n    )\n\n# --- test -----------------------------------------------------------------------------\ntest_loss, test_f1 = run_epoch(\n    model, test_loader, criterion_cls, criterion_mlm, optimizer=None\n)\nprint(f\"Test: loss = {test_loss:.4f}, macro_F1 = {test_f1:.4f}\")\nrecord[\"test_loss\"] = test_loss\nrecord[\"test_macro_f1\"] = test_f1\n\n# --- save -----------------------------------------------------------------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"Results saved to\", os.path.join(working_dir, \"experiment_data.npy\"))\n",
+            "plan": "To push beyond the earlier baseline we fuse explicit symbol-level self-supervision into the transformer.  \nDuring training each sequence is simultaneously (1) classified and (2) used in a masked-language-model (MLM) objective that forces the network to reconstruct randomly hidden symbols—encouraging rule abstraction and symbolic reasoning.  \nA special `<cls>` token is prepended for sequence classification, and a `<mask>` token is introduced for MLM.  \nThe total loss = classification_loss + 0.5 × MLM_loss.  \nAt evaluation time only the classification head is used.  \nWe keep all bookkeeping, metrics, GPU handling and saving requirements from the spec.  \nThe code below trains the joint model for 10 epochs, prints validation loss/F1 each epoch, evaluates on the test split, stores all metrics in `experiment_data.npy`, and thus offers a stronger, reasoning-aware baseline.",
+            "overall_plan": "",
+            "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# working directory for outputs\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ------------------------------------------------------------------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = None\n\nif experiment_data is not None:\n    test_summary = {}\n    # ---------- per-dataset plots ---------------------------------\n    for ds_name, rec in experiment_data.items():\n        epochs = rec.get(\"epochs\", [])\n        # ---- Figure 1: Macro-F1 curves ----\n        try:\n            fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True)\n            fig.suptitle(\n                f\"{ds_name} Macro-F1 over Epochs\\nLeft: Train  Right: Validation\",\n                fontsize=14,\n            )\n            axes[0].plot(epochs, rec[\"metrics\"][\"train_macro_f1\"], label=\"Train F1\")\n            axes[1].plot(epochs, rec[\"metrics\"][\"val_macro_f1\"], label=\"Val F1\")\n            for ax, ttl in zip(axes, [\"Train Macro-F1\", \"Validation Macro-F1\"]):\n                ax.set_title(ttl)\n                ax.set_xlabel(\"Epoch\")\n                ax.set_ylabel(\"Macro-F1\")\n                ax.legend()\n            fpath = os.path.join(working_dir, f\"{ds_name}_macro_f1_curves.png\")\n            plt.savefig(fpath)\n            plt.close()\n        except Exception as e:\n            print(f\"Error creating F1 plot for {ds_name}: {e}\")\n            plt.close()\n\n        # ---- Figure 2: Loss curves ----\n        try:\n            fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True)\n            fig.suptitle(\n                f\"{ds_name} Cross-Entropy Loss over Epochs\\nLeft: Train  Right: Validation\",\n                fontsize=14,\n            )\n            axes[0].plot(epochs, rec[\"losses\"][\"train\"], label=\"Train Loss\")\n            axes[1].plot(epochs, rec[\"losses\"][\"val\"], label=\"Val Loss\")\n            for ax, ttl in zip(axes, [\"Train Loss\", \"Validation Loss\"]):\n                ax.set_title(ttl)\n                ax.set_xlabel(\"Epoch\")\n                ax.set_ylabel(\"Loss\")\n                ax.legend()\n            fpath = os.path.join(working_dir, f\"{ds_name}_loss_curves.png\")\n            plt.savefig(fpath)\n            plt.close()\n        except Exception as e:\n            print(f\"Error creating Loss plot for {ds_name}: {e}\")\n            plt.close()\n\n        # collect test scores for comparison plot\n        test_summary[ds_name] = rec.get(\"test_macro_f1\", 0.0)\n\n    # ---------- comparison bar chart ------------------------------\n    try:\n        fig = plt.figure(figsize=(8, 5))\n        keys, vals = zip(*test_summary.items()) if test_summary else ([], [])\n        plt.bar(keys, vals, color=\"skyblue\")\n        plt.title(\"Test Macro-F1 Comparison Across Datasets\")\n        plt.ylabel(\"Macro-F1\")\n        plt.xticks(rotation=45)\n        plt.tight_layout()\n        fpath = os.path.join(working_dir, \"all_datasets_test_macro_f1_bar.png\")\n        plt.savefig(fpath)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating comparison bar chart: {e}\")\n        plt.close()\n\n    # ---------- console summary -----------------------------------\n    print(\"\\nFinal Test Macro-F1 Scores:\")\n    for k, v in test_summary.items():\n        print(f\"{k:25s}: {v:.4f}\")\n",
+            "plot_plan": "The solution loads the serialized `experiment_data.npy`, detects all datasets stored inside, and for each dataset constructs two standard learning-curve figures: (1) macro-F1 versus epochs and (2) total loss versus epochs, each with “Left: Train, Right: Validation” subtitles.  All figures are saved into the `working` directory with filenames that include both the dataset name and plot type.  To enable multi-dataset comparison, a separate bar chart comparing the final test macro-F1 scores of every dataset present is also created.  Every individual plotting routine is enclosed in a `try-except` block so that one failure does not stop the rest; inside the `except` clause the figure is closed to free resources.  No synthetic data are generated—plots are only produced if the corresponding keys exist in the numpy object.  The code follows the required imports, constructs `working_dir`, and finishes by printing a concise console summary of test macro-F1 values.  All figures are explicitly closed after saving to avoid memory leakage, and the code is kept compact and easy to read.",
+            "step": 3,
+            "id": "bd144de5527140edbf3f44dbfee8db6b",
+            "ctime": 1755493352.6278884,
+            "parse_metrics_plan": "We will load the NumPy file from the “working” directory, convert it back to a Python dict, and iterate over every dataset it contains.  \nFor each dataset we will extract the stored lists of training losses, validation losses, training macro-F1 scores and validation macro-F1 scores, then compute the final training values (last epoch) and the best validation values (min loss / max F1).  \nWe will also read the separately stored test loss and test macro-F1 score.  \nAll results will be printed with explicit metric names so it is clear which number refers to which split and metric.",
+            "parse_metrics_code": "import os\nimport numpy as np\n\n# ------------------------------------------------------------------\n# locate and load the saved experiment data\n# ------------------------------------------------------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nexp_path = os.path.join(working_dir, \"experiment_data.npy\")\n\nexperiment_data = np.load(exp_path, allow_pickle=True).item()\n\n\n# ------------------------------------------------------------------\n# helper functions to pick best values\n# ------------------------------------------------------------------\ndef best_val(loss_list=None, f1_list=None):\n    \"\"\"\n    Return best (lowest) loss or best (highest) f1.\n    Exactly one of loss_list or f1_list should be provided.\n    \"\"\"\n    if loss_list is not None:\n        return min(loss_list)\n    if f1_list is not None:\n        return max(f1_list)\n    raise ValueError(\"Either loss_list or f1_list must be given.\")\n\n\n# ------------------------------------------------------------------\n# iterate over every stored dataset and print requested metrics\n# ------------------------------------------------------------------\nfor dataset_name, record in experiment_data.items():\n    print(f\"{dataset_name}:\")  # dataset header\n\n    # retrieve per-epoch series\n    train_losses = record[\"losses\"][\"train\"]\n    val_losses = record[\"losses\"][\"val\"]\n    train_f1s = record[\"metrics\"][\"train_macro_f1\"]\n    val_f1s = record[\"metrics\"][\"val_macro_f1\"]\n\n    # final values\n    final_train_loss = train_losses[-1] if train_losses else None\n    final_train_f1 = train_f1s[-1] if train_f1s else None\n\n    # best validation values\n    best_val_loss = best_val(loss_list=val_losses) if val_losses else None\n    best_val_f1 = best_val(f1_list=val_f1s) if val_f1s else None\n\n    # test values (stored separately)\n    test_loss = record.get(\"test_loss\")\n    test_f1 = record.get(\"test_macro_f1\")\n\n    # print with explicit names\n    if final_train_loss is not None:\n        print(f\"  final training loss: {final_train_loss:.6f}\")\n    if best_val_loss is not None:\n        print(f\"  best validation loss: {best_val_loss:.6f}\")\n    if final_train_f1 is not None:\n        print(f\"  final training macro F1 score: {final_train_f1:.6f}\")\n    if best_val_f1 is not None:\n        print(f\"  best validation macro F1 score: {best_val_f1:.6f}\")\n    if test_loss is not None:\n        print(f\"  test loss: {test_loss:.6f}\")\n    if test_f1 is not None:\n        print(f\"  test macro F1 score: {test_f1:.6f}\")\n",
+            "parse_exc_type": null,
+            "parse_exc_info": null,
+            "parse_exc_stack": null,
+            "exec_time": 6.059115886688232,
+            "exc_type": null,
+            "exc_info": null,
+            "exc_stack": null,
+            "analysis": "The training script executed successfully without any bugs. The model was trained, validated, and tested on the SPR_BENCH dataset. The final test macro F1-score achieved was 0.6968, which is close to the reported state-of-the-art (70.0%). While the model's performance is promising, it did not surpass the SOTA benchmark. Further experimentation, such as hyperparameter tuning or architectural modifications, may help improve performance. The results were saved successfully, and the execution was efficient.",
+            "exp_results_dir": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_bd144de5527140edbf3f44dbfee8db6b_proc_3470355",
+            "metric": {
+                "value": {
+                    "metric_names": [
+                        {
+                            "metric_name": "training loss",
+                            "lower_is_better": true,
+                            "description": "The loss computed on the training set during model training.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_MLM",
+                                    "final_value": 1.53364,
+                                    "best_value": 1.53364
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "validation loss",
+                            "lower_is_better": true,
+                            "description": "The loss computed on the validation set to evaluate the model.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_MLM",
+                                    "final_value": 1.435533,
+                                    "best_value": 1.435533
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "training macro F1 score",
+                            "lower_is_better": false,
+                            "description": "The macro F1 score computed on the training set during model training.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_MLM",
+                                    "final_value": 0.9775,
+                                    "best_value": 0.9775
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "validation macro F1 score",
+                            "lower_is_better": false,
+                            "description": "The macro F1 score computed on the validation set to evaluate the model.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_MLM",
+                                    "final_value": 0.713969,
+                                    "best_value": 0.713969
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "test loss",
+                            "lower_is_better": true,
+                            "description": "The loss computed on the test set to evaluate the model.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_MLM",
+                                    "final_value": 2.039696,
+                                    "best_value": 2.039696
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "test macro F1 score",
+                            "lower_is_better": false,
+                            "description": "The macro F1 score computed on the test set to evaluate the model.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_MLM",
+                                    "final_value": 0.716779,
+                                    "best_value": 0.716779
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "maximize": null,
+                "name": null,
+                "description": null
+            },
+            "is_buggy": false,
+            "is_buggy_plots": false,
+            "parent_id": null,
+            "children": [],
+            "plot_data": {},
+            "plots_generated": false,
+            "plots": [
+                "../../logs/0-run/experiment_results/experiment_bd144de5527140edbf3f44dbfee8db6b_proc_3470355/SPR_BENCH_MLM_macro_f1_curves.png",
+                "../../logs/0-run/experiment_results/experiment_bd144de5527140edbf3f44dbfee8db6b_proc_3470355/SPR_BENCH_MLM_loss_curves.png",
+                "../../logs/0-run/experiment_results/experiment_bd144de5527140edbf3f44dbfee8db6b_proc_3470355/all_datasets_test_macro_f1_bar.png"
+            ],
+            "plot_paths": [
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_bd144de5527140edbf3f44dbfee8db6b_proc_3470355/SPR_BENCH_MLM_macro_f1_curves.png",
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_bd144de5527140edbf3f44dbfee8db6b_proc_3470355/SPR_BENCH_MLM_loss_curves.png",
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_bd144de5527140edbf3f44dbfee8db6b_proc_3470355/all_datasets_test_macro_f1_bar.png"
+            ],
+            "plot_analyses": [
+                {
+                    "analysis": "The training Macro-F1 score increases steadily and saturates at a high level (~0.95) by epoch 6, indicating effective learning on the training set. The validation Macro-F1 shows a fluctuating pattern with no clear upward trend, suggesting potential overfitting or instability in the model's generalization performance. The lack of consistent improvement in validation performance warrants further investigation into the model's architecture or training process.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_bd144de5527140edbf3f44dbfee8db6b_proc_3470355/SPR_BENCH_MLM_macro_f1_curves.png"
+                },
+                {
+                    "analysis": "The training loss decreases consistently over the epochs, indicating that the model is effectively learning from the training data. However, the validation loss exhibits a non-monotonic pattern, increasing significantly after epoch 6. This behavior, combined with the fluctuating validation Macro-F1, suggests overfitting, as the model performs well on the training data but struggles to generalize to unseen data. Regularization techniques or adjustments to the training procedure may be necessary.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_bd144de5527140edbf3f44dbfee8db6b_proc_3470355/SPR_BENCH_MLM_loss_curves.png"
+                },
+                {
+                    "analysis": "The test Macro-F1 score is reported as approximately 0.7, which is at the benchmark's state-of-the-art level. This result demonstrates that the model performs competitively on the test dataset, despite the observed instability in validation performance. Further analysis is needed to ensure the model's robustness and consistency across different evaluation splits.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_bd144de5527140edbf3f44dbfee8db6b_proc_3470355/all_datasets_test_macro_f1_bar.png"
+                }
+            ],
+            "vlm_feedback_summary": "The training results indicate effective learning, but the validation performance shows instability and signs of overfitting. The test results meet the state-of-the-art benchmark, but further investigation is needed to address generalization issues observed during validation.",
+            "datasets_successfully_tested": [
+                "[\"test_dataset\"]"
+            ],
+            "ablation_name": null,
+            "hyperparam_name": null,
+            "is_seed_node": false,
+            "is_seed_agg_node": false,
+            "exec_time_feedback": "",
+            "ranking": 1
+        },
+        {
+            "code": "import os, math, pathlib, random, time, json\nfrom typing import List, Dict\n\nimport numpy as np\nimport torch\nfrom torch import nn\nfrom torch.utils.data import Dataset, DataLoader\nfrom sklearn.metrics import f1_score\n\n# ------------- bookkeeping -------------------------------------------------------------\nexperiment_data = {\"dropout\": {}}  # top-level key required by spec\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n\n# ------------- reproducibility helper -------------------------------------------------\ndef set_seed(seed: int = 42):\n    random.seed(seed)\n    np.random.seed(seed)\n    torch.manual_seed(seed)\n    torch.cuda.manual_seed_all(seed)\n    torch.backends.cudnn.deterministic = True\n    torch.backends.cudnn.benchmark = False\n\n\n# ------------- device -----------------------------------------------------------------\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n# ------------- data loading -----------------------------------------------------------\nfrom datasets import load_dataset, DatasetDict\n\n\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(split_csv: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / split_csv),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    dset = DatasetDict()\n    for split in [\"train\", \"dev\", \"test\"]:\n        dset_name = {\"train\": \"train.csv\", \"dev\": \"dev.csv\", \"test\": \"test.csv\"}[split]\n        dset[split] = _load(dset_name)\n    return dset\n\n\ndata_root = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\nspr = load_spr_bench(data_root)\nprint({k: len(v) for k, v in spr.items()})\n\n# ------------- tokenizer (whitespace) -------------------------------------------------\nPAD, UNK = \"<pad>\", \"<unk>\"\n\n\ndef build_vocab(seqs: List[str]) -> Dict[str, int]:\n    vocab = {PAD: 0, UNK: 1}\n    for s in seqs:\n        for tok in s.strip().split():\n            if tok not in vocab:\n                vocab[tok] = len(vocab)\n    return vocab\n\n\nvocab = build_vocab(spr[\"train\"][\"sequence\"])\nvocab_size = len(vocab)\nprint(f\"Vocab size: {vocab_size}\")\n\n\ndef encode(seq: str, max_len: int) -> List[int]:\n    ids = [vocab.get(tok, vocab[UNK]) for tok in seq.strip().split()][:max_len]\n    ids += [vocab[PAD]] * (max_len - len(ids))\n    return ids\n\n\nmax_len = min(max(len(s.split()) for s in spr[\"train\"][\"sequence\"]), 64)\nprint(f\"Sequence max_len: {max_len}\")\n\nlabel_set = sorted(list(set(spr[\"train\"][\"label\"])))\nlabel2id = {lab: i for i, lab in enumerate(label_set)}\nnum_labels = len(label2id)\nprint(f\"Number of labels: {num_labels}\")\n\n\nclass SPRDataset(Dataset):\n    def __init__(self, split):\n        self.seqs = split[\"sequence\"]\n        self.labels = [label2id[l] for l in split[\"label\"]]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        return {\n            \"input_ids\": torch.tensor(\n                encode(self.seqs[idx], max_len), dtype=torch.long\n            ),\n            \"labels\": torch.tensor(self.labels[idx], dtype=torch.long),\n        }\n\n\nbatch_size = 64\ntrain_loader = DataLoader(SPRDataset(spr[\"train\"]), batch_size=batch_size, shuffle=True)\nval_loader = DataLoader(SPRDataset(spr[\"dev\"]), batch_size=batch_size, shuffle=False)\ntest_loader = DataLoader(SPRDataset(spr[\"test\"]), batch_size=batch_size, shuffle=False)\n\n\n# ------------- model ------------------------------------------------------------------\nclass PositionalEncoding(nn.Module):\n    def __init__(self, d_model, max_len=5000):\n        super().__init__()\n        pe = torch.zeros(max_len, d_model)\n        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)\n        div_term = torch.exp(\n            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)\n        )\n        pe[:, 0::2] = torch.sin(position * div_term)\n        pe[:, 1::2] = torch.cos(position * div_term)\n        self.register_buffer(\"pe\", pe.unsqueeze(0))\n\n    def forward(self, x):\n        return x + self.pe[:, : x.size(1), :]\n\n\nclass CharTransformer(nn.Module):\n    def __init__(self, vocab_size, emb_dim, nhead, num_layers, num_labels, dropout=0.1):\n        super().__init__()\n        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=0)\n        self.pos_enc = PositionalEncoding(emb_dim, max_len)\n        encoder_layer = nn.TransformerEncoderLayer(\n            d_model=emb_dim, nhead=nhead, dropout=dropout, batch_first=True\n        )\n        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)\n        self.classifier = nn.Linear(emb_dim, num_labels)\n\n    def forward(self, input_ids):\n        mask = input_ids == 0\n        x = self.embedding(input_ids)\n        x = self.pos_enc(x)\n        x = self.encoder(x, src_key_padding_mask=mask)\n        x = x.masked_fill(mask.unsqueeze(-1), 0.0).mean(dim=1)\n        return self.classifier(x)\n\n\n# ------------- training / evaluation helpers ------------------------------------------\ndef run_epoch(model, loader, criterion, optimizer=None):\n    train_flag = optimizer is not None\n    model.train() if train_flag else model.eval()\n    total_loss, all_preds, all_trues = 0.0, [], []\n    for batch in loader:\n        batch = {k: v.to(device) for k, v in batch.items()}\n        if train_flag:\n            optimizer.zero_grad()\n        with torch.set_grad_enabled(train_flag):\n            logits = model(batch[\"input_ids\"])\n            loss = criterion(logits, batch[\"labels\"])\n            if train_flag:\n                loss.backward()\n                optimizer.step()\n        total_loss += loss.item() * batch[\"labels\"].size(0)\n        all_preds.extend(logits.argmax(dim=-1).cpu().numpy())\n        all_trues.extend(batch[\"labels\"].cpu().numpy())\n    avg_loss = total_loss / len(loader.dataset)\n    macro_f1 = f1_score(all_trues, all_preds, average=\"macro\")\n    return avg_loss, macro_f1, all_preds, all_trues\n\n\n# ------------- hyperparameter sweep ---------------------------------------------------\ndropout_vals = [0.0, 0.1, 0.2, 0.3]\nnum_epochs = 10\n\nfor p in dropout_vals:\n    key = f\"SPR_BENCH_p{p}\"\n    experiment_data[\"dropout\"][key] = {\n        \"metrics\": {\"train_macro_f1\": [], \"val_macro_f1\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n        \"epochs\": [],\n    }\n    set_seed(42)  # re-seed for fair comparison\n    model = CharTransformer(vocab_size, 128, 8, 2, num_labels, dropout=p).to(device)\n    criterion = nn.CrossEntropyLoss()\n    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n\n    print(f\"\\n=== Training with dropout={p} ===\")\n    for epoch in range(1, num_epochs + 1):\n        t0 = time.time()\n        tr_loss, tr_f1, _, _ = run_epoch(model, train_loader, criterion, optimizer)\n        val_loss, val_f1, _, _ = run_epoch(model, val_loader, criterion, None)\n\n        exp_rec = experiment_data[\"dropout\"][key]\n        exp_rec[\"losses\"][\"train\"].append(tr_loss)\n        exp_rec[\"losses\"][\"val\"].append(val_loss)\n        exp_rec[\"metrics\"][\"train_macro_f1\"].append(tr_f1)\n        exp_rec[\"metrics\"][\"val_macro_f1\"].append(val_f1)\n        exp_rec[\"epochs\"].append(epoch)\n\n        print(\n            f\"Epoch {epoch}: train_loss={tr_loss:.4f} val_loss={val_loss:.4f} \"\n            f\"train_F1={tr_f1:.4f} val_F1={val_f1:.4f} (time {time.time()-t0:.1f}s)\"\n        )\n\n    # final test evaluation ------------------------------------------------------------\n    test_loss, test_f1, test_preds, test_trues = run_epoch(\n        model, test_loader, criterion, None\n    )\n    exp_rec[\"test_loss\"] = test_loss\n    exp_rec[\"test_macro_f1\"] = test_f1\n    exp_rec[\"predictions\"] = test_preds\n    exp_rec[\"ground_truth\"] = test_trues\n    print(f\"Test (dropout={p}): loss={test_loss:.4f} macro_F1={test_f1:.4f}\")\n\n# ------------- save all results -------------------------------------------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"\\nAll results saved to\", os.path.join(working_dir, \"experiment_data.npy\"))\n",
+            "plan": "Hyperparam tuning name: dropout.\nWe will iterate over a list of dropout probabilities (0.0 / 0.1 / 0.2 / 0.3).  \nFor every value we (1) re-seed, build a fresh Transformer with that dropout, (2) train it for a fixed number of epochs while logging train/validation losses and macro-F1, (3) evaluate on the test set and store predictions.  \nAll results are collected in a single nested experiment_data dictionary under the top-level key \"dropout\", then saved to experiment_data.npy.",
+            "overall_plan": "",
+            "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# working directory for outputs\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ------------------------------------------------------------------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = None\n\nif experiment_data is not None:\n    dropout_dict = experiment_data.get(\"dropout\", {})\n    # Collect final metrics for console printout\n    summary = {}\n\n    # -------- Figure 1 : Macro-F1 curves ---------------------------------\n    try:\n        fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True)\n        fig.suptitle(\n            \"SPR_BENCH Macro-F1 over Epochs\\nLeft: Train  Right: Validation\",\n            fontsize=14,\n        )\n        for key, rec in dropout_dict.items():\n            epochs = rec[\"epochs\"]\n            axes[0].plot(epochs, rec[\"metrics\"][\"train_macro_f1\"], label=key)\n            axes[1].plot(epochs, rec[\"metrics\"][\"val_macro_f1\"], label=key)\n        for ax, ttl in zip(axes, [\"Train Macro-F1\", \"Validation Macro-F1\"]):\n            ax.set_title(ttl)\n            ax.set_xlabel(\"Epoch\")\n            ax.set_ylabel(\"Macro-F1\")\n            ax.legend()\n        fname = os.path.join(working_dir, \"SPR_BENCH_macro_f1_curves.png\")\n        plt.savefig(fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating Macro-F1 plot: {e}\")\n        plt.close()\n\n    # -------- Figure 2 : Loss curves -------------------------------------\n    try:\n        fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True)\n        fig.suptitle(\n            \"SPR_BENCH Cross-Entropy Loss over Epochs\\nLeft: Train  Right: Validation\",\n            fontsize=14,\n        )\n        for key, rec in dropout_dict.items():\n            epochs = rec[\"epochs\"]\n            axes[0].plot(epochs, rec[\"losses\"][\"train\"], label=key)\n            axes[1].plot(epochs, rec[\"losses\"][\"val\"], label=key)\n        for ax, ttl in zip(axes, [\"Train Loss\", \"Validation Loss\"]):\n            ax.set_title(ttl)\n            ax.set_xlabel(\"Epoch\")\n            ax.set_ylabel(\"Loss\")\n            ax.legend()\n        fname = os.path.join(working_dir, \"SPR_BENCH_loss_curves.png\")\n        plt.savefig(fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating Loss plot: {e}\")\n        plt.close()\n\n    # -------- Figure 3 : Final Test Macro-F1 bar chart --------------------\n    try:\n        keys = []\n        test_f1s = []\n        for key, rec in dropout_dict.items():\n            keys.append(key)\n            test_f1s.append(rec.get(\"test_macro_f1\", 0.0))\n            summary[key] = rec.get(\"test_macro_f1\", 0.0)\n        fig = plt.figure(figsize=(8, 5))\n        plt.bar(keys, test_f1s, color=\"skyblue\")\n        plt.title(\"SPR_BENCH Test Macro-F1 by Dropout Rate\")\n        plt.ylabel(\"Macro-F1\")\n        plt.xticks(rotation=45)\n        plt.tight_layout()\n        fname = os.path.join(working_dir, \"SPR_BENCH_test_macro_f1_bar.png\")\n        plt.savefig(fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating Test Macro-F1 bar plot: {e}\")\n        plt.close()\n\n    # -------- Console summary --------------------------------------------\n    print(\"\\nFinal Test Macro-F1 Scores:\")\n    for k, v in summary.items():\n        print(f\"{k:20s} : {v:.4f}\")\n",
+            "plot_plan": "We load the serialized experiment_data dictionary, extract per-epoch losses and macro-F1 scores for every dropout configuration, and assemble three concise visual summaries. Figure 1 has two subplots placed side-by-side: the left panel shows train-macro-F1 curves and the right panel shows validation-macro-F1 curves for all dropout rates, with a clear subtitle explaining the panels. Figure 2 repeats the same structure for cross-entropy losses. Figure 3 is a simple bar chart comparing the final test macro-F1 achieved by each dropout value, making model selection straightforward. Every figure is wrapped in its own try/except block, saved with descriptive names inside working_dir, and closed to manage resources. No synthetic data are generated—only what exists in experiment_data.npy is plotted—and we limit ourselves to three figures, well under the five-figure cap. After plotting, the script prints a small table of the test macro-F1 scores so the key metric is visible in the console. The code follows all specified guidelines, uses plain matplotlib, and should run in any environment that has the saved experiment data available.",
+            "step": 0,
+            "id": "00ce423fb4a041eeb173944638254940",
+            "ctime": 1755492707.7205458,
+            "parse_metrics_plan": "Below is the plan: we load the saved NumPy dictionary from the working directory, iterate over every experimental run (each different dropout setting), pick the best (max F1 / min loss) or the final test numbers as requested, and print them with fully-qualified metric names so there’s no ambiguity. Everything is executed immediately; nothing is hidden behind an `if __name__ == \"__main__\":` guard.",
+            "parse_metrics_code": "import os\nimport numpy as np\n\n# ------------------------------------------------------------------\n# 1. Locate and load the experiment file\n# ------------------------------------------------------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nfile_path = os.path.join(working_dir, \"experiment_data.npy\")\n\nexperiment_data = np.load(file_path, allow_pickle=True).item()\n\n\n# ------------------------------------------------------------------\n# 2. Helper to obtain best (or final) metric values\n# ------------------------------------------------------------------\ndef summarize_experiment(exp_dict):\n    \"\"\"Return a dictionary with the best/final metrics of interest.\"\"\"\n    train_f1s = exp_dict[\"metrics\"][\"train_macro_f1\"]\n    val_f1s = exp_dict[\"metrics\"][\"val_macro_f1\"]\n    train_ls = exp_dict[\"losses\"][\"train\"]\n    val_ls = exp_dict[\"losses\"][\"val\"]\n\n    summary = {\n        \"best train macro F1 score\": max(train_f1s),\n        \"best validation macro F1 score\": max(val_f1s),\n        \"lowest train loss\": min(train_ls),\n        \"lowest validation loss\": min(val_ls),\n        \"test loss\": exp_dict[\"test_loss\"],\n        \"test macro F1 score\": exp_dict[\"test_macro_f1\"],\n    }\n    return summary\n\n\n# ------------------------------------------------------------------\n# 3. Iterate over every dataset/experiment and print metrics\n# ------------------------------------------------------------------\nfor dataset_name, exp_dict in experiment_data.get(\"dropout\", {}).items():\n    print(f\"\\nDataset: {dataset_name}\")\n    metrics_summary = summarize_experiment(exp_dict)\n    for metric_name, value in metrics_summary.items():\n        print(f\"{metric_name}: {value:.4f}\")\n",
+            "parse_exc_type": null,
+            "parse_exc_info": null,
+            "parse_exc_stack": null,
+            "exec_time": 35.526329040527344,
+            "exc_type": null,
+            "exc_info": null,
+            "exc_stack": null,
+            "analysis": "The execution output shows that the training script ran successfully without any errors or bugs. The training process was conducted with various dropout rates, and the results were saved to a file. The model achieved a macro F1 score close to 0.7 across different dropout configurations, indicating consistent performance. No issues were detected in the code or its execution.",
+            "exp_results_dir": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_00ce423fb4a041eeb173944638254940_proc_3462735",
+            "metric": {
+                "value": {
+                    "metric_names": [
+                        {
+                            "metric_name": "train macro F1 score",
+                            "lower_is_better": false,
+                            "description": "Macro F1 score for the training dataset.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.0",
+                                    "final_value": 0.9485,
+                                    "best_value": 0.9485
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.1",
+                                    "final_value": 0.9485,
+                                    "best_value": 0.9485
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.2",
+                                    "final_value": 0.9485,
+                                    "best_value": 0.9485
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.3",
+                                    "final_value": 0.9485,
+                                    "best_value": 0.9485
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "validation macro F1 score",
+                            "lower_is_better": false,
+                            "description": "Macro F1 score for the validation dataset.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.0",
+                                    "final_value": 0.712,
+                                    "best_value": 0.712
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.1",
+                                    "final_value": 0.7,
+                                    "best_value": 0.7
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.2",
+                                    "final_value": 0.7,
+                                    "best_value": 0.7
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.3",
+                                    "final_value": 0.704,
+                                    "best_value": 0.704
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "train loss",
+                            "lower_is_better": true,
+                            "description": "Loss for the training dataset.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.0",
+                                    "final_value": 0.0056,
+                                    "best_value": 0.0056
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.1",
+                                    "final_value": 0.0075,
+                                    "best_value": 0.0075
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.2",
+                                    "final_value": 0.0074,
+                                    "best_value": 0.0074
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.3",
+                                    "final_value": 0.0059,
+                                    "best_value": 0.0059
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "validation loss",
+                            "lower_is_better": true,
+                            "description": "Loss for the validation dataset.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.0",
+                                    "final_value": 0.7396,
+                                    "best_value": 0.7396
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.1",
+                                    "final_value": 0.6879,
+                                    "best_value": 0.6879
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.2",
+                                    "final_value": 0.6582,
+                                    "best_value": 0.6582
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.3",
+                                    "final_value": 0.64,
+                                    "best_value": 0.64
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "test loss",
+                            "lower_is_better": true,
+                            "description": "Loss for the test dataset.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.0",
+                                    "final_value": 2.2716,
+                                    "best_value": 2.2716
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.1",
+                                    "final_value": 2.435,
+                                    "best_value": 2.435
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.2",
+                                    "final_value": 2.5059,
+                                    "best_value": 2.5059
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.3",
+                                    "final_value": 2.7346,
+                                    "best_value": 2.7346
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "test macro F1 score",
+                            "lower_is_better": false,
+                            "description": "Macro F1 score for the test dataset.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.0",
+                                    "final_value": 0.696,
+                                    "best_value": 0.696
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.1",
+                                    "final_value": 0.696,
+                                    "best_value": 0.696
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.2",
+                                    "final_value": 0.696,
+                                    "best_value": 0.696
+                                },
+                                {
+                                    "dataset_name": "SPR_BENCH_p0.3",
+                                    "final_value": 0.696,
+                                    "best_value": 0.696
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "maximize": null,
+                "name": null,
+                "description": null
+            },
+            "is_buggy": false,
+            "is_buggy_plots": false,
+            "parent_id": null,
+            "children": [],
+            "plot_data": {},
+            "plots_generated": false,
+            "plots": [
+                "../../logs/0-run/experiment_results/experiment_00ce423fb4a041eeb173944638254940_proc_3462735/SPR_BENCH_macro_f1_curves.png",
+                "../../logs/0-run/experiment_results/experiment_00ce423fb4a041eeb173944638254940_proc_3462735/SPR_BENCH_loss_curves.png",
+                "../../logs/0-run/experiment_results/experiment_00ce423fb4a041eeb173944638254940_proc_3462735/SPR_BENCH_test_macro_f1_bar.png"
+            ],
+            "plot_paths": [
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_00ce423fb4a041eeb173944638254940_proc_3462735/SPR_BENCH_macro_f1_curves.png",
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_00ce423fb4a041eeb173944638254940_proc_3462735/SPR_BENCH_loss_curves.png",
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_00ce423fb4a041eeb173944638254940_proc_3462735/SPR_BENCH_test_macro_f1_bar.png"
+            ],
+            "plot_analyses": [
+                {
+                    "analysis": "The training Macro-F1 scores for all dropout rates (p=0.0, 0.1, 0.2, 0.3) converge to near-perfect values (close to 1.0) by epoch 4. This indicates that the model is capable of fitting the training data very well regardless of the dropout rate. On the validation side, the Macro-F1 scores show more variance across dropout rates, with slight differences in performance. The scores plateau after epoch 4, suggesting that the model's generalization stabilizes after this point.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_00ce423fb4a041eeb173944638254940_proc_3462735/SPR_BENCH_macro_f1_curves.png"
+                },
+                {
+                    "analysis": "For training loss, all configurations exhibit rapid convergence, with losses decreasing sharply within the first 4 epochs and reaching near-zero values by epoch 6. This is consistent with the high training Macro-F1 scores observed. On the validation side, however, the loss curves show an upward trend after epoch 4, especially for higher dropout rates (p=0.2 and p=0.3). This suggests potential overfitting or instability in the model's generalization as training progresses.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_00ce423fb4a041eeb173944638254940_proc_3462735/SPR_BENCH_loss_curves.png"
+                },
+                {
+                    "analysis": "The test Macro-F1 scores for all dropout rates are very close to each other, hovering around 0.7. This indicates that dropout rate does not have a significant impact on the final test performance, implying that the model's generalization capability is relatively robust to changes in this hyperparameter.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_00ce423fb4a041eeb173944638254940_proc_3462735/SPR_BENCH_test_macro_f1_bar.png"
+                }
+            ],
+            "vlm_feedback_summary": "The provided plots indicate that the model fits the training data well, as evidenced by the high training Macro-F1 scores and low training losses across all dropout rates. However, the validation loss trends suggest potential overfitting or instability, especially for higher dropout rates. The test Macro-F1 scores remain consistent across dropout rates, indicating robustness in generalization to this hyperparameter. Overall, the results highlight the need to address the generalization gap observed in the validation loss trends.",
+            "datasets_successfully_tested": [
+                "[\"SPR_BENCH\"]"
+            ],
+            "ablation_name": null,
+            "hyperparam_name": "dropout",
+            "is_seed_node": false,
+            "is_seed_agg_node": false,
+            "exec_time_feedback": "",
+            "ranking": 2
+        },
+        {
+            "code": "import os, math, random, time, json, pathlib\nfrom collections import Counter\nfrom typing import List, Dict\n\nimport numpy as np\nimport torch\nfrom torch import nn\nfrom torch.utils.data import Dataset, DataLoader\nfrom sklearn.metrics import f1_score\nfrom datasets import load_dataset, DatasetDict\n\n# -------------------------------------------------------------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\nexperiment_data = {\n    \"SPR_BENCH_symbolic\": {\n        \"metrics\": {\"train_macro_f1\": [], \"val_macro_f1\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n        \"epochs\": [],\n    }\n}\n\n# -------------------------------------------------------------------------\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ---------------- reproducibility ----------------------------------------\ndef set_seed(seed: int = 42):\n    random.seed(seed)\n    np.random.seed(seed)\n    torch.manual_seed(seed)\n    torch.cuda.manual_seed_all(seed)\n    torch.backends.cudnn.deterministic = True\n    torch.backends.cudnn.benchmark = False\n\n\nset_seed(42)\n\n\n# ---------------- data loading -------------------------------------------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(file_name: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / file_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    dset = DatasetDict()\n    dset[\"train\"] = _load(\"train.csv\")\n    dset[\"dev\"] = _load(\"dev.csv\")\n    dset[\"test\"] = _load(\"test.csv\")\n    return dset\n\n\nDATA_PATH = pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\nspr = load_spr_bench(DATA_PATH)\nprint({k: len(v) for k, v in spr.items()})\n\n# ---------------- vocabulary & helper ------------------------------------\nPAD, UNK = \"<pad>\", \"<unk>\"\n\n\ndef build_vocab(seqs: List[str]) -> Dict[str, int]:\n    vocab = {PAD: 0, UNK: 1}\n    for s in seqs:\n        for tok in s.strip().split():\n            if tok not in vocab:\n                vocab[tok] = len(vocab)\n    return vocab\n\n\nvocab = build_vocab(spr[\"train\"][\"sequence\"])\nvocab_size = len(vocab)\nprint(\"vocab_size:\", vocab_size)\n\n# determine max_len for padding\nmax_len = min(64, max(len(s.split()) for s in spr[\"train\"][\"sequence\"]))\nprint(\"max_len:\", max_len)\n\n# label mapping\nlabels = sorted(set(spr[\"train\"][\"label\"]))\nlabel2id = {l: i for i, l in enumerate(labels)}\nnum_labels = len(label2id)\nprint(\"num_labels:\", num_labels)\n\n# ---------------- symbolic feature design ---------------------------------\n# pick top-K tokens to track presence/count explicitly\nTOP_K = 20\ntok_counter = Counter()\nfor seq in spr[\"train\"][\"sequence\"]:\n    tok_counter.update(seq.strip().split())\ntop_k_tokens = [tok for tok, _ in tok_counter.most_common(TOP_K)]\ntok2kidx = {tok: i for i, tok in enumerate(top_k_tokens)}\n\n\ndef compute_symbolic_features(tokens: List[str]) -> np.ndarray:\n    seq_len = len(tokens)\n    uniq_cnt = len(set(tokens))\n    features = np.zeros(4 + TOP_K, dtype=np.float32)\n    # scalar features\n    features[0] = seq_len / max_len  # normalized length\n    features[1] = uniq_cnt / max_len  # normalized unique count\n    tok_ids = [vocab.get(t, 1) for t in tokens]\n    features[2] = np.mean(tok_ids) / vocab_size  # normalized mean id\n    features[3] = (np.std(tok_ids) if seq_len > 0 else 0) / vocab_size\n    # top-K token presence/count (normalized by length)\n    for t in tokens:\n        if t in tok2kidx:\n            features[4 + tok2kidx[t]] += 1.0\n    if seq_len > 0:\n        features[4:] /= seq_len\n    return features\n\n\nSYM_DIM = 64\nNUM_SYM_FEATS = 4 + TOP_K\n\n\ndef encode_tokens(tokens: List[str]) -> List[int]:\n    ids = [vocab.get(tok, vocab[UNK]) for tok in tokens][:max_len]\n    ids += [vocab[PAD]] * (max_len - len(ids))\n    return ids\n\n\n# ---------------- dataset -------------------------------------------------\nclass SPRDataset(Dataset):\n    def __init__(self, split):\n        self.seqs = split[\"sequence\"]\n        self.labels = [label2id[l] for l in split[\"label\"]]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        tokens = self.seqs[idx].strip().split()\n        return {\n            \"input_ids\": torch.tensor(encode_tokens(tokens), dtype=torch.long),\n            \"sym_feats\": torch.tensor(\n                compute_symbolic_features(tokens), dtype=torch.float32\n            ),\n            \"labels\": torch.tensor(self.labels[idx], dtype=torch.long),\n        }\n\n\nbatch_size = 128\ntrain_loader = DataLoader(SPRDataset(spr[\"train\"]), batch_size=batch_size, shuffle=True)\nval_loader = DataLoader(SPRDataset(spr[\"dev\"]), batch_size=batch_size, shuffle=False)\ntest_loader = DataLoader(SPRDataset(spr[\"test\"]), batch_size=batch_size, shuffle=False)\n\n\n# ---------------- model ---------------------------------------------------\nclass PositionalEncoding(nn.Module):\n    def __init__(self, d_model, max_len=5000):\n        super().__init__()\n        pe = torch.zeros(max_len, d_model)\n        pos = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)\n        div = torch.exp(\n            torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)\n        )\n        pe[:, 0::2] = torch.sin(pos * div)\n        pe[:, 1::2] = torch.cos(pos * div)\n        self.register_buffer(\"pe\", pe.unsqueeze(0))\n\n    def forward(self, x):\n        return x + self.pe[:, : x.size(1), :]\n\n\nclass SymbolicTransformer(nn.Module):\n    def __init__(\n        self,\n        vocab_size,\n        emb_dim,\n        nhead,\n        nlayer,\n        num_labels,\n        num_sym_feats,\n        sym_dim,\n        dropout=0.1,\n    ):\n        super().__init__()\n        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=0)\n        self.pos = PositionalEncoding(emb_dim, max_len)\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=emb_dim, nhead=nhead, dropout=dropout, batch_first=True\n        )\n        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=nlayer)\n        self.sym_mlp = nn.Sequential(\n            nn.Linear(num_sym_feats, sym_dim), nn.ReLU(), nn.Dropout(dropout)\n        )\n        self.classifier = nn.Linear(emb_dim + sym_dim, num_labels)\n\n    def forward(self, input_ids, sym_feats):\n        mask = input_ids == 0\n        x = self.embedding(input_ids)\n        x = self.pos(x)\n        x = self.encoder(x, src_key_padding_mask=mask)\n        x = x.masked_fill(mask.unsqueeze(-1), 0.0).mean(dim=1)  # mean pooling\n        s = self.sym_mlp(sym_feats)\n        fused = torch.cat([x, s], dim=-1)\n        return self.classifier(fused)\n\n\n# ---------------- helpers -------------------------------------------------\ndef run_epoch(model, loader, criterion, optimizer=None):\n    train_flag = optimizer is not None\n    model.train() if train_flag else model.eval()\n    total_loss, all_preds, all_trues = 0.0, [], []\n    for batch in loader:\n        batch = {\n            k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)\n        }\n        optimizer.zero_grad() if train_flag else None\n        with torch.set_grad_enabled(train_flag):\n            logits = model(batch[\"input_ids\"], batch[\"sym_feats\"])\n            loss = criterion(logits, batch[\"labels\"])\n            if train_flag:\n                loss.backward()\n                optimizer.step()\n        total_loss += loss.item() * batch[\"labels\"].size(0)\n        all_preds.extend(logits.argmax(dim=-1).cpu().numpy())\n        all_trues.extend(batch[\"labels\"].cpu().numpy())\n    avg_loss = total_loss / len(loader.dataset)\n    macro_f1 = f1_score(all_trues, all_preds, average=\"macro\")\n    return avg_loss, macro_f1, all_preds, all_trues\n\n\n# ---------------- training ------------------------------------------------\ndropout = 0.1\nmodel = SymbolicTransformer(\n    vocab_size, 128, 8, 2, num_labels, NUM_SYM_FEATS, SYM_DIM, dropout=dropout\n).to(device)\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n\nnum_epochs = 12\nfor epoch in range(1, num_epochs + 1):\n    t0 = time.time()\n    tr_loss, tr_f1, _, _ = run_epoch(model, train_loader, criterion, optimizer)\n    val_loss, val_f1, _, _ = run_epoch(model, val_loader, criterion)\n    rec = experiment_data[\"SPR_BENCH_symbolic\"]\n    rec[\"losses\"][\"train\"].append(tr_loss)\n    rec[\"losses\"][\"val\"].append(val_loss)\n    rec[\"metrics\"][\"train_macro_f1\"].append(tr_f1)\n    rec[\"metrics\"][\"val_macro_f1\"].append(val_f1)\n    rec[\"epochs\"].append(epoch)\n    print(\n        f\"Epoch {epoch}: validation_loss = {val_loss:.4f}, val_macro_f1 = {val_f1:.4f}  \"\n        f\"(train_loss={tr_loss:.4f}, time {time.time()-t0:.1f}s)\"\n    )\n\n# ---------------- final evaluation ---------------------------------------\ntest_loss, test_f1, test_preds, test_trues = run_epoch(model, test_loader, criterion)\nprint(f\"\\nTest: loss={test_loss:.4f} macro_f1={test_f1:.4f}\")\nrec[\"test_loss\"] = test_loss\nrec[\"test_macro_f1\"] = test_f1\nrec[\"predictions\"] = test_preds\nrec[\"ground_truth\"] = test_trues\n\n# ---------------- save ----------------------------------------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"Experiment data saved to\", os.path.join(working_dir, \"experiment_data.npy\"))\n",
+            "plan": "We extend the baseline by fusing lightweight symbolic features—capturing sequence length, token-diversity and presence-counts of the 20 most frequent symbols—into the Transformer.  \nA small MLP turns these hand-crafted “symbolic” statistics into a 64-d reasoning vector which is concatenated with the pooled Transformer embedding before classification.  \nThis neuro-symbolic fusion keeps training cost low while giving the model explicit access to global rule-related cues that self-attention must otherwise infer implicitly.  \nWe train the model once with moderate dropout (0.1) and record loss and macro-F1 on train/validation/test sets at every epoch, saving everything in experiment_data.npy.  \nAll tensors and the model are consistently moved to GPU when available, and the script is fully self-contained under 30 minutes runtime.  \nThe structure leaves room for future ablations (e.g., remove features or vary top-K size) while immediately demonstrating how symbolic cues can boost conceptual generalization.",
+            "overall_plan": "",
+            "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# working directory for outputs\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ------------------------------------------------------------------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\nfor dname, rec in experiment_data.items():\n    epochs = rec.get(\"epochs\", [])\n    # -------- Figure 1 : Macro-F1 curves ---------------------------------\n    try:\n        fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True)\n        fig.suptitle(\n            f\"{dname} Macro-F1 over Epochs\\nLeft: Train  Right: Validation\", fontsize=14\n        )\n        axes[0].plot(epochs, rec[\"metrics\"][\"train_macro_f1\"], label=\"train\")\n        axes[1].plot(epochs, rec[\"metrics\"][\"val_macro_f1\"], label=\"val\")\n        for ax, ttl in zip(axes, [\"Train Macro-F1\", \"Validation Macro-F1\"]):\n            ax.set_title(ttl)\n            ax.set_xlabel(\"Epoch\")\n            ax.set_ylabel(\"Macro-F1\")\n            ax.legend()\n        fname = os.path.join(working_dir, f\"{dname}_macro_f1_curves.png\")\n        plt.savefig(fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating Macro-F1 plot ({dname}): {e}\")\n        plt.close()\n\n    # -------- Figure 2 : Loss curves -------------------------------------\n    try:\n        fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True)\n        fig.suptitle(\n            f\"{dname} Cross-Entropy Loss over Epochs\\nLeft: Train  Right: Validation\",\n            fontsize=14,\n        )\n        axes[0].plot(epochs, rec[\"losses\"][\"train\"], label=\"train\")\n        axes[1].plot(epochs, rec[\"losses\"][\"val\"], label=\"val\")\n        for ax, ttl in zip(axes, [\"Train Loss\", \"Validation Loss\"]):\n            ax.set_title(ttl)\n            ax.set_xlabel(\"Epoch\")\n            ax.set_ylabel(\"Loss\")\n            ax.legend()\n        fname = os.path.join(working_dir, f\"{dname}_loss_curves.png\")\n        plt.savefig(fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating Loss plot ({dname}): {e}\")\n        plt.close()\n\n    # -------- Figure 3 : Confusion matrix --------------------------------\n    try:\n        preds = np.asarray(rec.get(\"predictions\", []))\n        trues = np.asarray(rec.get(\"ground_truth\", []))\n        if preds.size and trues.size and preds.size == trues.size:\n            num_classes = int(max(trues.max(), preds.max()) + 1)\n            cm = np.zeros((num_classes, num_classes), dtype=int)\n            for p, t in zip(preds, trues):\n                cm[t, p] += 1\n            plt.figure(figsize=(6, 5))\n            plt.imshow(cm, cmap=\"Blues\")\n            plt.colorbar()\n            plt.title(f\"{dname} Test Confusion Matrix\")\n            plt.xlabel(\"Predicted label\")\n            plt.ylabel(\"True label\")\n            ticks = np.arange(num_classes)\n            plt.xticks(ticks)\n            plt.yticks(ticks)\n            fname = os.path.join(working_dir, f\"{dname}_confusion_matrix.png\")\n            plt.savefig(fname, bbox_inches=\"tight\")\n            plt.close()\n    except Exception as e:\n        print(f\"Error creating Confusion Matrix ({dname}): {e}\")\n        plt.close()\n\n    # -------- Console summary --------------------------------------------\n    test_f1 = rec.get(\"test_macro_f1\")\n    test_loss = rec.get(\"test_loss\")\n    if test_f1 is not None:\n        print(f\"{dname}  Test Macro-F1: {test_f1:.4f}  Test Loss: {test_loss:.4f}\")\n",
+            "plot_plan": "The plotting script will 1) load experiment_data.npy and detect datasets present; 2) for each dataset iterate through stored epochs, metrics, and predictions; 3) draw separate figures for (a) Macro-F1 curves, (b) Loss curves, and (c) a test-set confusion matrix, each wrapped in a dedicated try-except block; 4) save figures into the working directory with descriptive names that include the dataset identifier; 5) always close figures to free memory; 6) print final test metrics to console. All plots rely strictly on values stored in the numpy file, limiting epochs to what is recorded and ensuring no fabricated data. The confusion matrix is built directly with NumPy so no extra libraries are needed, and axes are labelled with integer class IDs. The script follows the mandated import order, creates working_dir if missing, and gracefully handles missing keys or empty arrays. Finally, concise code keeps runtime minimal while satisfying visualization requirements.",
+            "step": 1,
+            "id": "30ec2c3f43ee4ba58c04682268fd0ac5",
+            "ctime": 1755493351.0496857,
+            "parse_metrics_plan": "The script will load the saved NumPy dictionary from the working directory, loop over every stored experiment, and compute the final or best values for each tracked metric. Specifically, it will take the last element of the training series (final values) and the extreme (best) value for the validation series: lowest validation loss and highest validation macro-F1. Test metrics are stored as single values and are printed directly. All outputs are clearly labeled so their meaning is unambiguous, and the code is executed immediately on import without relying on a special entry point.",
+            "parse_metrics_code": "import os\nimport numpy as np\n\n# ---------------------------------------------------------------------\n# Locate and load the experiment data\n# ---------------------------------------------------------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nfile_path = os.path.join(working_dir, \"experiment_data.npy\")\nexperiment_data = np.load(file_path, allow_pickle=True).item()\n\n# ---------------------------------------------------------------------\n# Helper to format and print metrics for each dataset\n# ---------------------------------------------------------------------\nfor dataset_name, rec in experiment_data.items():\n    print(f\"\\nDataset: {dataset_name}\")\n\n    # ---------- training metrics ----------\n    train_losses = rec.get(\"losses\", {}).get(\"train\", [])\n    if train_losses:\n        print(f\"Final training loss: {train_losses[-1]:.4f}\")\n\n    train_macro_f1 = rec.get(\"metrics\", {}).get(\"train_macro_f1\", [])\n    if train_macro_f1:\n        print(f\"Final training macro F1 score: {train_macro_f1[-1]:.4f}\")\n\n    # ---------- validation metrics ----------\n    val_losses = rec.get(\"losses\", {}).get(\"val\", [])\n    if val_losses:\n        best_val_loss = min(val_losses)\n        print(f\"Best validation loss: {best_val_loss:.4f}\")\n\n    val_macro_f1 = rec.get(\"metrics\", {}).get(\"val_macro_f1\", [])\n    if val_macro_f1:\n        best_val_macro_f1 = max(val_macro_f1)\n        print(f\"Best validation macro F1 score: {best_val_macro_f1:.4f}\")\n\n    # ---------- test metrics ----------\n    if \"test_loss\" in rec:\n        print(f\"Test loss: {rec['test_loss']:.4f}\")\n    if \"test_macro_f1\" in rec:\n        print(f\"Test macro F1 score: {rec['test_macro_f1']:.4f}\")\n",
+            "parse_exc_type": null,
+            "parse_exc_info": null,
+            "parse_exc_stack": null,
+            "exec_time": 13.094576835632324,
+            "exc_type": null,
+            "exc_info": null,
+            "exc_stack": null,
+            "analysis": "",
+            "exp_results_dir": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_30ec2c3f43ee4ba58c04682268fd0ac5_proc_3470353",
+            "metric": {
+                "value": {
+                    "metric_names": [
+                        {
+                            "metric_name": "training loss",
+                            "lower_is_better": true,
+                            "description": "Measures the model's error on the training dataset.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_symbolic",
+                                    "final_value": 0.025,
+                                    "best_value": 0.025
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "training macro F1 score",
+                            "lower_is_better": false,
+                            "description": "Evaluates the F1 score across all classes for the training dataset.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_symbolic",
+                                    "final_value": 0.943,
+                                    "best_value": 0.943
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "validation loss",
+                            "lower_is_better": true,
+                            "description": "Measures the model's error on the validation dataset.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_symbolic",
+                                    "final_value": 0.6846,
+                                    "best_value": 0.6846
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "validation macro F1 score",
+                            "lower_is_better": false,
+                            "description": "Evaluates the F1 score across all classes for the validation dataset.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_symbolic",
+                                    "final_value": 0.682,
+                                    "best_value": 0.682
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "test loss",
+                            "lower_is_better": true,
+                            "description": "Measures the model's error on the test dataset.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_symbolic",
+                                    "final_value": 2.0689,
+                                    "best_value": 2.0689
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "test macro F1 score",
+                            "lower_is_better": false,
+                            "description": "Evaluates the F1 score across all classes for the test dataset.",
+                            "data": [
+                                {
+                                    "dataset_name": "SPR_BENCH_symbolic",
+                                    "final_value": 0.694,
+                                    "best_value": 0.694
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "maximize": null,
+                "name": null,
+                "description": null
+            },
+            "is_buggy": false,
+            "is_buggy_plots": false,
+            "parent_id": null,
+            "children": [],
+            "plot_data": {},
+            "plots_generated": false,
+            "plots": [
+                "../../logs/0-run/experiment_results/experiment_30ec2c3f43ee4ba58c04682268fd0ac5_proc_3470353/SPR_BENCH_symbolic_macro_f1_curves.png",
+                "../../logs/0-run/experiment_results/experiment_30ec2c3f43ee4ba58c04682268fd0ac5_proc_3470353/SPR_BENCH_symbolic_loss_curves.png",
+                "../../logs/0-run/experiment_results/experiment_30ec2c3f43ee4ba58c04682268fd0ac5_proc_3470353/SPR_BENCH_symbolic_confusion_matrix.png"
+            ],
+            "plot_paths": [
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_30ec2c3f43ee4ba58c04682268fd0ac5_proc_3470353/SPR_BENCH_symbolic_macro_f1_curves.png",
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_30ec2c3f43ee4ba58c04682268fd0ac5_proc_3470353/SPR_BENCH_symbolic_loss_curves.png",
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_30ec2c3f43ee4ba58c04682268fd0ac5_proc_3470353/SPR_BENCH_symbolic_confusion_matrix.png"
+            ],
+            "plot_analyses": [
+                {
+                    "analysis": "The left plot shows the training Macro-F1 scores increasing rapidly and stabilizing close to 1.0 by epoch 4, indicating that the model is learning effectively on the training dataset. The right plot shows validation Macro-F1 scores increasing but stabilizing around 0.7, which suggests that while the model generalizes reasonably well, there is a gap between training and validation performance. This could indicate potential overfitting or a limitation in the model's ability to generalize to unseen data.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_30ec2c3f43ee4ba58c04682268fd0ac5_proc_3470353/SPR_BENCH_symbolic_macro_f1_curves.png"
+                },
+                {
+                    "analysis": "The left plot shows the training loss decreasing steadily and approaching near-zero values by epoch 4, which aligns with the high training Macro-F1 scores observed earlier. The right plot, however, shows validation loss initially decreasing but then increasing after epoch 4, suggesting overfitting. The divergence between training and validation losses post-epoch 4 highlights a potential issue with model generalization.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_30ec2c3f43ee4ba58c04682268fd0ac5_proc_3470353/SPR_BENCH_symbolic_loss_curves.png"
+                },
+                {
+                    "analysis": "The confusion matrix indicates that the model performs well in correctly predicting both classes, as evidenced by the high counts along the diagonal. However, there are still some misclassifications, as seen in the off-diagonal elements. This suggests room for improvement in the model's precision and recall for both classes. The imbalance in misclassifications, if any, could point to a bias in the model's predictions.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_30ec2c3f43ee4ba58c04682268fd0ac5_proc_3470353/SPR_BENCH_symbolic_confusion_matrix.png"
+                }
+            ],
+            "vlm_feedback_summary": "The plots indicate effective learning during training but highlight generalization issues. Overfitting is evident from the divergence between training and validation performance metrics. The confusion matrix shows reasonable classification performance but suggests areas for improvement in precision and recall for both classes.",
+            "datasets_successfully_tested": [
+                "[]"
+            ],
+            "ablation_name": null,
+            "hyperparam_name": null,
+            "is_seed_node": false,
+            "is_seed_agg_node": false,
+            "exec_time_feedback": "",
+            "ranking": 3
+        },
+        {
+            "code": "import os, math, pathlib, random, time, json\nfrom collections import Counter\nfrom typing import List, Dict\n\nimport numpy as np\nimport torch\nfrom torch import nn\nfrom torch.utils.data import Dataset, DataLoader\nfrom sklearn.metrics import f1_score\n\n# ------------------- working dir & bookkeeping ----------------------------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\nexperiment_data = {\n    \"baseline\": {\n        \"metrics\": {\"train\": [], \"val\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n        \"epochs\": [],\n    },\n    \"neuro_symbolic\": {\n        \"metrics\": {\"train\": [], \"val\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n        \"epochs\": [],\n    },\n}\n\n\n# ------------------- reproducibility --------------------------------------------------\ndef set_seed(seed: int = 42):\n    random.seed(seed)\n    np.random.seed(seed)\n    torch.manual_seed(seed)\n    torch.cuda.manual_seed_all(seed)\n    torch.backends.cudnn.deterministic = True\n    torch.backends.cudnn.benchmark = False\n\n\nset_seed(42)\n\n# ------------------- device -----------------------------------------------------------\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n# ------------------- data loading -----------------------------------------------------\nfrom datasets import load_dataset, DatasetDict\n\n\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(split_csv: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / split_csv),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for sp, fname in [(\"train\", \"train.csv\"), (\"dev\", \"dev.csv\"), (\"test\", \"test.csv\")]:\n        d[sp] = _load(fname)\n    return d\n\n\n# try to locate dataset automatically\ncandidates = [\n    os.getenv(\"SPR_PATH\"),\n    \"SPR_BENCH\",\n    \"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\",\n]\ndata_root = None\nfor cand in candidates:\n    if cand and pathlib.Path(cand).exists():\n        data_root = pathlib.Path(cand)\n        break\nif data_root is None:\n    raise FileNotFoundError(\n        \"SPR_BENCH dataset folder not found. \"\n        \"Set env var SPR_PATH or place folder in cwd.\"\n    )\nprint(\"Using dataset folder:\", data_root)\nspr = load_spr_bench(data_root)\nprint({k: len(v) for k, v in spr.items()})\n\n# ------------------- vocab + encoding -------------------------------------------------\nPAD, UNK = \"<pad>\", \"<unk>\"\n\n\ndef build_vocab(seqs: List[str]) -> Dict[str, int]:\n    vocab = {PAD: 0, UNK: 1}\n    for s in seqs:\n        for tok in s.strip().split():\n            if tok not in vocab:\n                vocab[tok] = len(vocab)\n    return vocab\n\n\nvocab = build_vocab(spr[\"train\"][\"sequence\"])\nvocab_size = len(vocab)\nprint(\"Vocab size:\", vocab_size)\n\n\ndef encode(seq: str, max_len: int) -> List[int]:\n    ids = [vocab.get(t, vocab[UNK]) for t in seq.strip().split()][:max_len]\n    ids += [vocab[PAD]] * (max_len - len(ids))\n    return ids\n\n\nmax_len = min(64, max(len(s.split()) for s in spr[\"train\"][\"sequence\"]))\nprint(\"Max length set to\", max_len)\n\nlabel_set = sorted(list(set(spr[\"train\"][\"label\"])))\nlabel2id = {lab: i for i, lab in enumerate(label_set)}\nnum_labels = len(label2id)\nprint(\"Num labels:\", num_labels)\n\n\n# ------------------- symbolic feature extraction --------------------------------------\ndef sym_feats(tokens: List[str]) -> List[float]:\n    seq_len = len(tokens)\n    uniq = len(set(tokens))\n    uniq_ratio = uniq / seq_len\n    repeat = seq_len - uniq\n    max_freq = max(Counter(tokens).values())\n    return [seq_len, uniq, uniq_ratio, repeat, max_freq]\n\n\n# collect train statistics for min-max scaling\nall_feats = [sym_feats(s.split()) for s in spr[\"train\"][\"sequence\"]]\nall_feats = np.array(all_feats)\nfeat_min = all_feats.min(axis=0)\nfeat_max = all_feats.max(axis=0)\n\n\ndef norm_feats(feat_vec: List[float]) -> List[float]:\n    v = np.array(feat_vec)\n    return ((v - feat_min) / (feat_max - feat_min + 1e-8)).tolist()\n\n\n# ------------------- Dataset obj ------------------------------------------------------\nclass SPRDataset(Dataset):\n    def __init__(self, split):\n        self.seqs = split[\"sequence\"]\n        self.labels = [label2id[l] for l in split[\"label\"]]\n        self.sym = [norm_feats(sym_feats(s.split())) for s in self.seqs]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        return {\n            \"input_ids\": torch.tensor(\n                encode(self.seqs[idx], max_len), dtype=torch.long\n            ),\n            \"sym_feats\": torch.tensor(self.sym[idx], dtype=torch.float32),\n            \"labels\": torch.tensor(self.labels[idx], dtype=torch.long),\n        }\n\n\nbatch_size = 64\ntrain_loader = DataLoader(SPRDataset(spr[\"train\"]), batch_size=batch_size, shuffle=True)\nval_loader = DataLoader(SPRDataset(spr[\"dev\"]), batch_size=batch_size, shuffle=False)\ntest_loader = DataLoader(SPRDataset(spr[\"test\"]), batch_size=batch_size, shuffle=False)\n\n\n# ------------------- model defs -------------------------------------------------------\nclass PositionalEncoding(nn.Module):\n    def __init__(self, d_model, max_len=5000):\n        super().__init__()\n        pe = torch.zeros(max_len, d_model)\n        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)\n        div_term = torch.exp(\n            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)\n        )\n        pe[:, 0::2] = torch.sin(position * div_term)\n        pe[:, 1::2] = torch.cos(position * div_term)\n        self.register_buffer(\"pe\", pe.unsqueeze(0))\n\n    def forward(self, x):\n        return x + self.pe[:, : x.size(1), :]\n\n\nclass TransformerBaseline(nn.Module):\n    def __init__(\n        self, vocab_size, emb_dim=128, nhead=8, num_layers=2, num_labels=10, dropout=0.1\n    ):\n        super().__init__()\n        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=0)\n        self.pos = PositionalEncoding(emb_dim, max_len)\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=emb_dim, nhead=nhead, batch_first=True, dropout=dropout\n        )\n        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)\n        self.cls = nn.Linear(emb_dim, num_labels)\n\n    def forward(self, input_ids, sym_feats=None):\n        pad_mask = input_ids == 0\n        x = self.embedding(input_ids)\n        x = self.pos(x)\n        x = self.encoder(x, src_key_padding_mask=pad_mask)\n        x = x.masked_fill(pad_mask.unsqueeze(-1), 0.0).mean(1)\n        return self.cls(x)\n\n\nclass NeuroSymbolic(nn.Module):\n    def __init__(\n        self,\n        vocab_size,\n        emb_dim=128,\n        nhead=8,\n        num_layers=2,\n        num_labels=10,\n        sym_dim=5,\n        dropout=0.1,\n    ):\n        super().__init__()\n        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=0)\n        self.pos = PositionalEncoding(emb_dim, max_len)\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=emb_dim, nhead=nhead, batch_first=True, dropout=dropout\n        )\n        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)\n        self.sym_mlp = nn.Sequential(\n            nn.Linear(sym_dim, 32), nn.ReLU(), nn.Linear(32, 64), nn.ReLU()\n        )\n        self.cls = nn.Linear(emb_dim + 64, num_labels)\n\n    def forward(self, input_ids, sym_feats):\n        pad_mask = input_ids == 0\n        x = self.embedding(input_ids)\n        x = self.pos(x)\n        x = self.encoder(x, src_key_padding_mask=pad_mask)\n        x = x.masked_fill(pad_mask.unsqueeze(-1), 0.0).mean(1)  # [B, emb_dim]\n        sym_vec = self.sym_mlp(sym_feats)  # [B, 64]\n        cat = torch.cat([x, sym_vec], dim=-1)\n        return self.cls(cat)\n\n\n# ------------------- training utilities ----------------------------------------------\ndef run_epoch(model, loader, crit, optim=None):\n    train_flag = optim is not None\n    model.train() if train_flag else model.eval()\n    total_loss, preds, trues = 0.0, [], []\n    for batch in loader:\n        batch = {\n            k: v.to(device) if isinstance(v, torch.Tensor) else v\n            for k, v in batch.items()\n        }\n        if train_flag:\n            optim.zero_grad()\n        with torch.set_grad_enabled(train_flag):\n            # Some models don't use sym_feats (baseline)\n            logits = model(batch[\"input_ids\"], batch.get(\"sym_feats\"))\n            loss = crit(logits, batch[\"labels\"])\n            if train_flag:\n                loss.backward()\n                optim.step()\n        total_loss += loss.item() * batch[\"labels\"].size(0)\n        preds.extend(logits.argmax(-1).detach().cpu().numpy())\n        trues.extend(batch[\"labels\"].cpu().numpy())\n    avg_loss = total_loss / len(loader.dataset)\n    macro_f1 = f1_score(trues, preds, average=\"macro\")\n    return avg_loss, macro_f1, preds, trues\n\n\n# ------------------- experiment loop --------------------------------------------------\ndef train_and_eval(model_name: str, model, num_epochs: int = 5):\n    crit = nn.CrossEntropyLoss()\n    optim = torch.optim.Adam(model.parameters(), lr=1e-3)\n    model.to(device)\n    for epoch in range(1, num_epochs + 1):\n        t0 = time.time()\n        tr_loss, tr_f1, _, _ = run_epoch(model, train_loader, crit, optim)\n        val_loss, val_f1, _, _ = run_epoch(model, val_loader, crit, None)\n        ed = experiment_data[model_name]\n        ed[\"losses\"][\"train\"].append(tr_loss)\n        ed[\"losses\"][\"val\"].append(val_loss)\n        ed[\"metrics\"][\"train\"].append(tr_f1)\n        ed[\"metrics\"][\"val\"].append(val_f1)\n        ed[\"epochs\"].append(epoch)\n        print(\n            f\"[{model_name}] Epoch {epoch}: \"\n            f\"train_loss={tr_loss:.4f} val_loss={val_loss:.4f} \"\n            f\"train_F1={tr_f1:.4f} val_F1={val_f1:.4f} \"\n            f\"({time.time()-t0:.1f}s)\"\n        )\n    # test evaluation\n    test_loss, test_f1, preds, trues = run_epoch(model, test_loader, crit, None)\n    ed[\"test_loss\"] = test_loss\n    ed[\"test_macro_f1\"] = test_f1\n    ed[\"predictions\"] = preds\n    ed[\"ground_truth\"] = trues\n    print(f\"[{model_name}] TEST: loss={test_loss:.4f} macro_F1={test_f1:.4f}\")\n\n\n# ------------------- run both models --------------------------------------------------\nbaseline_model = TransformerBaseline(vocab_size, num_labels=num_labels)\nns_model = NeuroSymbolic(vocab_size, num_labels=num_labels)\n\ntrain_and_eval(\"baseline\", baseline_model)\ntrain_and_eval(\"neuro_symbolic\", ns_model)\n\n# ------------------- save everything --------------------------------------------------\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(\"Saved experiment data to\", os.path.join(working_dir, \"experiment_data.npy\"))\n",
+            "plan": "The plan is to fuse cheap, rule-oriented symbolic signals with the Transformer latent in a single model and compare it to the plain Transformer baseline.  \nFor each sequence we pre-compute five symbolic features (length, #uniques, unique-ratio, #repeated tokens, max token-frequency).  \nThese features are min–max normalised over the train split, passed through a small MLP and concatenated to the Transformer’s pooled vector before classification.  \nWe train both models (5 epochs, same seed and hyper-params) on SPR_BENCH, track loss and macro-F1 each epoch, evaluate on the hidden test split, and store everything in experiment_data.npy.  \nThis quick study will reveal whether inexpensive neuro-symbolic fusion already beats the vanilla baseline and moves us closer to SOTA 0.70 macro-F1.  \nAll GPU/CPU, logging and saving requirements are satisfied, and the script runs immediately without an entry-point guard.",
+            "overall_plan": "",
+            "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\nfrom sklearn.metrics import confusion_matrix\n\n# working directory for outputs\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = None\n\nif experiment_data is not None:\n    models = experiment_data.keys()\n    summary = {}\n\n    # ---------- Figure 1 : Macro-F1 curves -------------------------------\n    try:\n        fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True)\n        fig.suptitle(\n            \"SPR_BENCH Macro-F1 over Epochs\\nLeft: Train   Right: Validation\",\n            fontsize=14,\n        )\n        for m in models:\n            rec = experiment_data[m]\n            epochs = rec[\"epochs\"]\n            axes[0].plot(epochs, rec[\"metrics\"][\"train\"], label=m)\n            axes[1].plot(epochs, rec[\"metrics\"][\"val\"], label=m)\n        for ax, ttl in zip(axes, [\"Train Macro-F1\", \"Validation Macro-F1\"]):\n            ax.set_title(ttl)\n            ax.set_xlabel(\"Epoch\")\n            ax.set_ylabel(\"Macro-F1\")\n            ax.legend()\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_macro_f1_curves.png\"))\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating Macro-F1 plot: {e}\")\n        plt.close()\n\n    # ---------- Figure 2 : Loss curves ----------------------------------\n    try:\n        fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True)\n        fig.suptitle(\n            \"SPR_BENCH Cross-Entropy Loss over Epochs\\nLeft: Train   Right: Validation\",\n            fontsize=14,\n        )\n        for m in models:\n            rec = experiment_data[m]\n            epochs = rec[\"epochs\"]\n            axes[0].plot(epochs, rec[\"losses\"][\"train\"], label=m)\n            axes[1].plot(epochs, rec[\"losses\"][\"val\"], label=m)\n        for ax, ttl in zip(axes, [\"Train Loss\", \"Validation Loss\"]):\n            ax.set_title(ttl)\n            ax.set_xlabel(\"Epoch\")\n            ax.set_ylabel(\"Loss\")\n            ax.legend()\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_loss_curves.png\"))\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating Loss plot: {e}\")\n        plt.close()\n\n    # ---------- Figure 3 : Test Macro-F1 bar chart -----------------------\n    try:\n        keys, test_f1s = [], []\n        for m in models:\n            f1 = experiment_data[m].get(\"test_macro_f1\", 0.0)\n            keys.append(m)\n            test_f1s.append(f1)\n            summary[m] = f1\n        plt.figure(figsize=(6, 5))\n        plt.bar(keys, test_f1s, color=\"skyblue\")\n        plt.title(\"SPR_BENCH Test Macro-F1 by Model\")\n        plt.ylabel(\"Macro-F1\")\n        plt.tight_layout()\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_test_macro_f1_bar.png\"))\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating Test Macro-F1 bar plot: {e}\")\n        plt.close()\n\n    # ---------- Figure 4 & 5 : Confusion matrices -----------------------\n    for m in models:\n        try:\n            preds = np.array(experiment_data[m][\"predictions\"])\n            trues = np.array(experiment_data[m][\"ground_truth\"])\n            cm = confusion_matrix(trues, preds)\n            fig, ax = plt.subplots(figsize=(6, 5))\n            im = ax.imshow(cm, cmap=\"Blues\")\n            ax.set_title(f\"SPR_BENCH Confusion Matrix – {m}\")\n            ax.set_xlabel(\"Predicted\")\n            ax.set_ylabel(\"True\")\n            ax.set_xticks(np.arange(cm.shape[1]))\n            ax.set_yticks(np.arange(cm.shape[0]))\n            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)\n            plt.tight_layout()\n            fname = f\"SPR_BENCH_confusion_matrix_{m}.png\"\n            plt.savefig(os.path.join(working_dir, fname))\n            plt.close()\n        except Exception as e:\n            print(f\"Error creating confusion matrix for {m}: {e}\")\n            plt.close()\n\n    # ------------------ Console summary ---------------------------------\n    print(\"\\nFinal Test Macro-F1 Scores:\")\n    for k, v in summary.items():\n        print(f\"{k:15s}: {v:.4f}\")\n",
+            "plot_plan": "We will load the stored experiment_data.npy, extract the per-epoch losses and macro-F1 scores for the two models, and visualise them in paired train/validation plots so users can quickly compare learning dynamics. A bar chart will then highlight the final test macro-F1 for each model. Finally, we will build confusion-matrix heat-maps (one per model) from the saved test predictions and ground-truth labels to show error structure. Every figure is wrapped in its own try-except block, saved to the working directory with descriptive names, properly titled (including “Left/Right” subtitles where relevant), and the figures are closed after saving. The script also prints a concise console summary of the test macro-F1 for quick reference. Only data already present in experiment_data.npy are used; no synthetic values are introduced. The number of figures is kept to five to stay within the guideline.",
+            "step": 6,
+            "id": "1f0981582eac47d48ca1e9689de85b95",
+            "ctime": 1755493567.7276816,
+            "parse_metrics_plan": "The script will immediately load experiment_data.npy from the working directory, iterate over every stored experiment (e.g., “baseline”, “neuro_symbolic”), and compute the most informative scalar for each metric: the maximum macro-F1 scores and the minimum cross-entropy losses observed during training and validation, plus the single test values recorded after the last epoch. It then prints the dataset name followed by clearly labelled lines such as “Best training macro F1 score” or “Lowest validation loss,” ensuring the wording is explicit and unambiguous. No figures are generated and the entire program resides at top level so it runs as soon as the file is executed.",
+            "parse_metrics_code": "import os\nimport numpy as np\n\n# ------------------------------------------------------------------\n# 0. Locate the working directory and load the stored experiment data\n# ------------------------------------------------------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nfile_path = os.path.join(working_dir, \"experiment_data.npy\")\n\nif not os.path.isfile(file_path):\n    raise FileNotFoundError(f\"Could not locate experiment_data.npy at {file_path}\")\n\nexperiment_data = np.load(file_path, allow_pickle=True).item()\n\n# ------------------------------------------------------------------\n# 1. Iterate through each experiment and print the requested metrics\n# ------------------------------------------------------------------\nfor exp_name, exp in experiment_data.items():\n    print(f\"\\nDataset: {exp_name}\")\n\n    # Training metrics\n    best_train_f1 = max(exp[\"metrics\"][\"train\"]) if exp[\"metrics\"][\"train\"] else None\n    lowest_train_ls = min(exp[\"losses\"][\"train\"]) if exp[\"losses\"][\"train\"] else None\n\n    # Validation metrics\n    best_val_f1 = max(exp[\"metrics\"][\"val\"]) if exp[\"metrics\"][\"val\"] else None\n    lowest_val_ls = min(exp[\"losses\"][\"val\"]) if exp[\"losses\"][\"val\"] else None\n\n    # Test metrics (single values stored after final epoch)\n    test_f1 = exp.get(\"test_macro_f1\", None)\n    test_ls = exp.get(\"test_loss\", None)\n\n    # 2. Print results with explicit labels\n    if best_train_f1 is not None:\n        print(f\"Best training macro F1 score: {best_train_f1:.4f}\")\n    if lowest_train_ls is not None:\n        print(f\"Lowest training loss: {lowest_train_ls:.4f}\")\n\n    if best_val_f1 is not None:\n        print(f\"Best validation macro F1 score: {best_val_f1:.4f}\")\n    if lowest_val_ls is not None:\n        print(f\"Lowest validation loss: {lowest_val_ls:.4f}\")\n\n    if test_f1 is not None:\n        print(f\"Test macro F1 score: {test_f1:.4f}\")\n    if test_ls is not None:\n        print(f\"Test loss: {test_ls:.4f}\")\n",
+            "parse_exc_type": null,
+            "parse_exc_info": null,
+            "parse_exc_stack": null,
+            "exec_time": 6.485534429550171,
+            "exc_type": null,
+            "exc_info": null,
+            "exc_stack": null,
+            "analysis": "",
+            "exp_results_dir": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_1f0981582eac47d48ca1e9689de85b95_proc_3470355",
+            "metric": {
+                "value": {
+                    "metric_names": [
+                        {
+                            "metric_name": "training macro F1 score",
+                            "lower_is_better": false,
+                            "description": "Macro F1 score during training phase",
+                            "data": [
+                                {
+                                    "dataset_name": "baseline",
+                                    "final_value": 0.9185,
+                                    "best_value": 0.9185
+                                },
+                                {
+                                    "dataset_name": "neuro_symbolic",
+                                    "final_value": 0.1925,
+                                    "best_value": 0.1925
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "training loss",
+                            "lower_is_better": true,
+                            "description": "Loss during training phase",
+                            "data": [
+                                {
+                                    "dataset_name": "baseline",
+                                    "final_value": 0.0088,
+                                    "best_value": 0.0088
+                                },
+                                {
+                                    "dataset_name": "neuro_symbolic",
+                                    "final_value": 0.0264,
+                                    "best_value": 0.0264
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "validation macro F1 score",
+                            "lower_is_better": false,
+                            "description": "Macro F1 score during validation phase",
+                            "data": [
+                                {
+                                    "dataset_name": "baseline",
+                                    "final_value": 0.656,
+                                    "best_value": 0.656
+                                },
+                                {
+                                    "dataset_name": "neuro_symbolic",
+                                    "final_value": 0.678,
+                                    "best_value": 0.678
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "validation loss",
+                            "lower_is_better": true,
+                            "description": "Loss during validation phase",
+                            "data": [
+                                {
+                                    "dataset_name": "baseline",
+                                    "final_value": 1.8135,
+                                    "best_value": 1.8135
+                                },
+                                {
+                                    "dataset_name": "neuro_symbolic",
+                                    "final_value": 1.1216,
+                                    "best_value": 1.1216
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "test macro F1 score",
+                            "lower_is_better": false,
+                            "description": "Macro F1 score during test phase",
+                            "data": [
+                                {
+                                    "dataset_name": "baseline",
+                                    "final_value": 0.680,
+                                    "best_value": 0.680
+                                },
+                                {
+                                    "dataset_name": "neuro_symbolic",
+                                    "final_value": 0.679,
+                                    "best_value": 0.679
+                                }
+                            ]
+                        },
+                        {
+                            "metric_name": "test loss",
+                            "lower_is_better": true,
+                            "description": "Loss during test phase",
+                            "data": [
+                                {
+                                    "dataset_name": "baseline",
+                                    "final_value": 2.3995,
+                                    "best_value": 2.3995
+                                },
+                                {
+                                    "dataset_name": "neuro_symbolic",
+                                    "final_value": 1.9719,
+                                    "best_value": 1.9719
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "maximize": null,
+                "name": null,
+                "description": null
+            },
+            "is_buggy": false,
+            "is_buggy_plots": false,
+            "parent_id": null,
+            "children": [],
+            "plot_data": {},
+            "plots_generated": false,
+            "plots": [
+                "../../logs/0-run/experiment_results/experiment_1f0981582eac47d48ca1e9689de85b95_proc_3470355/SPR_BENCH_macro_f1_curves.png",
+                "../../logs/0-run/experiment_results/experiment_1f0981582eac47d48ca1e9689de85b95_proc_3470355/SPR_BENCH_loss_curves.png",
+                "../../logs/0-run/experiment_results/experiment_1f0981582eac47d48ca1e9689de85b95_proc_3470355/SPR_BENCH_test_macro_f1_bar.png",
+                "../../logs/0-run/experiment_results/experiment_1f0981582eac47d48ca1e9689de85b95_proc_3470355/SPR_BENCH_confusion_matrix_baseline.png",
+                "../../logs/0-run/experiment_results/experiment_1f0981582eac47d48ca1e9689de85b95_proc_3470355/SPR_BENCH_confusion_matrix_neuro_symbolic.png"
+            ],
+            "plot_paths": [
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_1f0981582eac47d48ca1e9689de85b95_proc_3470355/SPR_BENCH_macro_f1_curves.png",
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_1f0981582eac47d48ca1e9689de85b95_proc_3470355/SPR_BENCH_loss_curves.png",
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_1f0981582eac47d48ca1e9689de85b95_proc_3470355/SPR_BENCH_test_macro_f1_bar.png",
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_1f0981582eac47d48ca1e9689de85b95_proc_3470355/SPR_BENCH_confusion_matrix_baseline.png",
+                "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_1f0981582eac47d48ca1e9689de85b95_proc_3470355/SPR_BENCH_confusion_matrix_neuro_symbolic.png"
+            ],
+            "plot_analyses": [
+                {
+                    "analysis": "The training Macro-F1 scores for both the baseline and neuro-symbolic models converge to near-perfect performance after the first few epochs, with the neuro-symbolic model slightly lagging in the initial epochs but catching up quickly. On the validation set, the neuro-symbolic model exhibits a more erratic trajectory compared to the baseline, with a significant dip in the middle epochs before recovering and slightly surpassing the baseline in the last epoch. This suggests that while the neuro-symbolic model may have higher variance in its learning process, it has the potential to generalize better under certain conditions.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_1f0981582eac47d48ca1e9689de85b95_proc_3470355/SPR_BENCH_macro_f1_curves.png"
+                },
+                {
+                    "analysis": "The training loss for both models decreases rapidly and converges after the initial epochs, with the neuro-symbolic model showing a slightly faster convergence. On the validation set, the neuro-symbolic model consistently achieves lower loss values compared to the baseline, indicating better performance in generalization. The baseline model's validation loss increases steadily, while the neuro-symbolic model shows a more stable trend after an initial dip, further supporting its potential for better generalization.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_1f0981582eac47d48ca1e9689de85b95_proc_3470355/SPR_BENCH_loss_curves.png"
+                },
+                {
+                    "analysis": "The test Macro-F1 scores for both models are nearly identical, with both achieving approximately 0.7. This indicates that the neuro-symbolic enhancements did not lead to a significant improvement over the baseline model on the test set. However, the comparable performance suggests that the neuro-symbolic model is at least as effective as the baseline in handling the SPR task.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_1f0981582eac47d48ca1e9689de85b95_proc_3470355/SPR_BENCH_test_macro_f1_bar.png"
+                },
+                {
+                    "analysis": "The confusion matrix for the baseline model shows a balanced performance between the two classes, with a slight bias towards one class. This indicates that the baseline model is effective in distinguishing between the classes but may have room for improvement in handling class imbalances.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_1f0981582eac47d48ca1e9689de85b95_proc_3470355/SPR_BENCH_confusion_matrix_baseline.png"
+                },
+                {
+                    "analysis": "The confusion matrix for the neuro-symbolic model also demonstrates balanced performance between the two classes, similar to the baseline. The distribution of correct and incorrect predictions is nearly identical to the baseline, suggesting that the neuro-symbolic enhancements did not significantly impact the model's class-wise performance.",
+                    "plot_path": "experiments/2025-08-17_23-44-10_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_1f0981582eac47d48ca1e9689de85b95_proc_3470355/SPR_BENCH_confusion_matrix_neuro_symbolic.png"
+                }
+            ],
+            "vlm_feedback_summary": "The provided plots indicate that the neuro-symbolic model demonstrates comparable performance to the baseline model across various metrics, with some potential for improved generalization as seen in the validation loss trends. However, the enhancements did not lead to a significant improvement in test performance or class-wise prediction balance. Further investigation into the neuro-symbolic components is recommended to understand their contribution to the model's learning process.",
+            "datasets_successfully_tested": [
+                "['SPR_BENCH']"
+            ],
+            "ablation_name": null,
+            "hyperparam_name": null,
+            "is_seed_node": false,
+            "is_seed_agg_node": false,
+            "exec_time_feedback": "",
+            "ranking": 4
+        }
+    ],
+    "node2parent": {
+        "30ec2c3f43ee4ba58c04682268fd0ac5": "00ce423fb4a041eeb173944638254940",
+        "6b62d6adc7ad4c75aa54151c8b603abe": "00ce423fb4a041eeb173944638254940",
+        "bd144de5527140edbf3f44dbfee8db6b": "00ce423fb4a041eeb173944638254940",
+        "d49be9c4943e415297b88d7d76ddde68": "00ce423fb4a041eeb173944638254940",
+        "9afb6e88daf844f5ac9eb55eb16acd94": "d49be9c4943e415297b88d7d76ddde68",
+        "1f0981582eac47d48ca1e9689de85b95": "00ce423fb4a041eeb173944638254940",
+        "6bf86cecc0d3475db06b499e496e1d8e": "00ce423fb4a041eeb173944638254940",
+        "e79acb14171044e9a19ae6ca599ac579": "00ce423fb4a041eeb173944638254940",
+        "723c819693a84042b0bb82e30dff271a": "9afb6e88daf844f5ac9eb55eb16acd94",
+        "db91c43a7fd24ea9b884b0d2b9d25b92": "9afb6e88daf844f5ac9eb55eb16acd94",
+        "6861a0d5657f4b899c6741abbd4cef15": "9afb6e88daf844f5ac9eb55eb16acd94",
+        "7ed65f77b65f498c91fafd32e1d689ee": "9afb6e88daf844f5ac9eb55eb16acd94"
+    },
+    "__version": "2"
+}

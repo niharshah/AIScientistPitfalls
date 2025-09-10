@@ -1,0 +1,489 @@
+{
+  "best node": {
+    "overall_plan": "The overall plan initially focused on hyperparameter tuning by training Transformer classifiers with varying encoder depths (1 to 4 layers) and evaluating performance through train/validation losses and macro-F1 scores, storing results for analysis. The current plan introduces a 'symbolic head' to the model, creating a neural-symbolic hybrid that combines sequential and symbolic reasoning. This is built upon the best configuration from the previous experiments (2 encoder layers). The plan also includes the use of early stopping and the computation of the SGA metric to assess rule generalization, particularly on sequences with novel bigrams. Comprehensive metric tracking continues to be a key aspect of the evaluation strategy.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "training loss",
+            "lower_is_better": true,
+            "description": "The loss during training phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.0161,
+                "best_value": 0.0161
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "The loss during validation phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6775,
+                "best_value": 0.6775
+              }
+            ]
+          },
+          {
+            "metric_name": "training F1 score",
+            "lower_is_better": false,
+            "description": "The F1 score during training phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.996,
+                "best_value": 0.996
+              }
+            ]
+          },
+          {
+            "metric_name": "validation F1 score",
+            "lower_is_better": false,
+            "description": "The F1 score during validation phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.696,
+                "best_value": 0.696
+              }
+            ]
+          },
+          {
+            "metric_name": "test F1 score",
+            "lower_is_better": false,
+            "description": "The F1 score during testing phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.6999,
+                "best_value": 0.6999
+              }
+            ]
+          },
+          {
+            "metric_name": "systematic generalization accuracy",
+            "lower_is_better": false,
+            "description": "The accuracy for systematic generalization.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.0,
+                "best_value": 0.0
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, pathlib, math, time, json, random\nimport torch, numpy as np\nfrom torch import nn\nfrom torch.utils.data import DataLoader, Dataset\nfrom datasets import DatasetDict, load_dataset\nfrom sklearn.metrics import f1_score\n\n# ---------- dirs / device ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\nexperiment_data = {\n    \"SPR_BENCH\": {\n        \"metrics\": {\"train_f1\": [], \"val_f1\": [], \"test_f1\": None, \"SGA\": None},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n        \"epochs\": [],\n    }\n}\n\n\n# ---------- load SPR_BENCH ----------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(f):\n        return load_dataset(\n            \"csv\", data_files=str(root / f), split=\"train\", cache_dir=\".cache_dsets\"\n        )\n\n    return DatasetDict(\n        train=_load(\"train.csv\"), dev=_load(\"dev.csv\"), test=_load(\"test.csv\")\n    )\n\n\nfor p in [\n    pathlib.Path(\"./SPR_BENCH\"),\n    pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\"),\n]:\n    if p.exists():\n        DATA_PATH = p\n        break\nelse:\n    raise FileNotFoundError(\"SPR_BENCH not found\")\n\nspr = load_spr_bench(DATA_PATH)\n\n# ---------- vocab / labels ----------\nPAD, UNK = \"<PAD>\", \"<UNK>\"\nvocab = [PAD, UNK] + sorted({c for s in spr[\"train\"][\"sequence\"] for c in s})\nstoi = {c: i for i, c in enumerate(vocab)}\nitos = {i: c for c, i in stoi.items()}\nlabel2id = {l: i for i, l in enumerate(sorted(set(spr[\"train\"][\"label\"])))}\nid2label = {i: l for l, i in label2id.items()}\nvocab_size, num_classes = len(vocab), len(label2id)\nMAX_LEN = 64\nprint(f\"vocab_size={vocab_size}, num_classes={num_classes}\")\n\n\ndef encode_seq(seq):\n    ids = [stoi.get(c, stoi[UNK]) for c in seq[:MAX_LEN]]\n    ids += [stoi[PAD]] * (MAX_LEN - len(ids))\n    return ids\n\n\ndef bag_of_symbols(seq):\n    v = np.zeros(vocab_size, dtype=np.float32)\n    for c in seq:\n        v[stoi.get(c, 1)] += 1\n    return v / max(1, len(seq))\n\n\nclass SPRTorchDataset(Dataset):\n    def __init__(self, hf_split):\n        self.seqs, self.labs = hf_split[\"sequence\"], hf_split[\"label\"]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        return {\n            \"input_ids\": torch.tensor(encode_seq(self.seqs[idx]), dtype=torch.long),\n            \"sym_counts\": torch.tensor(\n                bag_of_symbols(self.seqs[idx]), dtype=torch.float32\n            ),\n            \"labels\": torch.tensor(label2id[self.labs[idx]], dtype=torch.long),\n        }\n\n\nbatch_size = 128\ntrain_dl = DataLoader(\n    SPRTorchDataset(spr[\"train\"]), batch_size=batch_size, shuffle=True\n)\nval_dl = DataLoader(SPRTorchDataset(spr[\"dev\"]), batch_size=batch_size)\ntest_dl = DataLoader(SPRTorchDataset(spr[\"test\"]), batch_size=batch_size)\n\n\n# ---------- model ----------\nclass PositionalEncoding(nn.Module):\n    def __init__(self, d_model, max_len=MAX_LEN):\n        super().__init__()\n        pe = torch.zeros(max_len, d_model)\n        pos = torch.arange(0, max_len).unsqueeze(1)\n        div = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))\n        pe[:, 0::2] = torch.sin(pos * div)\n        pe[:, 1::2] = torch.cos(pos * div)\n        self.register_buffer(\"pe\", pe.unsqueeze(0))\n\n    def forward(self, x):\n        return x + self.pe[:, : x.size(1)]\n\n\nclass HybridClassifier(nn.Module):\n    def __init__(self, vocab, d_model, nhead, nlayers, sym_dim, n_classes):\n        super().__init__()\n        self.embed = nn.Embedding(vocab, d_model, padding_idx=0)\n        self.pos = PositionalEncoding(d_model)\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model, nhead, 256, 0.1, batch_first=True\n        )\n        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=nlayers)\n        self.sym_fc = nn.Linear(sym_dim, d_model)\n        self.out = nn.Linear(d_model * 2, n_classes)\n\n    def forward(self, input_ids, sym_counts):\n        mask = input_ids.eq(0)\n        x = self.pos(self.embed(input_ids))\n        x = self.transformer(x, src_key_padding_mask=mask)\n        x.masked_fill_(mask.unsqueeze(-1), 0)\n        seq_repr = x.sum(1) / (~mask).sum(1, keepdim=True).clamp(min=1)\n        sym_repr = torch.relu(self.sym_fc(sym_counts))\n        combined = torch.cat([seq_repr, sym_repr], dim=-1)\n        return self.out(combined)\n\n\nmodel = HybridClassifier(vocab_size, 128, 4, 2, vocab_size, num_classes).to(device)\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n\n\n# ---------- helper ----------\ndef run_epoch(model, dl, train=False):\n    model.train() if train else model.eval()\n    total_loss, preds, labs = 0.0, [], []\n    for batch in dl:\n        batch = {\n            k: (v.to(device) if isinstance(v, torch.Tensor) else v)\n            for k, v in batch.items()\n        }\n        with torch.set_grad_enabled(train):\n            logits = model(batch[\"input_ids\"], batch[\"sym_counts\"])\n            loss = criterion(logits, batch[\"labels\"])\n            if train:\n                optimizer.zero_grad()\n                loss.backward()\n                optimizer.step()\n        total_loss += loss.item() * batch[\"labels\"].size(0)\n        preds.append(logits.argmax(-1).cpu())\n        labs.append(batch[\"labels\"].cpu())\n    preds = torch.cat(preds).numpy()\n    labs = torch.cat(labs).numpy()\n    return (\n        total_loss / len(dl.dataset),\n        f1_score(labs, preds, average=\"macro\"),\n        preds,\n        labs,\n    )\n\n\n# ---------- training ----------\nEPOCHS, best_val = 15, -1\npatience, wait = 3, 0\nfor epoch in range(1, EPOCHS + 1):\n    tr_loss, tr_f1, _, _ = run_epoch(model, train_dl, train=True)\n    vl_loss, vl_f1, _, _ = run_epoch(model, val_dl)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"train\"].append(tr_loss)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"val\"].append(vl_loss)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"train_f1\"].append(tr_f1)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"val_f1\"].append(vl_f1)\n    experiment_data[\"SPR_BENCH\"][\"epochs\"].append(epoch)\n    print(f\"Epoch {epoch}: val_loss={vl_loss:.4f} val_F1={vl_f1:.4f}\")\n    if vl_f1 > best_val:\n        best_val = vl_f1\n        best_state = model.state_dict()\n        wait = 0\n    else:\n        wait += 1\n        if wait >= patience:\n            print(\"Early stop\")\n            break\n\nmodel.load_state_dict(best_state)\n\n# ---------- test ----------\nts_loss, ts_f1, ts_preds, ts_labels = run_epoch(model, test_dl)\nprint(f\"Test macro-F1={ts_f1:.4f}\")\nexperiment_data[\"SPR_BENCH\"][\"metrics\"][\"test_f1\"] = ts_f1\nexperiment_data[\"SPR_BENCH\"][\"predictions\"] = ts_preds.tolist()\nexperiment_data[\"SPR_BENCH\"][\"ground_truth\"] = ts_labels.tolist()\n\n\n# ---------- SGA metric (OOD bigram proxy) ----------\ndef bigrams(seq):\n    return {seq[i : i + 2] for i in range(len(seq) - 1)}\n\n\ntrain_bigrams = set().union(*(bigrams(s) for s in spr[\"train\"][\"sequence\"]))\nood_mask = []\nfor s in spr[\"test\"][\"sequence\"]:\n    ood_mask.append(len(bigrams(s) - train_bigrams) > 0)\nood_mask = np.array(ood_mask)\ncorrect = ts_preds == ts_labels\nSGA = correct[ood_mask].mean() if ood_mask.any() else 0.0\nprint(f\"Systematic Generalization Accuracy (proxy) = {SGA:.4f}\")\nexperiment_data[\"SPR_BENCH\"][\"metrics\"][\"SGA\"] = float(SGA)\n\n# ---------- save ----------\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Saved experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\nfrom sklearn.metrics import f1_score, confusion_matrix\n\n# ---------- load ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\ntest_scores = {}\n\nfor dset, rec in experiment_data.items():\n    epochs = np.asarray(rec.get(\"epochs\", []))\n    metrics = rec.get(\"metrics\", {})\n    losses = rec.get(\"losses\", {})\n    preds = np.asarray(rec.get(\"predictions\", []))\n    gts = np.asarray(rec.get(\"ground_truth\", []))\n\n    # ---------- plot 1: F1 curves ----------\n    try:\n        if len(epochs) and metrics.get(\"train_f1\") and metrics.get(\"val_f1\"):\n            plt.figure()\n            plt.plot(epochs, metrics[\"train_f1\"], label=\"Train\")\n            plt.plot(epochs, metrics[\"val_f1\"], linestyle=\"--\", label=\"Validation\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Macro-F1\")\n            plt.title(f\"{dset}: Train vs Validation Macro-F1\\nLeft: Train, Right: Val\")\n            plt.legend()\n            plt.tight_layout()\n            plt.savefig(os.path.join(working_dir, f\"{dset}_f1_curves.png\"))\n            plt.close()\n    except Exception as e:\n        print(f\"Error creating F1 plot for {dset}: {e}\")\n        plt.close()\n\n    # ---------- plot 2: Loss curves ----------\n    try:\n        if len(epochs) and losses.get(\"train\") and losses.get(\"val\"):\n            plt.figure()\n            plt.plot(epochs, losses[\"train\"], label=\"Train\")\n            plt.plot(epochs, losses[\"val\"], linestyle=\"--\", label=\"Validation\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Cross-Entropy Loss\")\n            plt.title(f\"{dset}: Train vs Validation Loss\\nLeft: Train, Right: Val\")\n            plt.legend()\n            plt.tight_layout()\n            plt.savefig(os.path.join(working_dir, f\"{dset}_loss_curves.png\"))\n            plt.close()\n    except Exception as e:\n        print(f\"Error creating loss plot for {dset}: {e}\")\n        plt.close()\n\n    # ---------- plot 3: Confusion matrix ----------\n    try:\n        if preds.size and gts.size and preds.shape == gts.shape:\n            cm = confusion_matrix(gts, preds)\n            plt.figure(figsize=(6, 5))\n            im = plt.imshow(cm, cmap=\"Blues\")\n            plt.colorbar(im)\n            plt.title(f\"{dset}: Confusion Matrix\\nLeft: Ground Truth, Right: Predicted\")\n            plt.xlabel(\"Predicted\")\n            plt.ylabel(\"True\")\n            for i in range(cm.shape[0]):\n                for j in range(cm.shape[1]):\n                    plt.text(\n                        j,\n                        i,\n                        cm[i, j],\n                        ha=\"center\",\n                        va=\"center\",\n                        color=\"white\" if cm[i, j] > cm.max() / 2 else \"black\",\n                    )\n            plt.tight_layout()\n            plt.savefig(os.path.join(working_dir, f\"{dset}_confusion_matrix.png\"))\n            plt.close()\n    except Exception as e:\n        print(f\"Error creating confusion matrix for {dset}: {e}\")\n        plt.close()\n\n    # ---------- compute / collect test F1 ----------\n    try:\n        test_f1 = metrics.get(\"test_f1\")\n        if test_f1 is None and preds.size and gts.size:\n            test_f1 = f1_score(gts, preds, average=\"macro\")\n        if test_f1 is not None:\n            test_scores[dset] = float(test_f1)\n    except Exception as e:\n        print(f\"Error computing test F1 for {dset}: {e}\")\n\n# ---------- bar chart across datasets ----------\ntry:\n    if test_scores:\n        plt.figure()\n        keys = list(test_scores.keys())\n        vals = [test_scores[k] for k in keys]\n        plt.bar(keys, vals, color=\"skyblue\")\n        for i, v in enumerate(vals):\n            plt.text(i, v + 0.01, f\"{v:.3f}\", ha=\"center\")\n        plt.ylabel(\"Macro-F1\")\n        plt.title(\"Test Macro-F1 Comparison Across Datasets\")\n        plt.tight_layout()\n        plt.savefig(os.path.join(working_dir, \"datasets_test_f1_comparison.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating comparison bar chart: {e}\")\n    plt.close()\n\n# ---------- print summary ----------\nprint(\"=== Test Macro-F1 Scores ===\")\nfor k, v in test_scores.items():\n    print(f\"{k}: {v:.4f}\")\n",
+    "plot_plan": "We load experiment_data.npy, loop over each dataset present, and for every dataset we extract epochs, train/val F1, train/val loss, predictions and labels. Within independent try-except blocks we: (1) draw and save F1 curves, (2) draw and save loss curves, (3) compute a confusion matrix when predictions exist and save the plot, and (4) compute test macro-F1 (either stored or recomputed) and store it in a dict. After iterating through all datasets we create a comparative bar-chart of test macro-F1 across datasets so users can quickly see relative performance. Each figure is saved to working_dir with descriptive names that include the dataset and plot type, subtitles clarify the split or content, and all figures are closed to free memory. The code respects the original numpy structure, never fabricates values, and only plots up to the available epochs (automatically \u22645 sample plots requirement is trivially satisfied here). Finally, all test-set scores are printed for reference.",
+    "plot_analyses": [
+      {
+        "analysis": "The plot shows the Macro-F1 score for both training and validation datasets over the epochs. The training Macro-F1 score improves rapidly and reaches near-perfect performance early in the training process, suggesting that the model has a high capacity to learn the training data. However, the validation Macro-F1 score starts at a lower value and plateaus around 0.7, indicating potential overfitting. The gap between the training and validation performance warrants further analysis, such as regularization techniques or adjustments to the model architecture, to improve generalization.",
+        "plot_path": "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_3eb8bea5b5774f3991a7842748719097_proc_3471777/SPR_BENCH_f1_curves.png"
+      },
+      {
+        "analysis": "This plot illustrates the cross-entropy loss for both training and validation datasets over the epochs. The training loss decreases steadily, approaching zero, which aligns with the model's ability to fit the training data effectively. However, the validation loss initially decreases but then begins to increase after a few epochs, indicating overfitting as the model starts to memorize the training data rather than generalizing to unseen data. Early stopping or additional regularization techniques like dropout could mitigate this issue.",
+        "plot_path": "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_3eb8bea5b5774f3991a7842748719097_proc_3471777/SPR_BENCH_loss_curves.png"
+      },
+      {
+        "analysis": "The confusion matrix shows the distribution of true and predicted labels. While the model correctly classifies a significant portion of the data for both classes, there is a notable number of misclassifications (146 false positives and 154 false negatives). This indicates that while the model performs reasonably well, there is room for improvement in handling edge cases or ambiguous sequences. Techniques such as data augmentation or class rebalancing could help address these shortcomings.",
+        "plot_path": "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_3eb8bea5b5774f3991a7842748719097_proc_3471777/SPR_BENCH_confusion_matrix.png"
+      },
+      {
+        "analysis": "The bar chart compares the test Macro-F1 score across datasets, with the SPR_BENCH dataset achieving a Macro-F1 score of 0.7. This matches the state-of-the-art performance benchmark. While this is a promising result, further experimentation and optimization are needed to surpass the benchmark. Exploring advanced symbolic reasoning modules or fine-tuning hyperparameters might lead to improved performance.",
+        "plot_path": "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_3eb8bea5b5774f3991a7842748719097_proc_3471777/datasets_test_f1_comparison.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_3eb8bea5b5774f3991a7842748719097_proc_3471777/SPR_BENCH_f1_curves.png",
+      "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_3eb8bea5b5774f3991a7842748719097_proc_3471777/SPR_BENCH_loss_curves.png",
+      "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_3eb8bea5b5774f3991a7842748719097_proc_3471777/SPR_BENCH_confusion_matrix.png",
+      "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_3eb8bea5b5774f3991a7842748719097_proc_3471777/datasets_test_f1_comparison.png"
+    ],
+    "vlm_feedback_summary": "The analysis reveals that while the model achieves good training performance, there are signs of overfitting, as indicated by the gap between training and validation metrics. The confusion matrix highlights areas for improvement in classification accuracy, and the test Macro-F1 score matches the state-of-the-art benchmark, indicating potential but also room for further optimization.",
+    "exp_results_dir": "experiment_results/experiment_3eb8bea5b5774f3991a7842748719097_proc_3471777",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_3eb8bea5b5774f3991a7842748719097_proc_3471777/experiment_data.npy"
+    ]
+  },
+  "best node with different seeds": [
+    {
+      "overall_plan": "The overall plan initially involved hyperparameter tuning of Transformer classifiers by varying encoder depths from 1 to 4 layers, with the evaluation based on train/validation losses and macro-F1 scores. The best-performing configuration, which consisted of 2 encoder layers, was then used as a basis for integrating a 'symbolic head' into the model, thus creating a neural-symbolic hybrid. This new model aimed to leverage both sequential and symbolic reasoning. The plan also included early stopping and the computation of the SGA metric to assess rule generalization, particularly on sequences with novel bigrams. Comprehensive metric tracking was a key aspect of this strategy. The current plan is identified as a 'seed node,' suggesting the establishment of foundational work for future developments, but does not introduce new experimental details. The comprehensive plan focuses on the systematic exploration of Transformer architectures and the innovative move towards a neural-symbolic hybrid model, with an emphasis on metric-driven evaluation and rule generalization as foundational elements for future inquiry.",
+      "analysis": "",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "training loss",
+              "lower_is_better": true,
+              "description": "Measures the error during training phase.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.0072,
+                  "best_value": 0.0072
+                }
+              ]
+            },
+            {
+              "metric_name": "validation loss",
+              "lower_is_better": true,
+              "description": "Measures the error on the validation set.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.7289,
+                  "best_value": 0.7289
+                }
+              ]
+            },
+            {
+              "metric_name": "training F1 score",
+              "lower_is_better": false,
+              "description": "F1 score during the training phase.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.9985,
+                  "best_value": 0.9985
+                }
+              ]
+            },
+            {
+              "metric_name": "validation F1 score",
+              "lower_is_better": false,
+              "description": "F1 score on the validation set.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.702,
+                  "best_value": 0.702
+                }
+              ]
+            },
+            {
+              "metric_name": "test F1 score",
+              "lower_is_better": false,
+              "description": "F1 score on the test set.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.6979,
+                  "best_value": 0.6979
+                }
+              ]
+            },
+            {
+              "metric_name": "systematic generalization accuracy",
+              "lower_is_better": false,
+              "description": "Accuracy for systematic generalization tasks.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.0,
+                  "best_value": 0.0
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 2\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os, pathlib, math, time, json, random\nimport torch, numpy as np\nfrom torch import nn\nfrom torch.utils.data import DataLoader, Dataset\nfrom datasets import DatasetDict, load_dataset\nfrom sklearn.metrics import f1_score\n\n# ---------- dirs / device ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\nexperiment_data = {\n    \"SPR_BENCH\": {\n        \"metrics\": {\"train_f1\": [], \"val_f1\": [], \"test_f1\": None, \"SGA\": None},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n        \"epochs\": [],\n    }\n}\n\n\n# ---------- load SPR_BENCH ----------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(f):\n        return load_dataset(\n            \"csv\", data_files=str(root / f), split=\"train\", cache_dir=\".cache_dsets\"\n        )\n\n    return DatasetDict(\n        train=_load(\"train.csv\"), dev=_load(\"dev.csv\"), test=_load(\"test.csv\")\n    )\n\n\nfor p in [\n    pathlib.Path(\"./SPR_BENCH\"),\n    pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\"),\n]:\n    if p.exists():\n        DATA_PATH = p\n        break\nelse:\n    raise FileNotFoundError(\"SPR_BENCH not found\")\n\nspr = load_spr_bench(DATA_PATH)\n\n# ---------- vocab / labels ----------\nPAD, UNK = \"<PAD>\", \"<UNK>\"\nvocab = [PAD, UNK] + sorted({c for s in spr[\"train\"][\"sequence\"] for c in s})\nstoi = {c: i for i, c in enumerate(vocab)}\nitos = {i: c for c, i in stoi.items()}\nlabel2id = {l: i for i, l in enumerate(sorted(set(spr[\"train\"][\"label\"])))}\nid2label = {i: l for l, i in label2id.items()}\nvocab_size, num_classes = len(vocab), len(label2id)\nMAX_LEN = 64\nprint(f\"vocab_size={vocab_size}, num_classes={num_classes}\")\n\n\ndef encode_seq(seq):\n    ids = [stoi.get(c, stoi[UNK]) for c in seq[:MAX_LEN]]\n    ids += [stoi[PAD]] * (MAX_LEN - len(ids))\n    return ids\n\n\ndef bag_of_symbols(seq):\n    v = np.zeros(vocab_size, dtype=np.float32)\n    for c in seq:\n        v[stoi.get(c, 1)] += 1\n    return v / max(1, len(seq))\n\n\nclass SPRTorchDataset(Dataset):\n    def __init__(self, hf_split):\n        self.seqs, self.labs = hf_split[\"sequence\"], hf_split[\"label\"]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        return {\n            \"input_ids\": torch.tensor(encode_seq(self.seqs[idx]), dtype=torch.long),\n            \"sym_counts\": torch.tensor(\n                bag_of_symbols(self.seqs[idx]), dtype=torch.float32\n            ),\n            \"labels\": torch.tensor(label2id[self.labs[idx]], dtype=torch.long),\n        }\n\n\nbatch_size = 128\ntrain_dl = DataLoader(\n    SPRTorchDataset(spr[\"train\"]), batch_size=batch_size, shuffle=True\n)\nval_dl = DataLoader(SPRTorchDataset(spr[\"dev\"]), batch_size=batch_size)\ntest_dl = DataLoader(SPRTorchDataset(spr[\"test\"]), batch_size=batch_size)\n\n\n# ---------- model ----------\nclass PositionalEncoding(nn.Module):\n    def __init__(self, d_model, max_len=MAX_LEN):\n        super().__init__()\n        pe = torch.zeros(max_len, d_model)\n        pos = torch.arange(0, max_len).unsqueeze(1)\n        div = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))\n        pe[:, 0::2] = torch.sin(pos * div)\n        pe[:, 1::2] = torch.cos(pos * div)\n        self.register_buffer(\"pe\", pe.unsqueeze(0))\n\n    def forward(self, x):\n        return x + self.pe[:, : x.size(1)]\n\n\nclass HybridClassifier(nn.Module):\n    def __init__(self, vocab, d_model, nhead, nlayers, sym_dim, n_classes):\n        super().__init__()\n        self.embed = nn.Embedding(vocab, d_model, padding_idx=0)\n        self.pos = PositionalEncoding(d_model)\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model, nhead, 256, 0.1, batch_first=True\n        )\n        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=nlayers)\n        self.sym_fc = nn.Linear(sym_dim, d_model)\n        self.out = nn.Linear(d_model * 2, n_classes)\n\n    def forward(self, input_ids, sym_counts):\n        mask = input_ids.eq(0)\n        x = self.pos(self.embed(input_ids))\n        x = self.transformer(x, src_key_padding_mask=mask)\n        x.masked_fill_(mask.unsqueeze(-1), 0)\n        seq_repr = x.sum(1) / (~mask).sum(1, keepdim=True).clamp(min=1)\n        sym_repr = torch.relu(self.sym_fc(sym_counts))\n        combined = torch.cat([seq_repr, sym_repr], dim=-1)\n        return self.out(combined)\n\n\nmodel = HybridClassifier(vocab_size, 128, 4, 2, vocab_size, num_classes).to(device)\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n\n\n# ---------- helper ----------\ndef run_epoch(model, dl, train=False):\n    model.train() if train else model.eval()\n    total_loss, preds, labs = 0.0, [], []\n    for batch in dl:\n        batch = {\n            k: (v.to(device) if isinstance(v, torch.Tensor) else v)\n            for k, v in batch.items()\n        }\n        with torch.set_grad_enabled(train):\n            logits = model(batch[\"input_ids\"], batch[\"sym_counts\"])\n            loss = criterion(logits, batch[\"labels\"])\n            if train:\n                optimizer.zero_grad()\n                loss.backward()\n                optimizer.step()\n        total_loss += loss.item() * batch[\"labels\"].size(0)\n        preds.append(logits.argmax(-1).cpu())\n        labs.append(batch[\"labels\"].cpu())\n    preds = torch.cat(preds).numpy()\n    labs = torch.cat(labs).numpy()\n    return (\n        total_loss / len(dl.dataset),\n        f1_score(labs, preds, average=\"macro\"),\n        preds,\n        labs,\n    )\n\n\n# ---------- training ----------\nEPOCHS, best_val = 15, -1\npatience, wait = 3, 0\nfor epoch in range(1, EPOCHS + 1):\n    tr_loss, tr_f1, _, _ = run_epoch(model, train_dl, train=True)\n    vl_loss, vl_f1, _, _ = run_epoch(model, val_dl)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"train\"].append(tr_loss)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"val\"].append(vl_loss)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"train_f1\"].append(tr_f1)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"val_f1\"].append(vl_f1)\n    experiment_data[\"SPR_BENCH\"][\"epochs\"].append(epoch)\n    print(f\"Epoch {epoch}: val_loss={vl_loss:.4f} val_F1={vl_f1:.4f}\")\n    if vl_f1 > best_val:\n        best_val = vl_f1\n        best_state = model.state_dict()\n        wait = 0\n    else:\n        wait += 1\n        if wait >= patience:\n            print(\"Early stop\")\n            break\n\nmodel.load_state_dict(best_state)\n\n# ---------- test ----------\nts_loss, ts_f1, ts_preds, ts_labels = run_epoch(model, test_dl)\nprint(f\"Test macro-F1={ts_f1:.4f}\")\nexperiment_data[\"SPR_BENCH\"][\"metrics\"][\"test_f1\"] = ts_f1\nexperiment_data[\"SPR_BENCH\"][\"predictions\"] = ts_preds.tolist()\nexperiment_data[\"SPR_BENCH\"][\"ground_truth\"] = ts_labels.tolist()\n\n\n# ---------- SGA metric (OOD bigram proxy) ----------\ndef bigrams(seq):\n    return {seq[i : i + 2] for i in range(len(seq) - 1)}\n\n\ntrain_bigrams = set().union(*(bigrams(s) for s in spr[\"train\"][\"sequence\"]))\nood_mask = []\nfor s in spr[\"test\"][\"sequence\"]:\n    ood_mask.append(len(bigrams(s) - train_bigrams) > 0)\nood_mask = np.array(ood_mask)\ncorrect = ts_preds == ts_labels\nSGA = correct[ood_mask].mean() if ood_mask.any() else 0.0\nprint(f\"Systematic Generalization Accuracy (proxy) = {SGA:.4f}\")\nexperiment_data[\"SPR_BENCH\"][\"metrics\"][\"SGA\"] = float(SGA)\n\n# ---------- save ----------\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Saved experiment_data.npy\")\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\nfrom sklearn.metrics import f1_score, confusion_matrix\n\n# ---------- load ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\ntest_scores = {}\n\nfor dset, rec in experiment_data.items():\n    epochs = np.asarray(rec.get(\"epochs\", []))\n    metrics = rec.get(\"metrics\", {})\n    losses = rec.get(\"losses\", {})\n    preds = np.asarray(rec.get(\"predictions\", []))\n    gts = np.asarray(rec.get(\"ground_truth\", []))\n\n    # ---------- plot 1: F1 curves ----------\n    try:\n        if len(epochs) and metrics.get(\"train_f1\") and metrics.get(\"val_f1\"):\n            plt.figure()\n            plt.plot(epochs, metrics[\"train_f1\"], label=\"Train\")\n            plt.plot(epochs, metrics[\"val_f1\"], linestyle=\"--\", label=\"Validation\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Macro-F1\")\n            plt.title(f\"{dset}: Train vs Validation Macro-F1\\nLeft: Train, Right: Val\")\n            plt.legend()\n            plt.tight_layout()\n            plt.savefig(os.path.join(working_dir, f\"{dset}_f1_curves.png\"))\n            plt.close()\n    except Exception as e:\n        print(f\"Error creating F1 plot for {dset}: {e}\")\n        plt.close()\n\n    # ---------- plot 2: Loss curves ----------\n    try:\n        if len(epochs) and losses.get(\"train\") and losses.get(\"val\"):\n            plt.figure()\n            plt.plot(epochs, losses[\"train\"], label=\"Train\")\n            plt.plot(epochs, losses[\"val\"], linestyle=\"--\", label=\"Validation\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Cross-Entropy Loss\")\n            plt.title(f\"{dset}: Train vs Validation Loss\\nLeft: Train, Right: Val\")\n            plt.legend()\n            plt.tight_layout()\n            plt.savefig(os.path.join(working_dir, f\"{dset}_loss_curves.png\"))\n            plt.close()\n    except Exception as e:\n        print(f\"Error creating loss plot for {dset}: {e}\")\n        plt.close()\n\n    # ---------- plot 3: Confusion matrix ----------\n    try:\n        if preds.size and gts.size and preds.shape == gts.shape:\n            cm = confusion_matrix(gts, preds)\n            plt.figure(figsize=(6, 5))\n            im = plt.imshow(cm, cmap=\"Blues\")\n            plt.colorbar(im)\n            plt.title(f\"{dset}: Confusion Matrix\\nLeft: Ground Truth, Right: Predicted\")\n            plt.xlabel(\"Predicted\")\n            plt.ylabel(\"True\")\n            for i in range(cm.shape[0]):\n                for j in range(cm.shape[1]):\n                    plt.text(\n                        j,\n                        i,\n                        cm[i, j],\n                        ha=\"center\",\n                        va=\"center\",\n                        color=\"white\" if cm[i, j] > cm.max() / 2 else \"black\",\n                    )\n            plt.tight_layout()\n            plt.savefig(os.path.join(working_dir, f\"{dset}_confusion_matrix.png\"))\n            plt.close()\n    except Exception as e:\n        print(f\"Error creating confusion matrix for {dset}: {e}\")\n        plt.close()\n\n    # ---------- compute / collect test F1 ----------\n    try:\n        test_f1 = metrics.get(\"test_f1\")\n        if test_f1 is None and preds.size and gts.size:\n            test_f1 = f1_score(gts, preds, average=\"macro\")\n        if test_f1 is not None:\n            test_scores[dset] = float(test_f1)\n    except Exception as e:\n        print(f\"Error computing test F1 for {dset}: {e}\")\n\n# ---------- bar chart across datasets ----------\ntry:\n    if test_scores:\n        plt.figure()\n        keys = list(test_scores.keys())\n        vals = [test_scores[k] for k in keys]\n        plt.bar(keys, vals, color=\"skyblue\")\n        for i, v in enumerate(vals):\n            plt.text(i, v + 0.01, f\"{v:.3f}\", ha=\"center\")\n        plt.ylabel(\"Macro-F1\")\n        plt.title(\"Test Macro-F1 Comparison Across Datasets\")\n        plt.tight_layout()\n        plt.savefig(os.path.join(working_dir, \"datasets_test_f1_comparison.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating comparison bar chart: {e}\")\n    plt.close()\n\n# ---------- print summary ----------\nprint(\"=== Test Macro-F1 Scores ===\")\nfor k, v in test_scores.items():\n    print(f\"{k}: {v:.4f}\")\n",
+      "plot_analyses": [
+        {
+          "analysis": "This plot demonstrates the training and validation Macro-F1 scores over epochs. The training Macro-F1 score increases rapidly and stabilizes near 1.0, indicating the model fits the training data well. However, the validation Macro-F1 score shows minimal improvement, plateauing around 0.7. This suggests possible overfitting, as the model generalizes poorly to unseen validation data.",
+          "plot_path": "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2aa8a7297a8640949d9fb806ec5016e4_proc_3471780/SPR_BENCH_f1_curves.png"
+        },
+        {
+          "analysis": "This plot shows the cross-entropy loss for training and validation over epochs. While the training loss decreases steadily and approaches zero, the validation loss initially decreases but then increases, forming a U-shaped curve. This behavior is indicative of overfitting, where the model learns to minimize training loss at the expense of generalization.",
+          "plot_path": "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2aa8a7297a8640949d9fb806ec5016e4_proc_3471780/SPR_BENCH_loss_curves.png"
+        },
+        {
+          "analysis": "The confusion matrix provides insights into the model's classification performance. It shows 340 true positives and 358 true negatives, indicating the model correctly classifies a significant portion of instances. However, with 146 false positives and 156 false negatives, there is room for improvement in reducing misclassifications, particularly in balancing precision and recall.",
+          "plot_path": "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2aa8a7297a8640949d9fb806ec5016e4_proc_3471780/SPR_BENCH_confusion_matrix.png"
+        },
+        {
+          "analysis": "This bar chart compares the test Macro-F1 score across datasets, with the SPR_BENCH dataset achieving a Macro-F1 score of 0.698. While this performance is close to the stated state-of-the-art benchmark of 0.7, it falls slightly short, indicating that the model requires further optimization or architectural improvements to surpass the benchmark.",
+          "plot_path": "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2aa8a7297a8640949d9fb806ec5016e4_proc_3471780/datasets_test_f1_comparison.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2aa8a7297a8640949d9fb806ec5016e4_proc_3471780/SPR_BENCH_f1_curves.png",
+        "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2aa8a7297a8640949d9fb806ec5016e4_proc_3471780/SPR_BENCH_loss_curves.png",
+        "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2aa8a7297a8640949d9fb806ec5016e4_proc_3471780/SPR_BENCH_confusion_matrix.png",
+        "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2aa8a7297a8640949d9fb806ec5016e4_proc_3471780/datasets_test_f1_comparison.png"
+      ],
+      "vlm_feedback_summary": "The results highlight overfitting as a major concern, with the training performance significantly outpacing validation performance. The confusion matrix reveals a need to improve classification balance, and the test Macro-F1 score, while close to the benchmark, does not exceed it. Further experimentation and architectural adjustments are needed to achieve state-of-the-art performance.",
+      "exp_results_dir": "experiment_results/experiment_2aa8a7297a8640949d9fb806ec5016e4_proc_3471780",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_2aa8a7297a8640949d9fb806ec5016e4_proc_3471780/experiment_data.npy"
+      ]
+    },
+    {
+      "overall_plan": "The overall plan initially focused on refining a Transformer-based model's performance through hyperparameter tuning by varying encoder depths and evaluating using train/validation losses and macro-F1 scores. The optimal configuration was identified as a model with 2 encoder layers. The plan then evolved to introduce a 'symbolic head' to create a neural-symbolic hybrid model, aimed at combining sequential and symbolic reasoning to improve rule generalization, particularly on sequences with novel bigrams. This plan also includes early stopping and the computation of the SGA metric to assess rule generalization. Comprehensive metric tracking remains a key aspect of the evaluation strategy. The current plan being a 'seed node' does not alter these objectives, indicating a continued focus on exploring the neural-symbolic hybrid model and its evaluation.",
+      "analysis": "The execution of the training script completed successfully without errors. The model achieved a test macro-F1 score of 0.6977, which is close to the benchmark's state-of-the-art accuracy of 70.0%. However, the Systematic Generalization Accuracy (SGA) metric was 0.0000, indicating that the model struggled with out-of-distribution (OOD) bigrams. This could be an area for further investigation and improvement in the model's generalization capabilities.",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "training loss",
+              "lower_is_better": true,
+              "description": "Measures the error during training.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.0468,
+                  "best_value": 0.0468
+                }
+              ]
+            },
+            {
+              "metric_name": "validation loss",
+              "lower_is_better": true,
+              "description": "Measures the error during validation.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 1.2678,
+                  "best_value": 1.2678
+                }
+              ]
+            },
+            {
+              "metric_name": "training F1 score",
+              "lower_is_better": false,
+              "description": "F1 score during training.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.9845,
+                  "best_value": 0.9845
+                }
+              ]
+            },
+            {
+              "metric_name": "validation F1 score",
+              "lower_is_better": false,
+              "description": "F1 score during validation.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.696,
+                  "best_value": 0.696
+                }
+              ]
+            },
+            {
+              "metric_name": "test F1 score",
+              "lower_is_better": false,
+              "description": "F1 score on the test dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.6977,
+                  "best_value": 0.6977
+                }
+              ]
+            },
+            {
+              "metric_name": "systematic generalization accuracy",
+              "lower_is_better": false,
+              "description": "Accuracy for systematic generalization.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.0,
+                  "best_value": 0.0
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 1\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os, pathlib, math, time, json, random\nimport torch, numpy as np\nfrom torch import nn\nfrom torch.utils.data import DataLoader, Dataset\nfrom datasets import DatasetDict, load_dataset\nfrom sklearn.metrics import f1_score\n\n# ---------- dirs / device ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\nexperiment_data = {\n    \"SPR_BENCH\": {\n        \"metrics\": {\"train_f1\": [], \"val_f1\": [], \"test_f1\": None, \"SGA\": None},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n        \"epochs\": [],\n    }\n}\n\n\n# ---------- load SPR_BENCH ----------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(f):\n        return load_dataset(\n            \"csv\", data_files=str(root / f), split=\"train\", cache_dir=\".cache_dsets\"\n        )\n\n    return DatasetDict(\n        train=_load(\"train.csv\"), dev=_load(\"dev.csv\"), test=_load(\"test.csv\")\n    )\n\n\nfor p in [\n    pathlib.Path(\"./SPR_BENCH\"),\n    pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\"),\n]:\n    if p.exists():\n        DATA_PATH = p\n        break\nelse:\n    raise FileNotFoundError(\"SPR_BENCH not found\")\n\nspr = load_spr_bench(DATA_PATH)\n\n# ---------- vocab / labels ----------\nPAD, UNK = \"<PAD>\", \"<UNK>\"\nvocab = [PAD, UNK] + sorted({c for s in spr[\"train\"][\"sequence\"] for c in s})\nstoi = {c: i for i, c in enumerate(vocab)}\nitos = {i: c for c, i in stoi.items()}\nlabel2id = {l: i for i, l in enumerate(sorted(set(spr[\"train\"][\"label\"])))}\nid2label = {i: l for l, i in label2id.items()}\nvocab_size, num_classes = len(vocab), len(label2id)\nMAX_LEN = 64\nprint(f\"vocab_size={vocab_size}, num_classes={num_classes}\")\n\n\ndef encode_seq(seq):\n    ids = [stoi.get(c, stoi[UNK]) for c in seq[:MAX_LEN]]\n    ids += [stoi[PAD]] * (MAX_LEN - len(ids))\n    return ids\n\n\ndef bag_of_symbols(seq):\n    v = np.zeros(vocab_size, dtype=np.float32)\n    for c in seq:\n        v[stoi.get(c, 1)] += 1\n    return v / max(1, len(seq))\n\n\nclass SPRTorchDataset(Dataset):\n    def __init__(self, hf_split):\n        self.seqs, self.labs = hf_split[\"sequence\"], hf_split[\"label\"]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        return {\n            \"input_ids\": torch.tensor(encode_seq(self.seqs[idx]), dtype=torch.long),\n            \"sym_counts\": torch.tensor(\n                bag_of_symbols(self.seqs[idx]), dtype=torch.float32\n            ),\n            \"labels\": torch.tensor(label2id[self.labs[idx]], dtype=torch.long),\n        }\n\n\nbatch_size = 128\ntrain_dl = DataLoader(\n    SPRTorchDataset(spr[\"train\"]), batch_size=batch_size, shuffle=True\n)\nval_dl = DataLoader(SPRTorchDataset(spr[\"dev\"]), batch_size=batch_size)\ntest_dl = DataLoader(SPRTorchDataset(spr[\"test\"]), batch_size=batch_size)\n\n\n# ---------- model ----------\nclass PositionalEncoding(nn.Module):\n    def __init__(self, d_model, max_len=MAX_LEN):\n        super().__init__()\n        pe = torch.zeros(max_len, d_model)\n        pos = torch.arange(0, max_len).unsqueeze(1)\n        div = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))\n        pe[:, 0::2] = torch.sin(pos * div)\n        pe[:, 1::2] = torch.cos(pos * div)\n        self.register_buffer(\"pe\", pe.unsqueeze(0))\n\n    def forward(self, x):\n        return x + self.pe[:, : x.size(1)]\n\n\nclass HybridClassifier(nn.Module):\n    def __init__(self, vocab, d_model, nhead, nlayers, sym_dim, n_classes):\n        super().__init__()\n        self.embed = nn.Embedding(vocab, d_model, padding_idx=0)\n        self.pos = PositionalEncoding(d_model)\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model, nhead, 256, 0.1, batch_first=True\n        )\n        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=nlayers)\n        self.sym_fc = nn.Linear(sym_dim, d_model)\n        self.out = nn.Linear(d_model * 2, n_classes)\n\n    def forward(self, input_ids, sym_counts):\n        mask = input_ids.eq(0)\n        x = self.pos(self.embed(input_ids))\n        x = self.transformer(x, src_key_padding_mask=mask)\n        x.masked_fill_(mask.unsqueeze(-1), 0)\n        seq_repr = x.sum(1) / (~mask).sum(1, keepdim=True).clamp(min=1)\n        sym_repr = torch.relu(self.sym_fc(sym_counts))\n        combined = torch.cat([seq_repr, sym_repr], dim=-1)\n        return self.out(combined)\n\n\nmodel = HybridClassifier(vocab_size, 128, 4, 2, vocab_size, num_classes).to(device)\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n\n\n# ---------- helper ----------\ndef run_epoch(model, dl, train=False):\n    model.train() if train else model.eval()\n    total_loss, preds, labs = 0.0, [], []\n    for batch in dl:\n        batch = {\n            k: (v.to(device) if isinstance(v, torch.Tensor) else v)\n            for k, v in batch.items()\n        }\n        with torch.set_grad_enabled(train):\n            logits = model(batch[\"input_ids\"], batch[\"sym_counts\"])\n            loss = criterion(logits, batch[\"labels\"])\n            if train:\n                optimizer.zero_grad()\n                loss.backward()\n                optimizer.step()\n        total_loss += loss.item() * batch[\"labels\"].size(0)\n        preds.append(logits.argmax(-1).cpu())\n        labs.append(batch[\"labels\"].cpu())\n    preds = torch.cat(preds).numpy()\n    labs = torch.cat(labs).numpy()\n    return (\n        total_loss / len(dl.dataset),\n        f1_score(labs, preds, average=\"macro\"),\n        preds,\n        labs,\n    )\n\n\n# ---------- training ----------\nEPOCHS, best_val = 15, -1\npatience, wait = 3, 0\nfor epoch in range(1, EPOCHS + 1):\n    tr_loss, tr_f1, _, _ = run_epoch(model, train_dl, train=True)\n    vl_loss, vl_f1, _, _ = run_epoch(model, val_dl)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"train\"].append(tr_loss)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"val\"].append(vl_loss)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"train_f1\"].append(tr_f1)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"val_f1\"].append(vl_f1)\n    experiment_data[\"SPR_BENCH\"][\"epochs\"].append(epoch)\n    print(f\"Epoch {epoch}: val_loss={vl_loss:.4f} val_F1={vl_f1:.4f}\")\n    if vl_f1 > best_val:\n        best_val = vl_f1\n        best_state = model.state_dict()\n        wait = 0\n    else:\n        wait += 1\n        if wait >= patience:\n            print(\"Early stop\")\n            break\n\nmodel.load_state_dict(best_state)\n\n# ---------- test ----------\nts_loss, ts_f1, ts_preds, ts_labels = run_epoch(model, test_dl)\nprint(f\"Test macro-F1={ts_f1:.4f}\")\nexperiment_data[\"SPR_BENCH\"][\"metrics\"][\"test_f1\"] = ts_f1\nexperiment_data[\"SPR_BENCH\"][\"predictions\"] = ts_preds.tolist()\nexperiment_data[\"SPR_BENCH\"][\"ground_truth\"] = ts_labels.tolist()\n\n\n# ---------- SGA metric (OOD bigram proxy) ----------\ndef bigrams(seq):\n    return {seq[i : i + 2] for i in range(len(seq) - 1)}\n\n\ntrain_bigrams = set().union(*(bigrams(s) for s in spr[\"train\"][\"sequence\"]))\nood_mask = []\nfor s in spr[\"test\"][\"sequence\"]:\n    ood_mask.append(len(bigrams(s) - train_bigrams) > 0)\nood_mask = np.array(ood_mask)\ncorrect = ts_preds == ts_labels\nSGA = correct[ood_mask].mean() if ood_mask.any() else 0.0\nprint(f\"Systematic Generalization Accuracy (proxy) = {SGA:.4f}\")\nexperiment_data[\"SPR_BENCH\"][\"metrics\"][\"SGA\"] = float(SGA)\n\n# ---------- save ----------\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Saved experiment_data.npy\")\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\nfrom sklearn.metrics import f1_score, confusion_matrix\n\n# ---------- load ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\ntest_scores = {}\n\nfor dset, rec in experiment_data.items():\n    epochs = np.asarray(rec.get(\"epochs\", []))\n    metrics = rec.get(\"metrics\", {})\n    losses = rec.get(\"losses\", {})\n    preds = np.asarray(rec.get(\"predictions\", []))\n    gts = np.asarray(rec.get(\"ground_truth\", []))\n\n    # ---------- plot 1: F1 curves ----------\n    try:\n        if len(epochs) and metrics.get(\"train_f1\") and metrics.get(\"val_f1\"):\n            plt.figure()\n            plt.plot(epochs, metrics[\"train_f1\"], label=\"Train\")\n            plt.plot(epochs, metrics[\"val_f1\"], linestyle=\"--\", label=\"Validation\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Macro-F1\")\n            plt.title(f\"{dset}: Train vs Validation Macro-F1\\nLeft: Train, Right: Val\")\n            plt.legend()\n            plt.tight_layout()\n            plt.savefig(os.path.join(working_dir, f\"{dset}_f1_curves.png\"))\n            plt.close()\n    except Exception as e:\n        print(f\"Error creating F1 plot for {dset}: {e}\")\n        plt.close()\n\n    # ---------- plot 2: Loss curves ----------\n    try:\n        if len(epochs) and losses.get(\"train\") and losses.get(\"val\"):\n            plt.figure()\n            plt.plot(epochs, losses[\"train\"], label=\"Train\")\n            plt.plot(epochs, losses[\"val\"], linestyle=\"--\", label=\"Validation\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Cross-Entropy Loss\")\n            plt.title(f\"{dset}: Train vs Validation Loss\\nLeft: Train, Right: Val\")\n            plt.legend()\n            plt.tight_layout()\n            plt.savefig(os.path.join(working_dir, f\"{dset}_loss_curves.png\"))\n            plt.close()\n    except Exception as e:\n        print(f\"Error creating loss plot for {dset}: {e}\")\n        plt.close()\n\n    # ---------- plot 3: Confusion matrix ----------\n    try:\n        if preds.size and gts.size and preds.shape == gts.shape:\n            cm = confusion_matrix(gts, preds)\n            plt.figure(figsize=(6, 5))\n            im = plt.imshow(cm, cmap=\"Blues\")\n            plt.colorbar(im)\n            plt.title(f\"{dset}: Confusion Matrix\\nLeft: Ground Truth, Right: Predicted\")\n            plt.xlabel(\"Predicted\")\n            plt.ylabel(\"True\")\n            for i in range(cm.shape[0]):\n                for j in range(cm.shape[1]):\n                    plt.text(\n                        j,\n                        i,\n                        cm[i, j],\n                        ha=\"center\",\n                        va=\"center\",\n                        color=\"white\" if cm[i, j] > cm.max() / 2 else \"black\",\n                    )\n            plt.tight_layout()\n            plt.savefig(os.path.join(working_dir, f\"{dset}_confusion_matrix.png\"))\n            plt.close()\n    except Exception as e:\n        print(f\"Error creating confusion matrix for {dset}: {e}\")\n        plt.close()\n\n    # ---------- compute / collect test F1 ----------\n    try:\n        test_f1 = metrics.get(\"test_f1\")\n        if test_f1 is None and preds.size and gts.size:\n            test_f1 = f1_score(gts, preds, average=\"macro\")\n        if test_f1 is not None:\n            test_scores[dset] = float(test_f1)\n    except Exception as e:\n        print(f\"Error computing test F1 for {dset}: {e}\")\n\n# ---------- bar chart across datasets ----------\ntry:\n    if test_scores:\n        plt.figure()\n        keys = list(test_scores.keys())\n        vals = [test_scores[k] for k in keys]\n        plt.bar(keys, vals, color=\"skyblue\")\n        for i, v in enumerate(vals):\n            plt.text(i, v + 0.01, f\"{v:.3f}\", ha=\"center\")\n        plt.ylabel(\"Macro-F1\")\n        plt.title(\"Test Macro-F1 Comparison Across Datasets\")\n        plt.tight_layout()\n        plt.savefig(os.path.join(working_dir, \"datasets_test_f1_comparison.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating comparison bar chart: {e}\")\n    plt.close()\n\n# ---------- print summary ----------\nprint(\"=== Test Macro-F1 Scores ===\")\nfor k, v in test_scores.items():\n    print(f\"{k}: {v:.4f}\")\n",
+      "plot_analyses": [
+        {
+          "analysis": "The plot shows the Macro-F1 scores for the training and validation sets over epochs. The training Macro-F1 score increases rapidly and reaches near-perfect performance, indicating that the model fits the training data well. However, the validation Macro-F1 score remains relatively flat and hovers around 0.70, suggesting that the model struggles to generalize and may be overfitting to the training data. This discrepancy highlights the need for regularization techniques or modifications to improve generalization.",
+          "plot_path": "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_83ca157fb0d74585b17303828577c6ab_proc_3471777/SPR_BENCH_f1_curves.png"
+        },
+        {
+          "analysis": "This plot displays the cross-entropy loss for the training and validation sets over epochs. The training loss decreases steadily and stabilizes, reflecting effective learning on the training set. However, the validation loss increases after an initial decrease, showing a divergence between the training and validation performance. This is a clear sign of overfitting, as the model performs well on the training data but fails to generalize to the validation set.",
+          "plot_path": "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_83ca157fb0d74585b17303828577c6ab_proc_3471777/SPR_BENCH_loss_curves.png"
+        },
+        {
+          "analysis": "The confusion matrix illustrates the classification performance on the test set. The model correctly predicts 334 and 364 instances for the two classes, with 152 and 150 misclassifications, respectively. While the performance is relatively balanced across classes, the significant number of misclassifications indicates room for improvement in the model's decision-making process, possibly by enhancing its ability to distinguish between the two classes.",
+          "plot_path": "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_83ca157fb0d74585b17303828577c6ab_proc_3471777/SPR_BENCH_confusion_matrix.png"
+        },
+        {
+          "analysis": "The bar chart shows the test Macro-F1 score for the SPR_BENCH dataset, which is 0.698. This score is slightly below the state-of-the-art benchmark of 0.70, indicating that the current model's performance is close to but does not surpass the benchmark. This result suggests that further optimization or architectural enhancements are needed to achieve state-of-the-art performance.",
+          "plot_path": "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_83ca157fb0d74585b17303828577c6ab_proc_3471777/datasets_test_f1_comparison.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_83ca157fb0d74585b17303828577c6ab_proc_3471777/SPR_BENCH_f1_curves.png",
+        "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_83ca157fb0d74585b17303828577c6ab_proc_3471777/SPR_BENCH_loss_curves.png",
+        "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_83ca157fb0d74585b17303828577c6ab_proc_3471777/SPR_BENCH_confusion_matrix.png",
+        "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_83ca157fb0d74585b17303828577c6ab_proc_3471777/datasets_test_f1_comparison.png"
+      ],
+      "vlm_feedback_summary": "The plots reveal that the model fits the training data well but struggles to generalize, as evidenced by the divergence between training and validation performance. The test Macro-F1 score of 0.698 is close to but slightly below the state-of-the-art benchmark, highlighting the need for further improvements to surpass the benchmark. Overfitting is a significant concern, and strategies to enhance generalization and reduce misclassifications should be prioritized.",
+      "exp_results_dir": "experiment_results/experiment_83ca157fb0d74585b17303828577c6ab_proc_3471777",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_83ca157fb0d74585b17303828577c6ab_proc_3471777/experiment_data.npy"
+      ]
+    },
+    {
+      "overall_plan": "The initial overall plan focused on hyperparameter tuning by training Transformer classifiers with varying encoder depths (1 to 4 layers) and evaluating performance through train/validation losses and macro-F1 scores, storing results for analysis. This stage aimed to determine the optimal configuration for model performance. Subsequently, a 'symbolic head' was introduced to create a neural-symbolic hybrid model, combining sequential and symbolic reasoning, applied to the best configuration from prior experiments (2 encoder layers). Early stopping and the computation of the SGA metric were incorporated to assess rule generalization on sequences with novel bigrams. The current plan, identified as a 'Seed node,' does not present new experimental directions, serving as a baseline or starting point for future work. Therefore, the comprehensive plan continues to prioritize the integration of neural-symbolic approaches and detailed performance evaluation.",
+      "analysis": "",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "training loss",
+              "lower_is_better": true,
+              "description": "The loss value during training phase.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.0395,
+                  "best_value": 0.0395
+                }
+              ]
+            },
+            {
+              "metric_name": "validation loss",
+              "lower_is_better": true,
+              "description": "The loss value during validation phase.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.6846,
+                  "best_value": 0.6846
+                }
+              ]
+            },
+            {
+              "metric_name": "training F1 score",
+              "lower_is_better": false,
+              "description": "The F1 score during training phase.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.989,
+                  "best_value": 0.989
+                }
+              ]
+            },
+            {
+              "metric_name": "validation F1 score",
+              "lower_is_better": false,
+              "description": "The F1 score during validation phase.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.698,
+                  "best_value": 0.698
+                }
+              ]
+            },
+            {
+              "metric_name": "test F1 score",
+              "lower_is_better": false,
+              "description": "The F1 score during testing phase.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.6967,
+                  "best_value": 0.6967
+                }
+              ]
+            },
+            {
+              "metric_name": "systematic generalization accuracy",
+              "lower_is_better": false,
+              "description": "The accuracy for systematic generalization.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.0,
+                  "best_value": 0.0
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 0\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os, pathlib, math, time, json, random\nimport torch, numpy as np\nfrom torch import nn\nfrom torch.utils.data import DataLoader, Dataset\nfrom datasets import DatasetDict, load_dataset\nfrom sklearn.metrics import f1_score\n\n# ---------- dirs / device ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\nexperiment_data = {\n    \"SPR_BENCH\": {\n        \"metrics\": {\"train_f1\": [], \"val_f1\": [], \"test_f1\": None, \"SGA\": None},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n        \"epochs\": [],\n    }\n}\n\n\n# ---------- load SPR_BENCH ----------\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(f):\n        return load_dataset(\n            \"csv\", data_files=str(root / f), split=\"train\", cache_dir=\".cache_dsets\"\n        )\n\n    return DatasetDict(\n        train=_load(\"train.csv\"), dev=_load(\"dev.csv\"), test=_load(\"test.csv\")\n    )\n\n\nfor p in [\n    pathlib.Path(\"./SPR_BENCH\"),\n    pathlib.Path(\"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\"),\n]:\n    if p.exists():\n        DATA_PATH = p\n        break\nelse:\n    raise FileNotFoundError(\"SPR_BENCH not found\")\n\nspr = load_spr_bench(DATA_PATH)\n\n# ---------- vocab / labels ----------\nPAD, UNK = \"<PAD>\", \"<UNK>\"\nvocab = [PAD, UNK] + sorted({c for s in spr[\"train\"][\"sequence\"] for c in s})\nstoi = {c: i for i, c in enumerate(vocab)}\nitos = {i: c for c, i in stoi.items()}\nlabel2id = {l: i for i, l in enumerate(sorted(set(spr[\"train\"][\"label\"])))}\nid2label = {i: l for l, i in label2id.items()}\nvocab_size, num_classes = len(vocab), len(label2id)\nMAX_LEN = 64\nprint(f\"vocab_size={vocab_size}, num_classes={num_classes}\")\n\n\ndef encode_seq(seq):\n    ids = [stoi.get(c, stoi[UNK]) for c in seq[:MAX_LEN]]\n    ids += [stoi[PAD]] * (MAX_LEN - len(ids))\n    return ids\n\n\ndef bag_of_symbols(seq):\n    v = np.zeros(vocab_size, dtype=np.float32)\n    for c in seq:\n        v[stoi.get(c, 1)] += 1\n    return v / max(1, len(seq))\n\n\nclass SPRTorchDataset(Dataset):\n    def __init__(self, hf_split):\n        self.seqs, self.labs = hf_split[\"sequence\"], hf_split[\"label\"]\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        return {\n            \"input_ids\": torch.tensor(encode_seq(self.seqs[idx]), dtype=torch.long),\n            \"sym_counts\": torch.tensor(\n                bag_of_symbols(self.seqs[idx]), dtype=torch.float32\n            ),\n            \"labels\": torch.tensor(label2id[self.labs[idx]], dtype=torch.long),\n        }\n\n\nbatch_size = 128\ntrain_dl = DataLoader(\n    SPRTorchDataset(spr[\"train\"]), batch_size=batch_size, shuffle=True\n)\nval_dl = DataLoader(SPRTorchDataset(spr[\"dev\"]), batch_size=batch_size)\ntest_dl = DataLoader(SPRTorchDataset(spr[\"test\"]), batch_size=batch_size)\n\n\n# ---------- model ----------\nclass PositionalEncoding(nn.Module):\n    def __init__(self, d_model, max_len=MAX_LEN):\n        super().__init__()\n        pe = torch.zeros(max_len, d_model)\n        pos = torch.arange(0, max_len).unsqueeze(1)\n        div = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))\n        pe[:, 0::2] = torch.sin(pos * div)\n        pe[:, 1::2] = torch.cos(pos * div)\n        self.register_buffer(\"pe\", pe.unsqueeze(0))\n\n    def forward(self, x):\n        return x + self.pe[:, : x.size(1)]\n\n\nclass HybridClassifier(nn.Module):\n    def __init__(self, vocab, d_model, nhead, nlayers, sym_dim, n_classes):\n        super().__init__()\n        self.embed = nn.Embedding(vocab, d_model, padding_idx=0)\n        self.pos = PositionalEncoding(d_model)\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model, nhead, 256, 0.1, batch_first=True\n        )\n        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=nlayers)\n        self.sym_fc = nn.Linear(sym_dim, d_model)\n        self.out = nn.Linear(d_model * 2, n_classes)\n\n    def forward(self, input_ids, sym_counts):\n        mask = input_ids.eq(0)\n        x = self.pos(self.embed(input_ids))\n        x = self.transformer(x, src_key_padding_mask=mask)\n        x.masked_fill_(mask.unsqueeze(-1), 0)\n        seq_repr = x.sum(1) / (~mask).sum(1, keepdim=True).clamp(min=1)\n        sym_repr = torch.relu(self.sym_fc(sym_counts))\n        combined = torch.cat([seq_repr, sym_repr], dim=-1)\n        return self.out(combined)\n\n\nmodel = HybridClassifier(vocab_size, 128, 4, 2, vocab_size, num_classes).to(device)\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n\n\n# ---------- helper ----------\ndef run_epoch(model, dl, train=False):\n    model.train() if train else model.eval()\n    total_loss, preds, labs = 0.0, [], []\n    for batch in dl:\n        batch = {\n            k: (v.to(device) if isinstance(v, torch.Tensor) else v)\n            for k, v in batch.items()\n        }\n        with torch.set_grad_enabled(train):\n            logits = model(batch[\"input_ids\"], batch[\"sym_counts\"])\n            loss = criterion(logits, batch[\"labels\"])\n            if train:\n                optimizer.zero_grad()\n                loss.backward()\n                optimizer.step()\n        total_loss += loss.item() * batch[\"labels\"].size(0)\n        preds.append(logits.argmax(-1).cpu())\n        labs.append(batch[\"labels\"].cpu())\n    preds = torch.cat(preds).numpy()\n    labs = torch.cat(labs).numpy()\n    return (\n        total_loss / len(dl.dataset),\n        f1_score(labs, preds, average=\"macro\"),\n        preds,\n        labs,\n    )\n\n\n# ---------- training ----------\nEPOCHS, best_val = 15, -1\npatience, wait = 3, 0\nfor epoch in range(1, EPOCHS + 1):\n    tr_loss, tr_f1, _, _ = run_epoch(model, train_dl, train=True)\n    vl_loss, vl_f1, _, _ = run_epoch(model, val_dl)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"train\"].append(tr_loss)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"val\"].append(vl_loss)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"train_f1\"].append(tr_f1)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"val_f1\"].append(vl_f1)\n    experiment_data[\"SPR_BENCH\"][\"epochs\"].append(epoch)\n    print(f\"Epoch {epoch}: val_loss={vl_loss:.4f} val_F1={vl_f1:.4f}\")\n    if vl_f1 > best_val:\n        best_val = vl_f1\n        best_state = model.state_dict()\n        wait = 0\n    else:\n        wait += 1\n        if wait >= patience:\n            print(\"Early stop\")\n            break\n\nmodel.load_state_dict(best_state)\n\n# ---------- test ----------\nts_loss, ts_f1, ts_preds, ts_labels = run_epoch(model, test_dl)\nprint(f\"Test macro-F1={ts_f1:.4f}\")\nexperiment_data[\"SPR_BENCH\"][\"metrics\"][\"test_f1\"] = ts_f1\nexperiment_data[\"SPR_BENCH\"][\"predictions\"] = ts_preds.tolist()\nexperiment_data[\"SPR_BENCH\"][\"ground_truth\"] = ts_labels.tolist()\n\n\n# ---------- SGA metric (OOD bigram proxy) ----------\ndef bigrams(seq):\n    return {seq[i : i + 2] for i in range(len(seq) - 1)}\n\n\ntrain_bigrams = set().union(*(bigrams(s) for s in spr[\"train\"][\"sequence\"]))\nood_mask = []\nfor s in spr[\"test\"][\"sequence\"]:\n    ood_mask.append(len(bigrams(s) - train_bigrams) > 0)\nood_mask = np.array(ood_mask)\ncorrect = ts_preds == ts_labels\nSGA = correct[ood_mask].mean() if ood_mask.any() else 0.0\nprint(f\"Systematic Generalization Accuracy (proxy) = {SGA:.4f}\")\nexperiment_data[\"SPR_BENCH\"][\"metrics\"][\"SGA\"] = float(SGA)\n\n# ---------- save ----------\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Saved experiment_data.npy\")\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\nfrom sklearn.metrics import f1_score, confusion_matrix\n\n# ---------- load ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\ntest_scores = {}\n\nfor dset, rec in experiment_data.items():\n    epochs = np.asarray(rec.get(\"epochs\", []))\n    metrics = rec.get(\"metrics\", {})\n    losses = rec.get(\"losses\", {})\n    preds = np.asarray(rec.get(\"predictions\", []))\n    gts = np.asarray(rec.get(\"ground_truth\", []))\n\n    # ---------- plot 1: F1 curves ----------\n    try:\n        if len(epochs) and metrics.get(\"train_f1\") and metrics.get(\"val_f1\"):\n            plt.figure()\n            plt.plot(epochs, metrics[\"train_f1\"], label=\"Train\")\n            plt.plot(epochs, metrics[\"val_f1\"], linestyle=\"--\", label=\"Validation\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Macro-F1\")\n            plt.title(f\"{dset}: Train vs Validation Macro-F1\\nLeft: Train, Right: Val\")\n            plt.legend()\n            plt.tight_layout()\n            plt.savefig(os.path.join(working_dir, f\"{dset}_f1_curves.png\"))\n            plt.close()\n    except Exception as e:\n        print(f\"Error creating F1 plot for {dset}: {e}\")\n        plt.close()\n\n    # ---------- plot 2: Loss curves ----------\n    try:\n        if len(epochs) and losses.get(\"train\") and losses.get(\"val\"):\n            plt.figure()\n            plt.plot(epochs, losses[\"train\"], label=\"Train\")\n            plt.plot(epochs, losses[\"val\"], linestyle=\"--\", label=\"Validation\")\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Cross-Entropy Loss\")\n            plt.title(f\"{dset}: Train vs Validation Loss\\nLeft: Train, Right: Val\")\n            plt.legend()\n            plt.tight_layout()\n            plt.savefig(os.path.join(working_dir, f\"{dset}_loss_curves.png\"))\n            plt.close()\n    except Exception as e:\n        print(f\"Error creating loss plot for {dset}: {e}\")\n        plt.close()\n\n    # ---------- plot 3: Confusion matrix ----------\n    try:\n        if preds.size and gts.size and preds.shape == gts.shape:\n            cm = confusion_matrix(gts, preds)\n            plt.figure(figsize=(6, 5))\n            im = plt.imshow(cm, cmap=\"Blues\")\n            plt.colorbar(im)\n            plt.title(f\"{dset}: Confusion Matrix\\nLeft: Ground Truth, Right: Predicted\")\n            plt.xlabel(\"Predicted\")\n            plt.ylabel(\"True\")\n            for i in range(cm.shape[0]):\n                for j in range(cm.shape[1]):\n                    plt.text(\n                        j,\n                        i,\n                        cm[i, j],\n                        ha=\"center\",\n                        va=\"center\",\n                        color=\"white\" if cm[i, j] > cm.max() / 2 else \"black\",\n                    )\n            plt.tight_layout()\n            plt.savefig(os.path.join(working_dir, f\"{dset}_confusion_matrix.png\"))\n            plt.close()\n    except Exception as e:\n        print(f\"Error creating confusion matrix for {dset}: {e}\")\n        plt.close()\n\n    # ---------- compute / collect test F1 ----------\n    try:\n        test_f1 = metrics.get(\"test_f1\")\n        if test_f1 is None and preds.size and gts.size:\n            test_f1 = f1_score(gts, preds, average=\"macro\")\n        if test_f1 is not None:\n            test_scores[dset] = float(test_f1)\n    except Exception as e:\n        print(f\"Error computing test F1 for {dset}: {e}\")\n\n# ---------- bar chart across datasets ----------\ntry:\n    if test_scores:\n        plt.figure()\n        keys = list(test_scores.keys())\n        vals = [test_scores[k] for k in keys]\n        plt.bar(keys, vals, color=\"skyblue\")\n        for i, v in enumerate(vals):\n            plt.text(i, v + 0.01, f\"{v:.3f}\", ha=\"center\")\n        plt.ylabel(\"Macro-F1\")\n        plt.title(\"Test Macro-F1 Comparison Across Datasets\")\n        plt.tight_layout()\n        plt.savefig(os.path.join(working_dir, \"datasets_test_f1_comparison.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating comparison bar chart: {e}\")\n    plt.close()\n\n# ---------- print summary ----------\nprint(\"=== Test Macro-F1 Scores ===\")\nfor k, v in test_scores.items():\n    print(f\"{k}: {v:.4f}\")\n",
+      "plot_analyses": [
+        {
+          "analysis": "The plot shows the Macro-F1 scores for both training and validation datasets across epochs. The training Macro-F1 score rapidly increases and reaches near-perfect performance by epoch 3, stabilizing thereafter. However, the validation Macro-F1 score demonstrates much slower improvement, plateauing around 0.7. This discrepancy indicates potential overfitting, as the model performs significantly better on the training data compared to the validation data.",
+          "plot_path": "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2a759f81326d4a2381cc66d354015197_proc_3471779/SPR_BENCH_f1_curves.png"
+        },
+        {
+          "analysis": "The plot illustrates the cross-entropy loss for training and validation datasets over epochs. Training loss decreases consistently, approaching zero, which is expected as the model learns from the data. However, validation loss initially decreases but starts to increase after epoch 3, forming a U-shape. This pattern is a clear sign of overfitting, as the model starts to memorize the training data rather than generalizing to unseen data.",
+          "plot_path": "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2a759f81326d4a2381cc66d354015197_proc_3471779/SPR_BENCH_loss_curves.png"
+        },
+        {
+          "analysis": "The confusion matrix provides insight into the classification performance of the model. The true positive and true negative counts are relatively high, but the misclassification counts (false positives and false negatives) are also notable. This suggests that while the model has learned the task to some extent, there is still room for improvement in reducing misclassifications, possibly by addressing overfitting or refining the model's reasoning capabilities.",
+          "plot_path": "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2a759f81326d4a2381cc66d354015197_proc_3471779/SPR_BENCH_confusion_matrix.png"
+        },
+        {
+          "analysis": "The bar chart shows the Macro-F1 score on the test dataset, which is approximately 0.697. This score is slightly below the state-of-the-art benchmark of 0.7, indicating that the model is close to but does not yet surpass the benchmark. The results suggest that while the model demonstrates promising performance, additional improvements, such as better regularization or enhanced symbolic reasoning modules, may be necessary to achieve and exceed the benchmark.",
+          "plot_path": "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2a759f81326d4a2381cc66d354015197_proc_3471779/datasets_test_f1_comparison.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2a759f81326d4a2381cc66d354015197_proc_3471779/SPR_BENCH_f1_curves.png",
+        "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2a759f81326d4a2381cc66d354015197_proc_3471779/SPR_BENCH_loss_curves.png",
+        "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2a759f81326d4a2381cc66d354015197_proc_3471779/SPR_BENCH_confusion_matrix.png",
+        "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2a759f81326d4a2381cc66d354015197_proc_3471779/datasets_test_f1_comparison.png"
+      ],
+      "vlm_feedback_summary": "The plots reveal that the model exhibits signs of overfitting, with a significant gap between training and validation performance. The test Macro-F1 score is close to the state-of-the-art benchmark but does not surpass it. Improvements in regularization and symbolic reasoning integration are recommended to enhance generalization and overall performance.",
+      "exp_results_dir": "experiment_results/experiment_2a759f81326d4a2381cc66d354015197_proc_3471779",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_2a759f81326d4a2381cc66d354015197_proc_3471779/experiment_data.npy"
+      ]
+    }
+  ],
+  "aggregated results of nodes with different seeds": {
+    "overall_plan": "The overall plan began with hyperparameter tuning of Transformer classifiers, varying encoder depths from 1 to 4 layers, and evaluating via train/validation losses and macro-F1 scores. This phase identified the optimal configuration with 2 encoder layers. Building on this, a 'symbolic head' was introduced to create a neural-symbolic hybrid model to enhance sequential and symbolic reasoning capabilities. Additional methodological improvements included early stopping and the SGA metric to evaluate rule generalization on sequences with novel bigrams. The current plan focuses on aggregating results from multiple seeds to ensure reliability and robustness, accounting for variability from random initializations. This comprehensive strategy emphasizes both innovative model development and rigorous evaluation, demonstrating a commitment to scientific progress.",
+    "metric": {
+      "value": null,
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# plotting aggregation code",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ---------- basic set-up ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- load every run ----------\nexperiment_data_path_list = [\n    \"experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2a759f81326d4a2381cc66d354015197_proc_3471779/experiment_data.npy\",\n    \"experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_83ca157fb0d74585b17303828577c6ab_proc_3471777/experiment_data.npy\",\n    \"experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/experiment_2aa8a7297a8640949d9fb806ec5016e4_proc_3471780/experiment_data.npy\",\n]\n\nall_experiment_data = []\nfor p in experiment_data_path_list:\n    try:\n        data = np.load(\n            os.path.join(os.getenv(\"AI_SCIENTIST_ROOT\", \"\"), p), allow_pickle=True\n        ).item()\n        all_experiment_data.append(data)\n    except Exception as e:\n        print(f\"Error loading {p}: {e}\")\n\n# ---------- aggregate by dataset ----------\nagg = {}\nfor run in all_experiment_data:\n    for dset, rec in run.items():\n        ds = agg.setdefault(\n            dset,\n            {\n                \"epochs\": [],\n                \"train_f1\": [],\n                \"val_f1\": [],\n                \"train_loss\": [],\n                \"val_loss\": [],\n                \"test_f1\": [],\n            },\n        )\n        epochs = np.asarray(rec.get(\"epochs\", []))\n        m = rec.get(\"metrics\", {})\n        l = rec.get(\"losses\", {})\n        if len(epochs):\n            ds[\"epochs\"].append(epochs)\n        if m.get(\"train_f1\") is not None:\n            ds[\"train_f1\"].append(np.asarray(m[\"train_f1\"]))\n        if m.get(\"val_f1\") is not None:\n            ds[\"val_f1\"].append(np.asarray(m[\"val_f1\"]))\n        if l.get(\"train\") is not None:\n            ds[\"train_loss\"].append(np.asarray(l[\"train\"]))\n        if l.get(\"val\") is not None:\n            ds[\"val_loss\"].append(np.asarray(l[\"val\"]))\n        test_f1 = m.get(\"test_f1\")\n        if test_f1 is not None:\n            ds[\"test_f1\"].append(test_f1)\n\n\n# ---------- helper ----------\ndef stack_and_crop(list_of_arr):\n    \"\"\"stack 1D arrays along axis 0, cropping to min length\"\"\"\n    if len(list_of_arr) == 0:\n        return None\n    min_len = min([len(a) for a in list_of_arr])\n    arr = np.stack([a[:min_len] for a in list_of_arr], axis=0)\n    return arr\n\n\n# ---------- create plots ----------\nfor dset, rec in agg.items():\n    # epochs (use first run, already cropped)\n    ep_stack = stack_and_crop(rec[\"epochs\"])\n    if ep_stack is None:\n        continue\n    epochs = ep_stack[0]  # all equal length after crop\n\n    # ----- F1 curves -----\n    try:\n        tr_stack = stack_and_crop(rec[\"train_f1\"])\n        val_stack = stack_and_crop(rec[\"val_f1\"])\n        if tr_stack is not None and val_stack is not None:\n            tr_mean, tr_sem = tr_stack.mean(0), tr_stack.std(0) / np.sqrt(\n                tr_stack.shape[0]\n            )\n            val_mean, val_sem = val_stack.mean(0), val_stack.std(0) / np.sqrt(\n                val_stack.shape[0]\n            )\n            plt.figure()\n            plt.plot(epochs, tr_mean, label=\"Train mean\")\n            plt.fill_between(\n                epochs,\n                tr_mean - tr_sem,\n                tr_mean + tr_sem,\n                alpha=0.3,\n                label=\"Train \u00b1SEM\",\n            )\n            plt.plot(epochs, val_mean, linestyle=\"--\", label=\"Validation mean\")\n            plt.fill_between(\n                epochs,\n                val_mean - val_sem,\n                val_mean + val_sem,\n                alpha=0.3,\n                label=\"Val \u00b1SEM\",\n            )\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Macro-F1\")\n            plt.title(\n                f\"{dset}: Aggregated Train/Val Macro-F1\\n(shaded: \u00b1SEM, n={tr_stack.shape[0]})\"\n            )\n            plt.legend()\n            plt.tight_layout()\n            plt.savefig(os.path.join(working_dir, f\"{dset}_aggregate_f1_curves.png\"))\n    except Exception as e:\n        print(f\"Error creating aggregated F1 for {dset}: {e}\")\n    finally:\n        plt.close()\n\n    # ----- Loss curves -----\n    try:\n        tr_l_stack = stack_and_crop(rec[\"train_loss\"])\n        val_l_stack = stack_and_crop(rec[\"val_loss\"])\n        if tr_l_stack is not None and val_l_stack is not None:\n            tr_mean, tr_sem = tr_l_stack.mean(0), tr_l_stack.std(0) / np.sqrt(\n                tr_l_stack.shape[0]\n            )\n            val_mean, val_sem = val_l_stack.mean(0), val_l_stack.std(0) / np.sqrt(\n                val_l_stack.shape[0]\n            )\n            plt.figure()\n            plt.plot(epochs, tr_mean, label=\"Train mean\")\n            plt.fill_between(\n                epochs,\n                tr_mean - tr_sem,\n                tr_mean + tr_sem,\n                alpha=0.3,\n                label=\"Train \u00b1SEM\",\n            )\n            plt.plot(epochs, val_mean, linestyle=\"--\", label=\"Validation mean\")\n            plt.fill_between(\n                epochs,\n                val_mean - val_sem,\n                val_mean + val_sem,\n                alpha=0.3,\n                label=\"Val \u00b1SEM\",\n            )\n            plt.xlabel(\"Epoch\")\n            plt.ylabel(\"Loss\")\n            plt.title(\n                f\"{dset}: Aggregated Train/Val Loss\\n(shaded: \u00b1SEM, n={tr_l_stack.shape[0]})\"\n            )\n            plt.legend()\n            plt.tight_layout()\n            plt.savefig(os.path.join(working_dir, f\"{dset}_aggregate_loss_curves.png\"))\n    except Exception as e:\n        print(f\"Error creating aggregated Loss for {dset}: {e}\")\n    finally:\n        plt.close()\n\n# ---------- aggregated bar chart of test-F1 ----------\ntry:\n    names, means, sems = [], [], []\n    for dset, rec in agg.items():\n        if len(rec[\"test_f1\"]):\n            arr = np.asarray(rec[\"test_f1\"], dtype=float)\n            names.append(dset)\n            means.append(arr.mean())\n            sems.append(arr.std() / np.sqrt(len(arr)))\n    if names:\n        idx = np.arange(len(names))\n        plt.figure()\n        plt.bar(idx, means, yerr=sems, capsize=5, color=\"skyblue\")\n        plt.xticks(idx, names, rotation=45, ha=\"right\")\n        for i, (m, s) in enumerate(zip(means, sems)):\n            plt.text(i, m + 0.01, f\"{m:.3f}\u00b1{s:.3f}\", ha=\"center\")\n        plt.ylabel(\"Macro-F1\")\n        plt.title(\n            \"Aggregated Test Macro-F1 Across Datasets (bars: mean, whiskers: \u00b1SEM)\"\n        )\n        plt.tight_layout()\n        plt.savefig(os.path.join(working_dir, \"aggregate_test_f1_comparison.png\"))\nexcept Exception as e:\n    print(f\"Error creating aggregated test F1 bar chart: {e}\")\nfinally:\n    plt.close()\n\n# ---------- console summary ----------\nprint(\"=== Aggregated Test Macro-F1 (mean \u00b1 SEM) ===\")\nfor n, m, s in zip(names, means, sems):\n    print(f\"{n}: {m:.4f} \u00b1 {s:.4f}\")\n",
+    "plot_analyses": [],
+    "plot_paths": [
+      "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/seed_aggregation_55b47dec53224fa98ed04e2672bae7e1/SPR_BENCH_aggregate_f1_curves.png",
+      "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/seed_aggregation_55b47dec53224fa98ed04e2672bae7e1/SPR_BENCH_aggregate_loss_curves.png",
+      "experiments/2025-08-17_23-44-17_conceptual_generalization_poly_rule_attempt_0/logs/0-run/experiment_results/seed_aggregation_55b47dec53224fa98ed04e2672bae7e1/aggregate_test_f1_comparison.png"
+    ],
+    "vlm_feedback_summary": [],
+    "exp_results_dir": "experiment_results/seed_aggregation_55b47dec53224fa98ed04e2672bae7e1",
+    "exp_results_npy_files": []
+  }
+}

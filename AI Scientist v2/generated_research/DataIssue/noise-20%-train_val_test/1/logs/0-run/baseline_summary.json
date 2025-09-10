@@ -1,0 +1,103 @@
+{
+  "best node": {
+    "overall_plan": "A robust fix is to make the script automatically discover the SPR_BENCH folder instead of assuming it lies inside the experiment working directory.  \nWe try, in order, (i) explicit environment variables, (ii) common relative paths, and (iii) the absolute path shown in the prompt; the first candidate that contains the three CSV files is taken.  \nBecause positional-embedding length was hard-coded to 500, the model may crash on longer sequences, so we compute the maximum training length and size the positional matrix accordingly.  \nFinally, we ensure that tensors are placed on the correct device inside the training / evaluation loops (the collate-fn now leaves them on CPU).",
+    "analysis": "The execution of the training script was successful without any bugs. The dataset was loaded correctly, and the training process proceeded as expected. The model achieved a validation accuracy of 79.60% and a test accuracy of 79.50%, which is close to the state-of-the-art benchmark of 80.0%. The experiment data was successfully saved for further analysis.",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "train accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy of the model on the training dataset",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.7985,
+                "best_value": 0.7985
+              }
+            ]
+          },
+          {
+            "metric_name": "validation accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy of the model on the validation dataset",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.796,
+                "best_value": 0.796
+              }
+            ]
+          },
+          {
+            "metric_name": "train loss",
+            "lower_is_better": true,
+            "description": "Loss of the model on the training dataset",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.5048,
+                "best_value": 0.5048
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "Loss of the model on the validation dataset",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.5144,
+                "best_value": 0.5144
+              }
+            ]
+          },
+          {
+            "metric_name": "test accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy of the model on the test dataset",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.795,
+                "best_value": 0.795
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, pathlib, time, numpy as np, torch, math\nfrom torch import nn\nfrom torch.utils.data import Dataset, DataLoader\nfrom datasets import load_dataset, DatasetDict\n\n# -----------------------------------------------------------------------------#\n# directories / device\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# -----------------------------------------------------------------------------#\n# locate SPR_BENCH  -----------------------------------------------------------#\ndef _find_spr_bench() -> pathlib.Path:\n    \"\"\"Return a Path that contains train.csv/dev.csv/test.csv for SPR_BENCH.\"\"\"\n    # candidate roots (ordered)\n    candidates = [\n        pathlib.Path(os.getenv(\"SPR_DATA\", \"\")),\n        pathlib.Path(os.getenv(\"SPR_DATASET_PATH\", \"\")),\n        pathlib.Path(\"./SPR_BENCH\").resolve(),\n        pathlib.Path(\"../SPR_BENCH\").resolve(),\n        pathlib.Path(\n            \"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\"\n        ).resolve(),  # prompt default\n    ]\n    files = {\"train.csv\", \"dev.csv\", \"test.csv\"}\n    for c in candidates:\n        if c and c.exists() and files.issubset({p.name for p in c.iterdir()}):\n            print(f\"Found SPR_BENCH at: {c}\")\n            return c\n    raise FileNotFoundError(\n        \"Could not locate SPR_BENCH.  Set SPR_DATA or SPR_DATASET_PATH env var.\"\n    )\n\n\n# -----------------------------------------------------------------------------#\n# dataset loading helper (from prompt) ----------------------------------------#\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(split_csv: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / split_csv),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    dset = DatasetDict()\n    for split in (\"train\", \"dev\", \"test\"):\n        dset[split] = _load(f\"{split}.csv\")\n    return dset\n\n\n# -----------------------------------------------------------------------------#\n# PyTorch dataset -------------------------------------------------------------#\nclass SPRCharDataset(Dataset):\n    def __init__(self, hf_dataset, vocab):\n        self.data = hf_dataset\n        self.vocab = vocab\n        self.pad_id = vocab[\"<pad>\"]\n\n    def __len__(self):\n        return len(self.data)\n\n    def _encode(self, seq: str):\n        seq = seq.replace(\" \", \"\")\n        return torch.tensor([self.vocab[ch] for ch in seq], dtype=torch.long)\n\n    def __getitem__(self, idx):\n        row = self.data[idx]\n        return {\n            \"input_ids\": self._encode(row[\"sequence\"]),\n            \"labels\": torch.tensor(int(row[\"label\"]), dtype=torch.long),\n        }\n\n\ndef build_vocab(train_split):\n    chars = set()\n    for ex in train_split:\n        chars.update(ex[\"sequence\"].replace(\" \", \"\"))\n    vocab = {\"<pad>\": 0}\n    for ch in sorted(chars):\n        vocab[ch] = len(vocab)\n    return vocab\n\n\ndef collate_fn(batch, pad_id=0):\n    seqs = [b[\"input_ids\"] for b in batch]\n    labels = torch.stack([b[\"labels\"] for b in batch])\n    padded = nn.utils.rnn.pad_sequence(seqs, batch_first=True, padding_value=pad_id)\n    attention_mask = (padded != pad_id).long()\n    return {\"input_ids\": padded, \"attention_mask\": attention_mask, \"labels\": labels}\n\n\n# -----------------------------------------------------------------------------#\n# model -----------------------------------------------------------------------#\nclass SimpleTransformerClassifier(nn.Module):\n    def __init__(\n        self,\n        vocab_size,\n        num_labels,\n        max_len,\n        d_model=64,\n        nhead=4,\n        num_layers=2,\n        dim_ff=128,\n        dropout=0.1,\n    ):\n        super().__init__()\n        self.embed = nn.Embedding(vocab_size, d_model, padding_idx=0)\n        self.pos_embed = nn.Parameter(torch.zeros(max_len, d_model))\n        nn.init.trunc_normal_(self.pos_embed, std=0.02)\n        enc_layer = nn.TransformerEncoderLayer(d_model, nhead, dim_ff, dropout)\n        self.encoder = nn.TransformerEncoder(enc_layer, num_layers)\n        self.classifier = nn.Linear(d_model, num_labels)\n\n    def forward(self, input_ids, attention_mask):\n        seq_len = input_ids.size(1)\n        pos = self.pos_embed[:seq_len, :].unsqueeze(0)  # 1,S,E\n        x = self.embed(input_ids) + pos  # B,S,E\n        x = x.transpose(0, 1)  # S,B,E\n        x = self.encoder(x, src_key_padding_mask=~attention_mask.bool())\n        x = x.transpose(0, 1)  # B,S,E\n        pooled = (x * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(\n            1, keepdim=True\n        )\n        return self.classifier(pooled)\n\n\n# -----------------------------------------------------------------------------#\n# train / eval loops -----------------------------------------------------------#\ndef run_epoch(model, loader, criterion, optimizer=None):\n    train_mode = optimizer is not None\n    model.train() if train_mode else model.eval()\n    epoch_loss, correct, total = 0.0, 0, 0\n    with torch.set_grad_enabled(train_mode):\n        for batch in loader:\n            # move to device\n            batch = {\n                k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()\n            }\n            outputs = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n            loss = criterion(outputs, batch[\"labels\"])\n            if train_mode:\n                optimizer.zero_grad()\n                loss.backward()\n                optimizer.step()\n            epoch_loss += loss.item() * batch[\"labels\"].size(0)\n            preds = outputs.argmax(1)\n            correct += (preds == batch[\"labels\"]).sum().item()\n            total += batch[\"labels\"].size(0)\n    return epoch_loss / total, correct / total\n\n\n# -----------------------------------------------------------------------------#\n# experiment data structure ---------------------------------------------------#\nexperiment_data = {\n    \"SPR_BENCH\": {\n        \"metrics\": {\"train_acc\": [], \"val_acc\": []},\n        \"losses\": {\"train_loss\": [], \"val_loss\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n}\n\n# -----------------------------------------------------------------------------#\n# main pipeline (auto-exec) ---------------------------------------------------#\ndata_dir = _find_spr_bench()\nspr = load_spr_bench(data_dir)\nprint(\"Loaded SPR_BENCH splits:\", list(spr.keys()))\n\nvocab = build_vocab(spr[\"train\"])\nprint(f\"Vocab size: {len(vocab)}\")\n\n# determine max sequence length\nmax_len = max(len(ex[\"sequence\"].replace(\" \", \"\")) for ex in spr[\"train\"])\nprint(f\"Max sequence length in training set: {max_len}\")\n\n# datasets / loaders\ntrain_ds = SPRCharDataset(spr[\"train\"], vocab)\ndev_ds = SPRCharDataset(spr[\"dev\"], vocab)\ntest_ds = SPRCharDataset(spr[\"test\"], vocab)\n\ntrain_loader = DataLoader(\n    train_ds,\n    batch_size=64,\n    shuffle=True,\n    collate_fn=lambda b: collate_fn(b, pad_id=vocab[\"<pad>\"]),\n)\ndev_loader = DataLoader(\n    dev_ds,\n    batch_size=128,\n    shuffle=False,\n    collate_fn=lambda b: collate_fn(b, pad_id=vocab[\"<pad>\"]),\n)\ntest_loader = DataLoader(\n    test_ds,\n    batch_size=128,\n    shuffle=False,\n    collate_fn=lambda b: collate_fn(b, pad_id=vocab[\"<pad>\"]),\n)\n\nnum_labels = len(set(int(ex[\"label\"]) for ex in spr[\"train\"]))\nmodel = SimpleTransformerClassifier(len(vocab), num_labels, max_len=max_len).to(device)\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.Adam(model.parameters(), lr=1e-3)\n\n# training loop\nepochs = 10\nfor epoch in range(1, epochs + 1):\n    t_loss, t_acc = run_epoch(model, train_loader, criterion, optimizer)\n    v_loss, v_acc = run_epoch(model, dev_loader, criterion, optimizer=None)\n    print(\n        f\"Epoch {epoch}: train_loss={t_loss:.4f}, val_loss={v_loss:.4f}, val_acc={v_acc*100:.2f}%\"\n    )\n\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"train_loss\"].append(t_loss)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"val_loss\"].append(v_loss)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"train_acc\"].append(t_acc)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"val_acc\"].append(v_acc)\n\n# final test evaluation\ntest_loss, test_acc = run_epoch(model, test_loader, criterion, optimizer=None)\nprint(f\"Test accuracy: {test_acc*100:.2f}%\")\n\n# store predictions / ground truth\nmodel.eval()\nwith torch.no_grad():\n    for batch in test_loader:\n        batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}\n        logits = model(batch[\"input_ids\"], batch[\"attention_mask\"])\n        preds = logits.argmax(1).cpu().numpy()\n        experiment_data[\"SPR_BENCH\"][\"predictions\"].extend(preds)\n        experiment_data[\"SPR_BENCH\"][\"ground_truth\"].extend(\n            batch[\"labels\"].cpu().numpy()\n        )\n\n# save results\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(f'Experiment data saved to {os.path.join(working_dir, \"experiment_data.npy\")}')\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# set up working directory\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# --------------------------------------------------------------------- #\n# load experiment results\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\n# proceed only if data are present\nif \"SPR_BENCH\" in experiment_data:\n    data = experiment_data[\"SPR_BENCH\"]\n    train_loss = np.array(data[\"losses\"][\"train_loss\"])\n    val_loss = np.array(data[\"losses\"][\"val_loss\"])\n    train_acc = np.array(data[\"metrics\"][\"train_acc\"])\n    val_acc = np.array(data[\"metrics\"][\"val_acc\"])\n    epochs = np.arange(1, len(train_loss) + 1)\n\n    # ----------------------------------------------------------------- #\n    # 1. Loss curves\n    try:\n        plt.figure()\n        plt.plot(epochs, train_loss, label=\"Train Loss\")\n        plt.plot(epochs, val_loss, label=\"Validation Loss\")\n        plt.title(\"SPR_BENCH Loss Curves (Sequence Classification)\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Cross-Entropy Loss\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"spr_bench_loss_curves.png\"))\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating loss curve: {e}\")\n        plt.close()\n\n    # ----------------------------------------------------------------- #\n    # 2. Accuracy curves\n    try:\n        plt.figure()\n        plt.plot(epochs, train_acc, label=\"Train Accuracy\")\n        plt.plot(epochs, val_acc, label=\"Validation Accuracy\")\n        plt.title(\"SPR_BENCH Accuracy Curves (Sequence Classification)\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Accuracy\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"spr_bench_accuracy_curves.png\"))\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating accuracy curve: {e}\")\n        plt.close()\n\n    # ----------------------------------------------------------------- #\n    # 3. Confusion matrix on test set\n    try:\n        preds = np.array(data[\"predictions\"])\n        gts = np.array(data[\"ground_truth\"])\n        num_classes = int(max(preds.max(), gts.max()) + 1)\n        cm = np.zeros((num_classes, num_classes), dtype=int)\n        for gt, pr in zip(gts, preds):\n            cm[gt, pr] += 1\n\n        plt.figure()\n        im = plt.imshow(cm, cmap=\"Blues\")\n        plt.colorbar(im)\n        plt.title(\"SPR_BENCH Confusion Matrix (Test Set)\")\n        plt.xlabel(\"Predicted\")\n        plt.ylabel(\"Ground Truth\")\n        ticks = np.arange(num_classes)\n        plt.xticks(ticks)\n        plt.yticks(ticks)\n        plt.savefig(os.path.join(working_dir, \"spr_bench_confusion_matrix.png\"))\n        plt.close()\n\n        test_acc = (preds == gts).mean()\n        print(f\"Test accuracy from saved predictions: {test_acc*100:.2f}%\")\n    except Exception as e:\n        print(f\"Error creating confusion matrix: {e}\")\n        plt.close()\nelse:\n    print(\"SPR_BENCH data not found in experiment_data.npy\")\n",
+    "plot_plan": "The script first loads the saved experiment_data.npy, extracts the SPR_BENCH training/validation losses and accuracies, and derives the epoch indices. It then plots (1) the loss curves and (2) the accuracy curves, each in its own try-except block, saving the figures with descriptive names in working_dir. Next, it computes a confusion matrix from the stored test\u2010set predictions and ground truths, plots it with class labels, and prints the overall test accuracy. All figures are closed after saving. No synthetic data are created; every plot strictly reflects the contents of experiment_data.npy.",
+    "plot_analyses": [
+      {
+        "analysis": "The loss curves indicate that the model is converging well. Both the training and validation loss decrease significantly in the initial epochs, with the validation loss stabilizing around epoch 4. The gap between training and validation loss is minimal, suggesting that the model is not overfitting. However, the slight fluctuations in validation loss after epoch 4 could indicate some sensitivity to the dataset or hyperparameter settings.",
+        "plot_path": "experiments/2025-08-17_00-43-58_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_89abcd2ab84b4fb89db44a3c173d28b4_proc_3154414/spr_bench_loss_curves.png"
+      },
+      {
+        "analysis": "The accuracy curves show consistent improvement over the epochs. Both training and validation accuracies reach a plateau near 80%, which aligns with the state-of-the-art (SOTA) benchmark accuracy mentioned in the hypothesis. The close tracking of validation accuracy with training accuracy is a positive sign, indicating good generalization. Further fine-tuning or architectural adjustments may be needed to surpass the SOTA.",
+        "plot_path": "experiments/2025-08-17_00-43-58_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_89abcd2ab84b4fb89db44a3c173d28b4_proc_3154414/spr_bench_accuracy_curves.png"
+      },
+      {
+        "analysis": "The confusion matrix for the test set reveals a strong performance, with a high number of correctly classified samples for both classes. The balance in the confusion matrix suggests that the model is not biased toward any particular class. However, the exact number of misclassifications could be analyzed further to identify specific patterns or sequences that the model struggles with.",
+        "plot_path": "experiments/2025-08-17_00-43-58_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_89abcd2ab84b4fb89db44a3c173d28b4_proc_3154414/spr_bench_confusion_matrix.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_00-43-58_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_89abcd2ab84b4fb89db44a3c173d28b4_proc_3154414/spr_bench_loss_curves.png",
+      "experiments/2025-08-17_00-43-58_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_89abcd2ab84b4fb89db44a3c173d28b4_proc_3154414/spr_bench_accuracy_curves.png",
+      "experiments/2025-08-17_00-43-58_contextual_embedding_spr_attempt_0/logs/0-run/experiment_results/experiment_89abcd2ab84b4fb89db44a3c173d28b4_proc_3154414/spr_bench_confusion_matrix.png"
+    ],
+    "vlm_feedback_summary": "The plots demonstrate that the model is performing well, with good convergence and generalization. The accuracy is approaching the SOTA benchmark, and the confusion matrix suggests balanced performance across classes. Further analysis and fine-tuning could help in achieving or exceeding the SOTA performance.",
+    "exp_results_dir": "experiment_results/experiment_89abcd2ab84b4fb89db44a3c173d28b4_proc_3154414",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_89abcd2ab84b4fb89db44a3c173d28b4_proc_3154414/experiment_data.npy"
+    ]
+  },
+  "best node with different seeds": []
+}

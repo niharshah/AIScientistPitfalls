@@ -1,0 +1,4 @@
+import matplotlib.pyplot as plt
+import numpy as np
+
+We will load experiment_data.npy, extract the SPR_BENCH metrics, and generate up to three plots: (1) Train vs. validation loss over epochs; (2) the three weighted-accuracy curves (CWA, SWA, CWA2); (3) a 2×2 confusion-matrix heat-map for predictions vs. ground-truth from the last epoch. Each figure is wrapped in its own try-except block, titled clearly, saved to working_dir with descriptive names, and the figure is always closed. After plotting, we print the final-epoch metrics to verify extraction. Only data found in experiment_data.npy are used; no values are fabricated.

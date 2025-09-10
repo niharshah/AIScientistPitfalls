@@ -1,0 +1,4 @@
+import matplotlib.pyplot as plt
+import numpy as np
+
+We will load the stored experiment_data, pick the ConstantNodeFeatures–SPR entry, and extract epochs, train/val losses, and the three weighted accuracies. For each of the four quantities (loss, CWA, SWA, CmpWA) we generate one line plot that overlays training and validation curves (where applicable), use clear titles and save into working_dir with descriptive filenames. All plotting is wrapped in individual try-except blocks, figures are always closed, and we print the test-set metrics after plotting. Only data present in the .npy file are accessed; if a key is missing the corresponding plot is skipped gracefully. This yields at most four figures, satisfying the “≤5” constraint, and gives a concise visual summary of the experiment.

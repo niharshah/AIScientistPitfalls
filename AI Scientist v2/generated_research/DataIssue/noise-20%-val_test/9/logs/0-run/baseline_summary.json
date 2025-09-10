@@ -1,0 +1,489 @@
+{
+  "best node": {
+    "overall_plan": "The previous script halted during training because the batch dictionary was built incorrectly and no optimization step was performed. I rewrote the training loop to correctly unpack TensorDataset batches, move tensors to the selected device, perform forward / backward passes, and update the optimizer. I also normalised bag-of-character inputs by sequence length, added validation monitoring, stored metrics (including a simple Rule-Based Accuracy that uses the most influential character per class as an extracted \u201crule\u201d), and persisted all collected data to the working directory. The code now runs end-to-end, printing epoch-level losses and accuracies, and saving the experiment data for later analysis.",
+    "analysis": "The execution of the training script was successful, and no bugs were detected. The model was trained on the SPR_BENCH dataset, achieving a final test accuracy of 77.3% and a Rule-Based Accuracy (RBA) of 66.2%. The experiment data was successfully saved for further analysis. The implementation demonstrates basic functional correctness and meets the goals of the preliminary sub-stage.",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "train accuracy",
+            "lower_is_better": false,
+            "description": "The accuracy of the model on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.9335,
+                "best_value": 0.9335
+              }
+            ]
+          },
+          {
+            "metric_name": "validation accuracy",
+            "lower_is_better": false,
+            "description": "The accuracy of the model on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.764,
+                "best_value": 0.764
+              }
+            ]
+          },
+          {
+            "metric_name": "rule-based accuracy",
+            "lower_is_better": false,
+            "description": "The accuracy of the rule-based approach for the dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.662,
+                "best_value": 0.662
+              }
+            ]
+          },
+          {
+            "metric_name": "training loss",
+            "lower_is_better": true,
+            "description": "The loss of the model on the training dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.647695,
+                "best_value": 0.647695
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "The loss of the model on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.666328,
+                "best_value": 0.666328
+              }
+            ]
+          },
+          {
+            "metric_name": "test accuracy",
+            "lower_is_better": false,
+            "description": "The accuracy of the model on the test dataset.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.773,
+                "best_value": 0.773
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\nimport time\nimport pathlib\nfrom typing import Dict\n\nimport numpy as np\nimport torch\nfrom torch import nn\nfrom torch.utils.data import TensorDataset, DataLoader\nfrom datasets import load_dataset, DatasetDict\n\n# ---------------- Device ---------------- #\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n# ---------------- Hyper-params ---------------- #\nBATCH_SIZE = 256\nVAL_BATCH = 512\nLR = 1e-2\nEPOCHS = 10\nRULE_TOP_K = 1  # characters per class that constitute the symbolic \u201crule\u201d\n\n\n# ---------------- Dataset loading ---------------- #\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(csv_name: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for split in [\"train\", \"dev\", \"test\"]:\n        d[split] = _load(f\"{split}.csv\")\n    return d\n\n\nDATA_PATH = pathlib.Path(\n    os.getenv(\"SPR_DATASET_PATH\", \"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\n)\nspr_bench = load_spr_bench(DATA_PATH)\nprint(\"Loaded splits:\", spr_bench.keys())\n\n# ---------------- Vocabulary ---------------- #\nall_chars = set()\nfor seq in spr_bench[\"train\"][\"sequence\"]:\n    all_chars.update(seq)\nchar2idx = {c: i for i, c in enumerate(sorted(all_chars))}\nidx2char = {i: c for c, i in char2idx.items()}\nvocab_size = len(char2idx)\nprint(f\"Vocab size = {vocab_size}\")\n\n\ndef seq_to_vec(seq: str) -> np.ndarray:\n    \"\"\"Bag-of-chars (frequency).\"\"\"\n    vec = np.zeros(vocab_size, dtype=np.float32)\n    for ch in seq:\n        vec[char2idx[ch]] += 1.0\n    if len(seq) > 0:  # normalise\n        vec /= len(seq)\n    return vec\n\n\ndef prepare_split(split):\n    X = np.stack([seq_to_vec(s) for s in split[\"sequence\"]])\n    y = np.array(split[\"label\"], dtype=np.int64)\n    return torch.from_numpy(X), torch.from_numpy(y)\n\n\nX_train, y_train = prepare_split(spr_bench[\"train\"])\nX_dev, y_dev = prepare_split(spr_bench[\"dev\"])\nX_test, y_test = prepare_split(spr_bench[\"test\"])\n\nnum_classes = int(max(y_train.max(), y_dev.max(), y_test.max()) + 1)\nprint(f\"Number of classes: {num_classes}\")\n\n# ---------------- DataLoaders ---------------- #\ntrain_loader = DataLoader(\n    TensorDataset(X_train, y_train), batch_size=BATCH_SIZE, shuffle=True\n)\nval_loader = DataLoader(TensorDataset(X_dev, y_dev), batch_size=VAL_BATCH)\ntest_loader = DataLoader(TensorDataset(X_test, y_test), batch_size=VAL_BATCH)\n\n\n# ---------------- Model ---------------- #\nclass CharBagLinear(nn.Module):\n    def __init__(self, in_dim: int, num_cls: int):\n        super().__init__()\n        self.linear = nn.Linear(in_dim, num_cls)\n\n    def forward(self, x):\n        return self.linear(x)\n\n\nmodel = CharBagLinear(vocab_size, num_classes).to(device)\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.Adam(model.parameters(), lr=LR)\n\n# ---------------- Experiment store ---------------- #\nexperiment_data = {\n    \"SPR_BENCH\": {\n        \"metrics\": {\"train_acc\": [], \"val_acc\": [], \"RBA\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"timestamps\": [],\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n}\n\n\n# ---------------- Helper: evaluation ---------------- #\ndef evaluate(loader):\n    model.eval()\n    total, correct, loss_sum = 0, 0, 0.0\n    with torch.no_grad():\n        for xb, yb in loader:\n            xb, yb = xb.to(device), yb.to(device)\n            logits = model(xb)\n            loss = criterion(logits, yb)\n            preds = logits.argmax(1)\n            total += yb.size(0)\n            correct += (preds == yb).sum().item()\n            loss_sum += loss.item() * yb.size(0)\n    return correct / total, loss_sum / total\n\n\n# ---------------- Helper: Rule-Based Accuracy (RBA) ---------------- #\ndef compute_rule_accuracy(loader):\n    \"\"\"\n    Build a trivial symbolic rule set: for each class, pick the top-K\n    characters with highest weight. Predict by counting occurrences of those\n    characters and picking the class with max count.\n    \"\"\"\n    with torch.no_grad():\n        W = model.linear.weight.detach().cpu().numpy()  # [C, V]\n    # top K indices per class\n    top_idx = np.argsort(W, axis=1)[:, -RULE_TOP_K:]  # [C, K]\n\n    total, correct = 0, 0\n    for xb, yb in loader:\n        seq_vectors = xb.numpy()  # frequencies\n        # revert to counts to avoid floating\n        counts = (seq_vectors * 1000).astype(int)  # arbitrary scaling\n        preds = []\n        for count_vec in counts:\n            votes = []\n            for cls in range(num_classes):\n                votes.append(count_vec[top_idx[cls]].sum())\n            preds.append(int(np.argmax(votes)))\n        preds = torch.tensor(preds)\n        correct += (preds == yb).sum().item()\n        total += yb.size(0)\n    return correct / total\n\n\n# ---------------- Training loop ---------------- #\nfor epoch in range(1, EPOCHS + 1):\n    model.train()\n    running_loss, running_correct, seen = 0.0, 0, 0\n    start_t = time.time()\n    for xb, yb in train_loader:\n        xb, yb = xb.to(device), yb.to(device)\n        optimizer.zero_grad()\n        logits = model(xb)\n        loss = criterion(logits, yb)\n        loss.backward()\n        optimizer.step()\n\n        preds = logits.argmax(1)\n        running_loss += loss.item() * yb.size(0)\n        running_correct += (preds == yb).sum().item()\n        seen += yb.size(0)\n\n    train_acc = running_correct / seen\n    train_loss = running_loss / seen\n    val_acc, val_loss = evaluate(val_loader)\n    rba = compute_rule_accuracy(val_loader)\n\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"train_acc\"].append(train_acc)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"val_acc\"].append(val_acc)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"RBA\"].append(rba)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"train\"].append(train_loss)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"val\"].append(val_loss)\n    experiment_data[\"SPR_BENCH\"][\"timestamps\"].append(time.time())\n\n    print(\n        f\"Epoch {epoch:02d}: \"\n        f\"train_loss={train_loss:.4f}, train_acc={train_acc:.3f} | \"\n        f\"val_loss={val_loss:.4f}, val_acc={val_acc:.3f} | \"\n        f\"RBA={rba:.3f} | \"\n        f\"epoch_time={time.time()-start_t:.1f}s\"\n    )\n\n# ---------------- Final test evaluation ---------------- #\ntest_acc, test_loss = evaluate(test_loader)\nrba_test = compute_rule_accuracy(test_loader)\nprint(f\"\\nTest set: loss={test_loss:.4f}, acc={test_acc:.3f}, RBA={rba_test:.3f}\")\n\n# Store final predictions for interpretability\nmodel.eval()\nall_preds, all_gts = [], []\nwith torch.no_grad():\n    for xb, yb in test_loader:\n        xb = xb.to(device)\n        logits = model(xb)\n        preds = logits.argmax(1).cpu()\n        all_preds.append(preds)\n        all_gts.append(yb)\nexperiment_data[\"SPR_BENCH\"][\"predictions\"] = torch.cat(all_preds).numpy()\nexperiment_data[\"SPR_BENCH\"][\"ground_truth\"] = torch.cat(all_gts).numpy()\n\n# ---------------- Save everything ---------------- #\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(f\"\\nExperiment data saved to {os.path.join(working_dir, 'experiment_data.npy')}\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ----- paths -----\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ----- load data -----\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\ndata = experiment_data.get(\"SPR_BENCH\", {})\n\n\n# Helper to safely fetch arrays\ndef get(arr, key):\n    return arr.get(key, [])\n\n\nmetrics = data.get(\"metrics\", {})\nlosses = data.get(\"losses\", {})\n\n# Plot 1: Accuracy curves\ntry:\n    train_acc = np.array(get(metrics, \"train_acc\"))\n    val_acc = np.array(get(metrics, \"val_acc\"))\n    if train_acc.size and val_acc.size:\n        plt.figure()\n        epochs = np.arange(1, len(train_acc) + 1)\n        plt.plot(epochs, train_acc, label=\"Train Acc\")\n        plt.plot(epochs, val_acc, label=\"Val Acc\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Accuracy\")\n        plt.title(\"SPR_BENCH: Train vs Validation Accuracy\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_accuracy_curves.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating accuracy plot: {e}\")\n    plt.close()\n\n# Plot 2: Loss curves\ntry:\n    train_loss = np.array(get(losses, \"train\"))\n    val_loss = np.array(get(losses, \"val\"))\n    if train_loss.size and val_loss.size:\n        plt.figure()\n        epochs = np.arange(1, len(train_loss) + 1)\n        plt.plot(epochs, train_loss, label=\"Train Loss\")\n        plt.plot(epochs, val_loss, label=\"Val Loss\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Cross-Entropy Loss\")\n        plt.title(\"SPR_BENCH: Train vs Validation Loss\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_loss_curves.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating loss plot: {e}\")\n    plt.close()\n\n# Plot 3: RBA vs Validation Accuracy\ntry:\n    rba = np.array(get(metrics, \"RBA\"))\n    val_acc = np.array(get(metrics, \"val_acc\"))\n    if rba.size and val_acc.size:\n        plt.figure()\n        epochs = np.arange(1, len(rba) + 1)\n        plt.plot(epochs, val_acc, label=\"Val Acc\")\n        plt.plot(epochs, rba, label=\"RBA\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Accuracy\")\n        plt.title(\"SPR_BENCH: Validation Accuracy vs Rule-Based Accuracy\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_rba_vs_val.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating RBA plot: {e}\")\n    plt.close()\n\n# Plot 4: Confusion Matrix\ntry:\n    preds = np.array(data.get(\"predictions\", []))\n    gts = np.array(data.get(\"ground_truth\", []))\n    if preds.size and gts.size and preds.shape == gts.shape:\n        n_cls = int(max(preds.max(), gts.max()) + 1)\n        cm = np.zeros((n_cls, n_cls), dtype=int)\n        for p, t in zip(preds, gts):\n            cm[t, p] += 1\n        plt.figure(figsize=(6, 5))\n        plt.imshow(cm, cmap=\"Blues\")\n        plt.colorbar()\n        plt.xlabel(\"Predicted\")\n        plt.ylabel(\"Ground Truth\")\n        plt.title(\"SPR_BENCH: Confusion Matrix (Test Set)\")\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_confusion_matrix.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating confusion matrix: {e}\")\n    plt.close()\n\n# ----- evaluation metric -----\nif \"predictions\" in data and \"ground_truth\" in data:\n    preds = np.array(data[\"predictions\"])\n    gts = np.array(data[\"ground_truth\"])\n    if preds.size and preds.shape == gts.shape:\n        test_acc = (preds == gts).mean()\n        print(f\"Test Accuracy: {test_acc:.3f}\")\n",
+    "plot_plan": "We load experiment_data.npy, extract the single entry SPR_BENCH, and retrieve the arrays for train/val accuracy, train/val loss, and rule-based accuracy (RBA). Using matplotlib we create up to four figures: (1) train vs validation accuracy across epochs, (2) train vs validation loss across epochs, (3) comparison of validation accuracy and RBA, and (4) a confusion matrix of final test predictions vs ground truth. Each figure is built in its own try-except block, saved to working_dir with descriptive names, titled clearly, and the figure is always closed. If the required data for a plot is missing, the corresponding except block reports the issue without stopping the script. After plotting, we compute and print the final test accuracy directly from stored predictions/ground_truth. All code is concise, relies only on numpy and matplotlib, and respects the directory and plotting guidelines. Finally, the script prints the computed evaluation metric(s) so users can verify performance without opening the plots.",
+    "plot_analyses": [
+      {
+        "analysis": "The training accuracy increases steadily and reaches above 90% by the 10th epoch, indicating that the model is learning the task effectively on the training data. However, the validation accuracy shows a less pronounced improvement, plateauing around 80%. This suggests potential overfitting, as the model performs better on the training data than on unseen validation data.",
+        "plot_path": "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_95dbf5af5c80492d9c949248fc35830e_proc_3198575/SPR_BENCH_accuracy_curves.png"
+      },
+      {
+        "analysis": "The training loss decreases consistently, showing that the model is effectively minimizing the objective function on the training data. The validation loss also decreases but at a slower rate, which aligns with the validation accuracy plateau observed earlier. This supports the potential overfitting hypothesis.",
+        "plot_path": "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_95dbf5af5c80492d9c949248fc35830e_proc_3198575/SPR_BENCH_loss_curves.png"
+      },
+      {
+        "analysis": "Validation accuracy outperforms the rule-based accuracy (RBA) starting from the 5th epoch, indicating that the neural model is learning patterns beyond the baseline rules. However, the fluctuations in validation accuracy suggest that the model's generalization ability may still need improvement.",
+        "plot_path": "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_95dbf5af5c80492d9c949248fc35830e_proc_3198575/SPR_BENCH_rba_vs_val.png"
+      },
+      {
+        "analysis": "The confusion matrix shows that the model performs reasonably well on the test set, with a high number of correct predictions (diagonal elements). However, there is still room for improvement as some misclassifications are evident, particularly in one of the classes.",
+        "plot_path": "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_95dbf5af5c80492d9c949248fc35830e_proc_3198575/SPR_BENCH_confusion_matrix.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_95dbf5af5c80492d9c949248fc35830e_proc_3198575/SPR_BENCH_accuracy_curves.png",
+      "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_95dbf5af5c80492d9c949248fc35830e_proc_3198575/SPR_BENCH_loss_curves.png",
+      "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_95dbf5af5c80492d9c949248fc35830e_proc_3198575/SPR_BENCH_rba_vs_val.png",
+      "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_95dbf5af5c80492d9c949248fc35830e_proc_3198575/SPR_BENCH_confusion_matrix.png"
+    ],
+    "vlm_feedback_summary": "The experimental results indicate that the model is learning effectively on the training data but shows signs of overfitting as the validation performance plateaus. The neural model surpasses the rule-based baseline in validation accuracy, demonstrating its capability to learn complex patterns. However, further efforts are needed to improve generalization and reduce misclassifications, as indicated by the confusion matrix.",
+    "exp_results_dir": "experiment_results/experiment_95dbf5af5c80492d9c949248fc35830e_proc_3198575",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_95dbf5af5c80492d9c949248fc35830e_proc_3198575/experiment_data.npy"
+    ]
+  },
+  "best node with different seeds": [
+    {
+      "overall_plan": "The overall plan began with addressing key issues in the training script, specifically correcting the batch dictionary construction, and revising the training loop to ensure proper data handling and optimization processes. Enhancements such as input normalization, validation monitoring, and comprehensive metric tracking were implemented to enable the script to run entirely and produce valuable data for analysis. The current plan, being a seed node, sets the stage for future experiments or developments, building upon the robust and stable framework established by the previous corrections and improvements.",
+      "analysis": "",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "train accuracy",
+              "lower_is_better": false,
+              "description": "The accuracy achieved on the training dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.912,
+                  "best_value": 0.912
+                }
+              ]
+            },
+            {
+              "metric_name": "validation accuracy",
+              "lower_is_better": false,
+              "description": "The accuracy achieved on the validation dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.736,
+                  "best_value": 0.736
+                }
+              ]
+            },
+            {
+              "metric_name": "rule-based accuracy",
+              "lower_is_better": false,
+              "description": "The accuracy achieved using a rule-based approach.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.644,
+                  "best_value": 0.644
+                }
+              ]
+            },
+            {
+              "metric_name": "training loss",
+              "lower_is_better": true,
+              "description": "The loss value on the training dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.654037,
+                  "best_value": 0.654037
+                }
+              ]
+            },
+            {
+              "metric_name": "validation loss",
+              "lower_is_better": true,
+              "description": "The loss value on the validation dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.670362,
+                  "best_value": 0.670362
+                }
+              ]
+            },
+            {
+              "metric_name": "test accuracy",
+              "lower_is_better": false,
+              "description": "The accuracy achieved on the test dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.74,
+                  "best_value": 0.74
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 2\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\nimport time\nimport pathlib\nfrom typing import Dict\n\nimport numpy as np\nimport torch\nfrom torch import nn\nfrom torch.utils.data import TensorDataset, DataLoader\nfrom datasets import load_dataset, DatasetDict\n\n# ---------------- Device ---------------- #\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n# ---------------- Hyper-params ---------------- #\nBATCH_SIZE = 256\nVAL_BATCH = 512\nLR = 1e-2\nEPOCHS = 10\nRULE_TOP_K = 1  # characters per class that constitute the symbolic \u201crule\u201d\n\n\n# ---------------- Dataset loading ---------------- #\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(csv_name: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for split in [\"train\", \"dev\", \"test\"]:\n        d[split] = _load(f\"{split}.csv\")\n    return d\n\n\nDATA_PATH = pathlib.Path(\n    os.getenv(\"SPR_DATASET_PATH\", \"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\n)\nspr_bench = load_spr_bench(DATA_PATH)\nprint(\"Loaded splits:\", spr_bench.keys())\n\n# ---------------- Vocabulary ---------------- #\nall_chars = set()\nfor seq in spr_bench[\"train\"][\"sequence\"]:\n    all_chars.update(seq)\nchar2idx = {c: i for i, c in enumerate(sorted(all_chars))}\nidx2char = {i: c for c, i in char2idx.items()}\nvocab_size = len(char2idx)\nprint(f\"Vocab size = {vocab_size}\")\n\n\ndef seq_to_vec(seq: str) -> np.ndarray:\n    \"\"\"Bag-of-chars (frequency).\"\"\"\n    vec = np.zeros(vocab_size, dtype=np.float32)\n    for ch in seq:\n        vec[char2idx[ch]] += 1.0\n    if len(seq) > 0:  # normalise\n        vec /= len(seq)\n    return vec\n\n\ndef prepare_split(split):\n    X = np.stack([seq_to_vec(s) for s in split[\"sequence\"]])\n    y = np.array(split[\"label\"], dtype=np.int64)\n    return torch.from_numpy(X), torch.from_numpy(y)\n\n\nX_train, y_train = prepare_split(spr_bench[\"train\"])\nX_dev, y_dev = prepare_split(spr_bench[\"dev\"])\nX_test, y_test = prepare_split(spr_bench[\"test\"])\n\nnum_classes = int(max(y_train.max(), y_dev.max(), y_test.max()) + 1)\nprint(f\"Number of classes: {num_classes}\")\n\n# ---------------- DataLoaders ---------------- #\ntrain_loader = DataLoader(\n    TensorDataset(X_train, y_train), batch_size=BATCH_SIZE, shuffle=True\n)\nval_loader = DataLoader(TensorDataset(X_dev, y_dev), batch_size=VAL_BATCH)\ntest_loader = DataLoader(TensorDataset(X_test, y_test), batch_size=VAL_BATCH)\n\n\n# ---------------- Model ---------------- #\nclass CharBagLinear(nn.Module):\n    def __init__(self, in_dim: int, num_cls: int):\n        super().__init__()\n        self.linear = nn.Linear(in_dim, num_cls)\n\n    def forward(self, x):\n        return self.linear(x)\n\n\nmodel = CharBagLinear(vocab_size, num_classes).to(device)\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.Adam(model.parameters(), lr=LR)\n\n# ---------------- Experiment store ---------------- #\nexperiment_data = {\n    \"SPR_BENCH\": {\n        \"metrics\": {\"train_acc\": [], \"val_acc\": [], \"RBA\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"timestamps\": [],\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n}\n\n\n# ---------------- Helper: evaluation ---------------- #\ndef evaluate(loader):\n    model.eval()\n    total, correct, loss_sum = 0, 0, 0.0\n    with torch.no_grad():\n        for xb, yb in loader:\n            xb, yb = xb.to(device), yb.to(device)\n            logits = model(xb)\n            loss = criterion(logits, yb)\n            preds = logits.argmax(1)\n            total += yb.size(0)\n            correct += (preds == yb).sum().item()\n            loss_sum += loss.item() * yb.size(0)\n    return correct / total, loss_sum / total\n\n\n# ---------------- Helper: Rule-Based Accuracy (RBA) ---------------- #\ndef compute_rule_accuracy(loader):\n    \"\"\"\n    Build a trivial symbolic rule set: for each class, pick the top-K\n    characters with highest weight. Predict by counting occurrences of those\n    characters and picking the class with max count.\n    \"\"\"\n    with torch.no_grad():\n        W = model.linear.weight.detach().cpu().numpy()  # [C, V]\n    # top K indices per class\n    top_idx = np.argsort(W, axis=1)[:, -RULE_TOP_K:]  # [C, K]\n\n    total, correct = 0, 0\n    for xb, yb in loader:\n        seq_vectors = xb.numpy()  # frequencies\n        # revert to counts to avoid floating\n        counts = (seq_vectors * 1000).astype(int)  # arbitrary scaling\n        preds = []\n        for count_vec in counts:\n            votes = []\n            for cls in range(num_classes):\n                votes.append(count_vec[top_idx[cls]].sum())\n            preds.append(int(np.argmax(votes)))\n        preds = torch.tensor(preds)\n        correct += (preds == yb).sum().item()\n        total += yb.size(0)\n    return correct / total\n\n\n# ---------------- Training loop ---------------- #\nfor epoch in range(1, EPOCHS + 1):\n    model.train()\n    running_loss, running_correct, seen = 0.0, 0, 0\n    start_t = time.time()\n    for xb, yb in train_loader:\n        xb, yb = xb.to(device), yb.to(device)\n        optimizer.zero_grad()\n        logits = model(xb)\n        loss = criterion(logits, yb)\n        loss.backward()\n        optimizer.step()\n\n        preds = logits.argmax(1)\n        running_loss += loss.item() * yb.size(0)\n        running_correct += (preds == yb).sum().item()\n        seen += yb.size(0)\n\n    train_acc = running_correct / seen\n    train_loss = running_loss / seen\n    val_acc, val_loss = evaluate(val_loader)\n    rba = compute_rule_accuracy(val_loader)\n\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"train_acc\"].append(train_acc)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"val_acc\"].append(val_acc)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"RBA\"].append(rba)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"train\"].append(train_loss)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"val\"].append(val_loss)\n    experiment_data[\"SPR_BENCH\"][\"timestamps\"].append(time.time())\n\n    print(\n        f\"Epoch {epoch:02d}: \"\n        f\"train_loss={train_loss:.4f}, train_acc={train_acc:.3f} | \"\n        f\"val_loss={val_loss:.4f}, val_acc={val_acc:.3f} | \"\n        f\"RBA={rba:.3f} | \"\n        f\"epoch_time={time.time()-start_t:.1f}s\"\n    )\n\n# ---------------- Final test evaluation ---------------- #\ntest_acc, test_loss = evaluate(test_loader)\nrba_test = compute_rule_accuracy(test_loader)\nprint(f\"\\nTest set: loss={test_loss:.4f}, acc={test_acc:.3f}, RBA={rba_test:.3f}\")\n\n# Store final predictions for interpretability\nmodel.eval()\nall_preds, all_gts = [], []\nwith torch.no_grad():\n    for xb, yb in test_loader:\n        xb = xb.to(device)\n        logits = model(xb)\n        preds = logits.argmax(1).cpu()\n        all_preds.append(preds)\n        all_gts.append(yb)\nexperiment_data[\"SPR_BENCH\"][\"predictions\"] = torch.cat(all_preds).numpy()\nexperiment_data[\"SPR_BENCH\"][\"ground_truth\"] = torch.cat(all_gts).numpy()\n\n# ---------------- Save everything ---------------- #\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(f\"\\nExperiment data saved to {os.path.join(working_dir, 'experiment_data.npy')}\")\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ----- paths -----\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ----- load data -----\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\ndata = experiment_data.get(\"SPR_BENCH\", {})\n\n\n# Helper to safely fetch arrays\ndef get(arr, key):\n    return arr.get(key, [])\n\n\nmetrics = data.get(\"metrics\", {})\nlosses = data.get(\"losses\", {})\n\n# Plot 1: Accuracy curves\ntry:\n    train_acc = np.array(get(metrics, \"train_acc\"))\n    val_acc = np.array(get(metrics, \"val_acc\"))\n    if train_acc.size and val_acc.size:\n        plt.figure()\n        epochs = np.arange(1, len(train_acc) + 1)\n        plt.plot(epochs, train_acc, label=\"Train Acc\")\n        plt.plot(epochs, val_acc, label=\"Val Acc\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Accuracy\")\n        plt.title(\"SPR_BENCH: Train vs Validation Accuracy\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_accuracy_curves.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating accuracy plot: {e}\")\n    plt.close()\n\n# Plot 2: Loss curves\ntry:\n    train_loss = np.array(get(losses, \"train\"))\n    val_loss = np.array(get(losses, \"val\"))\n    if train_loss.size and val_loss.size:\n        plt.figure()\n        epochs = np.arange(1, len(train_loss) + 1)\n        plt.plot(epochs, train_loss, label=\"Train Loss\")\n        plt.plot(epochs, val_loss, label=\"Val Loss\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Cross-Entropy Loss\")\n        plt.title(\"SPR_BENCH: Train vs Validation Loss\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_loss_curves.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating loss plot: {e}\")\n    plt.close()\n\n# Plot 3: RBA vs Validation Accuracy\ntry:\n    rba = np.array(get(metrics, \"RBA\"))\n    val_acc = np.array(get(metrics, \"val_acc\"))\n    if rba.size and val_acc.size:\n        plt.figure()\n        epochs = np.arange(1, len(rba) + 1)\n        plt.plot(epochs, val_acc, label=\"Val Acc\")\n        plt.plot(epochs, rba, label=\"RBA\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Accuracy\")\n        plt.title(\"SPR_BENCH: Validation Accuracy vs Rule-Based Accuracy\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_rba_vs_val.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating RBA plot: {e}\")\n    plt.close()\n\n# Plot 4: Confusion Matrix\ntry:\n    preds = np.array(data.get(\"predictions\", []))\n    gts = np.array(data.get(\"ground_truth\", []))\n    if preds.size and gts.size and preds.shape == gts.shape:\n        n_cls = int(max(preds.max(), gts.max()) + 1)\n        cm = np.zeros((n_cls, n_cls), dtype=int)\n        for p, t in zip(preds, gts):\n            cm[t, p] += 1\n        plt.figure(figsize=(6, 5))\n        plt.imshow(cm, cmap=\"Blues\")\n        plt.colorbar()\n        plt.xlabel(\"Predicted\")\n        plt.ylabel(\"Ground Truth\")\n        plt.title(\"SPR_BENCH: Confusion Matrix (Test Set)\")\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_confusion_matrix.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating confusion matrix: {e}\")\n    plt.close()\n\n# ----- evaluation metric -----\nif \"predictions\" in data and \"ground_truth\" in data:\n    preds = np.array(data[\"predictions\"])\n    gts = np.array(data[\"ground_truth\"])\n    if preds.size and preds.shape == gts.shape:\n        test_acc = (preds == gts).mean()\n        print(f\"Test Accuracy: {test_acc:.3f}\")\n",
+      "plot_analyses": [
+        {
+          "analysis": "This plot shows the training and validation accuracy over epochs. Training accuracy steadily increases, reaching over 90%, while validation accuracy fluctuates significantly, peaking around 75%. This indicates potential overfitting, as the model performs well on the training data but struggles to generalize to the validation set. The fluctuations in validation accuracy suggest that the model might be sensitive to the validation data distribution or that the learning rate could be too high.",
+          "plot_path": "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_5677ab331cb645589beb2cedcbd57ec7_proc_3204921/SPR_BENCH_accuracy_curves.png"
+        },
+        {
+          "analysis": "This plot depicts the training and validation loss over epochs. Training loss decreases consistently, indicating that the model is learning from the training data. Validation loss also decreases but at a slower rate, suggesting that the model is improving on the validation set but not as effectively as on the training set. The gap between training and validation loss further supports the observation of overfitting.",
+          "plot_path": "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_5677ab331cb645589beb2cedcbd57ec7_proc_3204921/SPR_BENCH_loss_curves.png"
+        },
+        {
+          "analysis": "This plot compares validation accuracy with rule-based accuracy (RBA) over epochs. Validation accuracy surpasses RBA, showcasing the neural model's ability to outperform traditional rule-based methods. However, the fluctuations in validation accuracy highlight potential instability in the learning process. The steady RBA line provides a baseline for comparison, emphasizing the model's potential when it stabilizes.",
+          "plot_path": "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_5677ab331cb645589beb2cedcbd57ec7_proc_3204921/SPR_BENCH_rba_vs_val.png"
+        },
+        {
+          "analysis": "The confusion matrix for the test set shows the distribution of predictions against ground truth labels. The diagonal dominance indicates that the model correctly classifies most instances. However, there is noticeable misclassification in both classes, suggesting room for improvement in the model's discriminative ability. Balancing precision and recall could help address these issues.",
+          "plot_path": "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_5677ab331cb645589beb2cedcbd57ec7_proc_3204921/SPR_BENCH_confusion_matrix.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_5677ab331cb645589beb2cedcbd57ec7_proc_3204921/SPR_BENCH_accuracy_curves.png",
+        "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_5677ab331cb645589beb2cedcbd57ec7_proc_3204921/SPR_BENCH_loss_curves.png",
+        "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_5677ab331cb645589beb2cedcbd57ec7_proc_3204921/SPR_BENCH_rba_vs_val.png",
+        "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_5677ab331cb645589beb2cedcbd57ec7_proc_3204921/SPR_BENCH_confusion_matrix.png"
+      ],
+      "vlm_feedback_summary": "The experimental results suggest that while the model achieves high training accuracy and outperforms rule-based accuracy on validation, it exhibits signs of overfitting and instability in validation performance. The confusion matrix indicates decent classification performance but highlights areas for improvement in minimizing misclassifications.",
+      "exp_results_dir": "experiment_results/experiment_5677ab331cb645589beb2cedcbd57ec7_proc_3204921",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_5677ab331cb645589beb2cedcbd57ec7_proc_3204921/experiment_data.npy"
+      ]
+    },
+    {
+      "overall_plan": "The overall plan integrates the previous efforts to address critical training script issues, such as incorrect batch dictionary construction and missing optimization steps, by rewriting the training loop for proper unpacking of TensorDataset batches, device management, and execution of forward/backward passes with optimizer updates. Enhancements included normalizing bag-of-character inputs, validation monitoring, and storing metrics like Rule-Based Accuracy. These efforts culminated in a functional end-to-end code with epoch-level insights and saved experiment data. The current plan, being a seed node, marks the commencement of a new phase, laying the groundwork for subsequent exploration or refinement, building on the improved training framework from the previous phase.",
+      "analysis": "",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "train accuracy",
+              "lower_is_better": false,
+              "description": "Accuracy of the model on the training dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.9095,
+                  "best_value": 0.9095
+                }
+              ]
+            },
+            {
+              "metric_name": "validation accuracy",
+              "lower_is_better": false,
+              "description": "Accuracy of the model on the validation dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.742,
+                  "best_value": 0.742
+                }
+              ]
+            },
+            {
+              "metric_name": "rule-based accuracy",
+              "lower_is_better": false,
+              "description": "Accuracy of the rule-based system.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.644,
+                  "best_value": 0.644
+                }
+              ]
+            },
+            {
+              "metric_name": "training loss",
+              "lower_is_better": true,
+              "description": "Loss of the model on the training dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.649738,
+                  "best_value": 0.649738
+                }
+              ]
+            },
+            {
+              "metric_name": "validation loss",
+              "lower_is_better": true,
+              "description": "Loss of the model on the validation dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.66763,
+                  "best_value": 0.66763
+                }
+              ]
+            },
+            {
+              "metric_name": "test accuracy",
+              "lower_is_better": false,
+              "description": "Accuracy of the model on the test dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.745,
+                  "best_value": 0.745
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 0\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\nimport time\nimport pathlib\nfrom typing import Dict\n\nimport numpy as np\nimport torch\nfrom torch import nn\nfrom torch.utils.data import TensorDataset, DataLoader\nfrom datasets import load_dataset, DatasetDict\n\n# ---------------- Device ---------------- #\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n# ---------------- Hyper-params ---------------- #\nBATCH_SIZE = 256\nVAL_BATCH = 512\nLR = 1e-2\nEPOCHS = 10\nRULE_TOP_K = 1  # characters per class that constitute the symbolic \u201crule\u201d\n\n\n# ---------------- Dataset loading ---------------- #\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(csv_name: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for split in [\"train\", \"dev\", \"test\"]:\n        d[split] = _load(f\"{split}.csv\")\n    return d\n\n\nDATA_PATH = pathlib.Path(\n    os.getenv(\"SPR_DATASET_PATH\", \"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\n)\nspr_bench = load_spr_bench(DATA_PATH)\nprint(\"Loaded splits:\", spr_bench.keys())\n\n# ---------------- Vocabulary ---------------- #\nall_chars = set()\nfor seq in spr_bench[\"train\"][\"sequence\"]:\n    all_chars.update(seq)\nchar2idx = {c: i for i, c in enumerate(sorted(all_chars))}\nidx2char = {i: c for c, i in char2idx.items()}\nvocab_size = len(char2idx)\nprint(f\"Vocab size = {vocab_size}\")\n\n\ndef seq_to_vec(seq: str) -> np.ndarray:\n    \"\"\"Bag-of-chars (frequency).\"\"\"\n    vec = np.zeros(vocab_size, dtype=np.float32)\n    for ch in seq:\n        vec[char2idx[ch]] += 1.0\n    if len(seq) > 0:  # normalise\n        vec /= len(seq)\n    return vec\n\n\ndef prepare_split(split):\n    X = np.stack([seq_to_vec(s) for s in split[\"sequence\"]])\n    y = np.array(split[\"label\"], dtype=np.int64)\n    return torch.from_numpy(X), torch.from_numpy(y)\n\n\nX_train, y_train = prepare_split(spr_bench[\"train\"])\nX_dev, y_dev = prepare_split(spr_bench[\"dev\"])\nX_test, y_test = prepare_split(spr_bench[\"test\"])\n\nnum_classes = int(max(y_train.max(), y_dev.max(), y_test.max()) + 1)\nprint(f\"Number of classes: {num_classes}\")\n\n# ---------------- DataLoaders ---------------- #\ntrain_loader = DataLoader(\n    TensorDataset(X_train, y_train), batch_size=BATCH_SIZE, shuffle=True\n)\nval_loader = DataLoader(TensorDataset(X_dev, y_dev), batch_size=VAL_BATCH)\ntest_loader = DataLoader(TensorDataset(X_test, y_test), batch_size=VAL_BATCH)\n\n\n# ---------------- Model ---------------- #\nclass CharBagLinear(nn.Module):\n    def __init__(self, in_dim: int, num_cls: int):\n        super().__init__()\n        self.linear = nn.Linear(in_dim, num_cls)\n\n    def forward(self, x):\n        return self.linear(x)\n\n\nmodel = CharBagLinear(vocab_size, num_classes).to(device)\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.Adam(model.parameters(), lr=LR)\n\n# ---------------- Experiment store ---------------- #\nexperiment_data = {\n    \"SPR_BENCH\": {\n        \"metrics\": {\"train_acc\": [], \"val_acc\": [], \"RBA\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"timestamps\": [],\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n}\n\n\n# ---------------- Helper: evaluation ---------------- #\ndef evaluate(loader):\n    model.eval()\n    total, correct, loss_sum = 0, 0, 0.0\n    with torch.no_grad():\n        for xb, yb in loader:\n            xb, yb = xb.to(device), yb.to(device)\n            logits = model(xb)\n            loss = criterion(logits, yb)\n            preds = logits.argmax(1)\n            total += yb.size(0)\n            correct += (preds == yb).sum().item()\n            loss_sum += loss.item() * yb.size(0)\n    return correct / total, loss_sum / total\n\n\n# ---------------- Helper: Rule-Based Accuracy (RBA) ---------------- #\ndef compute_rule_accuracy(loader):\n    \"\"\"\n    Build a trivial symbolic rule set: for each class, pick the top-K\n    characters with highest weight. Predict by counting occurrences of those\n    characters and picking the class with max count.\n    \"\"\"\n    with torch.no_grad():\n        W = model.linear.weight.detach().cpu().numpy()  # [C, V]\n    # top K indices per class\n    top_idx = np.argsort(W, axis=1)[:, -RULE_TOP_K:]  # [C, K]\n\n    total, correct = 0, 0\n    for xb, yb in loader:\n        seq_vectors = xb.numpy()  # frequencies\n        # revert to counts to avoid floating\n        counts = (seq_vectors * 1000).astype(int)  # arbitrary scaling\n        preds = []\n        for count_vec in counts:\n            votes = []\n            for cls in range(num_classes):\n                votes.append(count_vec[top_idx[cls]].sum())\n            preds.append(int(np.argmax(votes)))\n        preds = torch.tensor(preds)\n        correct += (preds == yb).sum().item()\n        total += yb.size(0)\n    return correct / total\n\n\n# ---------------- Training loop ---------------- #\nfor epoch in range(1, EPOCHS + 1):\n    model.train()\n    running_loss, running_correct, seen = 0.0, 0, 0\n    start_t = time.time()\n    for xb, yb in train_loader:\n        xb, yb = xb.to(device), yb.to(device)\n        optimizer.zero_grad()\n        logits = model(xb)\n        loss = criterion(logits, yb)\n        loss.backward()\n        optimizer.step()\n\n        preds = logits.argmax(1)\n        running_loss += loss.item() * yb.size(0)\n        running_correct += (preds == yb).sum().item()\n        seen += yb.size(0)\n\n    train_acc = running_correct / seen\n    train_loss = running_loss / seen\n    val_acc, val_loss = evaluate(val_loader)\n    rba = compute_rule_accuracy(val_loader)\n\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"train_acc\"].append(train_acc)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"val_acc\"].append(val_acc)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"RBA\"].append(rba)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"train\"].append(train_loss)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"val\"].append(val_loss)\n    experiment_data[\"SPR_BENCH\"][\"timestamps\"].append(time.time())\n\n    print(\n        f\"Epoch {epoch:02d}: \"\n        f\"train_loss={train_loss:.4f}, train_acc={train_acc:.3f} | \"\n        f\"val_loss={val_loss:.4f}, val_acc={val_acc:.3f} | \"\n        f\"RBA={rba:.3f} | \"\n        f\"epoch_time={time.time()-start_t:.1f}s\"\n    )\n\n# ---------------- Final test evaluation ---------------- #\ntest_acc, test_loss = evaluate(test_loader)\nrba_test = compute_rule_accuracy(test_loader)\nprint(f\"\\nTest set: loss={test_loss:.4f}, acc={test_acc:.3f}, RBA={rba_test:.3f}\")\n\n# Store final predictions for interpretability\nmodel.eval()\nall_preds, all_gts = [], []\nwith torch.no_grad():\n    for xb, yb in test_loader:\n        xb = xb.to(device)\n        logits = model(xb)\n        preds = logits.argmax(1).cpu()\n        all_preds.append(preds)\n        all_gts.append(yb)\nexperiment_data[\"SPR_BENCH\"][\"predictions\"] = torch.cat(all_preds).numpy()\nexperiment_data[\"SPR_BENCH\"][\"ground_truth\"] = torch.cat(all_gts).numpy()\n\n# ---------------- Save everything ---------------- #\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(f\"\\nExperiment data saved to {os.path.join(working_dir, 'experiment_data.npy')}\")\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ----- paths -----\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ----- load data -----\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\ndata = experiment_data.get(\"SPR_BENCH\", {})\n\n\n# Helper to safely fetch arrays\ndef get(arr, key):\n    return arr.get(key, [])\n\n\nmetrics = data.get(\"metrics\", {})\nlosses = data.get(\"losses\", {})\n\n# Plot 1: Accuracy curves\ntry:\n    train_acc = np.array(get(metrics, \"train_acc\"))\n    val_acc = np.array(get(metrics, \"val_acc\"))\n    if train_acc.size and val_acc.size:\n        plt.figure()\n        epochs = np.arange(1, len(train_acc) + 1)\n        plt.plot(epochs, train_acc, label=\"Train Acc\")\n        plt.plot(epochs, val_acc, label=\"Val Acc\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Accuracy\")\n        plt.title(\"SPR_BENCH: Train vs Validation Accuracy\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_accuracy_curves.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating accuracy plot: {e}\")\n    plt.close()\n\n# Plot 2: Loss curves\ntry:\n    train_loss = np.array(get(losses, \"train\"))\n    val_loss = np.array(get(losses, \"val\"))\n    if train_loss.size and val_loss.size:\n        plt.figure()\n        epochs = np.arange(1, len(train_loss) + 1)\n        plt.plot(epochs, train_loss, label=\"Train Loss\")\n        plt.plot(epochs, val_loss, label=\"Val Loss\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Cross-Entropy Loss\")\n        plt.title(\"SPR_BENCH: Train vs Validation Loss\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_loss_curves.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating loss plot: {e}\")\n    plt.close()\n\n# Plot 3: RBA vs Validation Accuracy\ntry:\n    rba = np.array(get(metrics, \"RBA\"))\n    val_acc = np.array(get(metrics, \"val_acc\"))\n    if rba.size and val_acc.size:\n        plt.figure()\n        epochs = np.arange(1, len(rba) + 1)\n        plt.plot(epochs, val_acc, label=\"Val Acc\")\n        plt.plot(epochs, rba, label=\"RBA\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Accuracy\")\n        plt.title(\"SPR_BENCH: Validation Accuracy vs Rule-Based Accuracy\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_rba_vs_val.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating RBA plot: {e}\")\n    plt.close()\n\n# Plot 4: Confusion Matrix\ntry:\n    preds = np.array(data.get(\"predictions\", []))\n    gts = np.array(data.get(\"ground_truth\", []))\n    if preds.size and gts.size and preds.shape == gts.shape:\n        n_cls = int(max(preds.max(), gts.max()) + 1)\n        cm = np.zeros((n_cls, n_cls), dtype=int)\n        for p, t in zip(preds, gts):\n            cm[t, p] += 1\n        plt.figure(figsize=(6, 5))\n        plt.imshow(cm, cmap=\"Blues\")\n        plt.colorbar()\n        plt.xlabel(\"Predicted\")\n        plt.ylabel(\"Ground Truth\")\n        plt.title(\"SPR_BENCH: Confusion Matrix (Test Set)\")\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_confusion_matrix.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating confusion matrix: {e}\")\n    plt.close()\n\n# ----- evaluation metric -----\nif \"predictions\" in data and \"ground_truth\" in data:\n    preds = np.array(data[\"predictions\"])\n    gts = np.array(data[\"ground_truth\"])\n    if preds.size and preds.shape == gts.shape:\n        test_acc = (preds == gts).mean()\n        print(f\"Test Accuracy: {test_acc:.3f}\")\n",
+      "plot_analyses": [
+        {
+          "analysis": "The training accuracy improves consistently over the epochs, reaching above 90%, indicating that the model is learning effectively on the training data. However, the validation accuracy plateaus around 75%, suggesting potential overfitting. The gap between training and validation accuracy widens as training progresses, which supports this hypothesis.",
+          "plot_path": "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_67c8ec0854c64b15929b376f6d333a48_proc_3204919/SPR_BENCH_accuracy_curves.png"
+        },
+        {
+          "analysis": "Both training and validation loss decrease steadily over the epochs, which is a positive sign. However, the validation loss decreases at a slower rate, reinforcing the notion of overfitting. The model might be focusing too much on the training data rather than generalizing well to unseen data.",
+          "plot_path": "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_67c8ec0854c64b15929b376f6d333a48_proc_3204919/SPR_BENCH_loss_curves.png"
+        },
+        {
+          "analysis": "Validation accuracy improves over time and surpasses the rule-based accuracy (RBA) at around the 5th epoch. This indicates that the model eventually outperforms the rule-based approach. However, there is a noticeable plateau in validation accuracy after epoch 7, suggesting that additional improvements may require further tuning or regularization.",
+          "plot_path": "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_67c8ec0854c64b15929b376f6d333a48_proc_3204919/SPR_BENCH_rba_vs_val.png"
+        },
+        {
+          "analysis": "The confusion matrix shows that the model performs reasonably well in distinguishing between the two classes, but there is some misclassification. The diagonal dominance indicates that the model is making correct predictions most of the time, but the off-diagonal values suggest areas for improvement in precision and recall.",
+          "plot_path": "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_67c8ec0854c64b15929b376f6d333a48_proc_3204919/SPR_BENCH_confusion_matrix.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_67c8ec0854c64b15929b376f6d333a48_proc_3204919/SPR_BENCH_accuracy_curves.png",
+        "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_67c8ec0854c64b15929b376f6d333a48_proc_3204919/SPR_BENCH_loss_curves.png",
+        "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_67c8ec0854c64b15929b376f6d333a48_proc_3204919/SPR_BENCH_rba_vs_val.png",
+        "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_67c8ec0854c64b15929b376f6d333a48_proc_3204919/SPR_BENCH_confusion_matrix.png"
+      ],
+      "vlm_feedback_summary": "The model demonstrates strong learning on the training data, but there are clear signs of overfitting as evidenced by the widening gap between training and validation accuracy. The validation accuracy surpasses rule-based accuracy, indicating progress, but plateaus after epoch 7, suggesting diminishing returns from further training without adjustments. The confusion matrix highlights reasonable performance but also reveals areas for improvement in reducing misclassifications.",
+      "exp_results_dir": "experiment_results/experiment_67c8ec0854c64b15929b376f6d333a48_proc_3204919",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_67c8ec0854c64b15929b376f6d333a48_proc_3204919/experiment_data.npy"
+      ]
+    },
+    {
+      "overall_plan": "The previous overall plan focused on fixing critical issues in the training loop, ensuring that batch dictionaries were constructed correctly, tensors were moved to the correct device, and optimization steps were performed accurately. It included normalizing inputs, adding validation monitoring, and creating a novel Rule-Based Accuracy metric for interpretability. All experimental data was saved for analysis. The current plan, described as a 'Seed node,' suggests establishing a foundational stage of the project without additional modifications, setting the groundwork for future advancements.",
+      "analysis": "The training script executed successfully without any errors or bugs. The model was trained over 10 epochs, and both training and validation metrics were logged. The final test accuracy reached 73.7% with a Rule-Based Accuracy (RBA) of 64.8%. The experiment data was saved successfully, and the overall execution time was within the limit. No issues were observed in the code or output.",
+      "metric": {
+        "value": {
+          "metric_names": [
+            {
+              "metric_name": "train accuracy",
+              "lower_is_better": false,
+              "description": "The accuracy achieved on the training dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.9195,
+                  "best_value": 0.9195
+                }
+              ]
+            },
+            {
+              "metric_name": "validation accuracy",
+              "lower_is_better": false,
+              "description": "The accuracy achieved on the validation dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.728,
+                  "best_value": 0.728
+                }
+              ]
+            },
+            {
+              "metric_name": "rule-based accuracy",
+              "lower_is_better": false,
+              "description": "The accuracy achieved using rule-based methods.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.644,
+                  "best_value": 0.644
+                }
+              ]
+            },
+            {
+              "metric_name": "training loss",
+              "lower_is_better": true,
+              "description": "The loss value on the training dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.654383,
+                  "best_value": 0.654383
+                }
+              ]
+            },
+            {
+              "metric_name": "validation loss",
+              "lower_is_better": true,
+              "description": "The loss value on the validation dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.67065,
+                  "best_value": 0.67065
+                }
+              ]
+            },
+            {
+              "metric_name": "test accuracy",
+              "lower_is_better": false,
+              "description": "The accuracy achieved on the test dataset.",
+              "data": [
+                {
+                  "dataset_name": "SPR_BENCH",
+                  "final_value": 0.737,
+                  "best_value": 0.737
+                }
+              ]
+            }
+          ]
+        },
+        "maximize": null,
+        "name": null,
+        "description": null
+      },
+      "code": "# Set random seed\nimport random\nimport numpy as np\nimport torch\n\nseed = 1\nrandom.seed(seed)\nnp.random.seed(seed)\ntorch.manual_seed(seed)\nif torch.cuda.is_available():\n    torch.cuda.manual_seed(seed)\n\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\nimport time\nimport pathlib\nfrom typing import Dict\n\nimport numpy as np\nimport torch\nfrom torch import nn\nfrom torch.utils.data import TensorDataset, DataLoader\nfrom datasets import load_dataset, DatasetDict\n\n# ---------------- Device ---------------- #\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n# ---------------- Hyper-params ---------------- #\nBATCH_SIZE = 256\nVAL_BATCH = 512\nLR = 1e-2\nEPOCHS = 10\nRULE_TOP_K = 1  # characters per class that constitute the symbolic \u201crule\u201d\n\n\n# ---------------- Dataset loading ---------------- #\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(csv_name: str):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    d = DatasetDict()\n    for split in [\"train\", \"dev\", \"test\"]:\n        d[split] = _load(f\"{split}.csv\")\n    return d\n\n\nDATA_PATH = pathlib.Path(\n    os.getenv(\"SPR_DATASET_PATH\", \"/home/zxl240011/AI-Scientist-v2/SPR_BENCH/\")\n)\nspr_bench = load_spr_bench(DATA_PATH)\nprint(\"Loaded splits:\", spr_bench.keys())\n\n# ---------------- Vocabulary ---------------- #\nall_chars = set()\nfor seq in spr_bench[\"train\"][\"sequence\"]:\n    all_chars.update(seq)\nchar2idx = {c: i for i, c in enumerate(sorted(all_chars))}\nidx2char = {i: c for c, i in char2idx.items()}\nvocab_size = len(char2idx)\nprint(f\"Vocab size = {vocab_size}\")\n\n\ndef seq_to_vec(seq: str) -> np.ndarray:\n    \"\"\"Bag-of-chars (frequency).\"\"\"\n    vec = np.zeros(vocab_size, dtype=np.float32)\n    for ch in seq:\n        vec[char2idx[ch]] += 1.0\n    if len(seq) > 0:  # normalise\n        vec /= len(seq)\n    return vec\n\n\ndef prepare_split(split):\n    X = np.stack([seq_to_vec(s) for s in split[\"sequence\"]])\n    y = np.array(split[\"label\"], dtype=np.int64)\n    return torch.from_numpy(X), torch.from_numpy(y)\n\n\nX_train, y_train = prepare_split(spr_bench[\"train\"])\nX_dev, y_dev = prepare_split(spr_bench[\"dev\"])\nX_test, y_test = prepare_split(spr_bench[\"test\"])\n\nnum_classes = int(max(y_train.max(), y_dev.max(), y_test.max()) + 1)\nprint(f\"Number of classes: {num_classes}\")\n\n# ---------------- DataLoaders ---------------- #\ntrain_loader = DataLoader(\n    TensorDataset(X_train, y_train), batch_size=BATCH_SIZE, shuffle=True\n)\nval_loader = DataLoader(TensorDataset(X_dev, y_dev), batch_size=VAL_BATCH)\ntest_loader = DataLoader(TensorDataset(X_test, y_test), batch_size=VAL_BATCH)\n\n\n# ---------------- Model ---------------- #\nclass CharBagLinear(nn.Module):\n    def __init__(self, in_dim: int, num_cls: int):\n        super().__init__()\n        self.linear = nn.Linear(in_dim, num_cls)\n\n    def forward(self, x):\n        return self.linear(x)\n\n\nmodel = CharBagLinear(vocab_size, num_classes).to(device)\ncriterion = nn.CrossEntropyLoss()\noptimizer = torch.optim.Adam(model.parameters(), lr=LR)\n\n# ---------------- Experiment store ---------------- #\nexperiment_data = {\n    \"SPR_BENCH\": {\n        \"metrics\": {\"train_acc\": [], \"val_acc\": [], \"RBA\": []},\n        \"losses\": {\"train\": [], \"val\": []},\n        \"timestamps\": [],\n        \"predictions\": [],\n        \"ground_truth\": [],\n    }\n}\n\n\n# ---------------- Helper: evaluation ---------------- #\ndef evaluate(loader):\n    model.eval()\n    total, correct, loss_sum = 0, 0, 0.0\n    with torch.no_grad():\n        for xb, yb in loader:\n            xb, yb = xb.to(device), yb.to(device)\n            logits = model(xb)\n            loss = criterion(logits, yb)\n            preds = logits.argmax(1)\n            total += yb.size(0)\n            correct += (preds == yb).sum().item()\n            loss_sum += loss.item() * yb.size(0)\n    return correct / total, loss_sum / total\n\n\n# ---------------- Helper: Rule-Based Accuracy (RBA) ---------------- #\ndef compute_rule_accuracy(loader):\n    \"\"\"\n    Build a trivial symbolic rule set: for each class, pick the top-K\n    characters with highest weight. Predict by counting occurrences of those\n    characters and picking the class with max count.\n    \"\"\"\n    with torch.no_grad():\n        W = model.linear.weight.detach().cpu().numpy()  # [C, V]\n    # top K indices per class\n    top_idx = np.argsort(W, axis=1)[:, -RULE_TOP_K:]  # [C, K]\n\n    total, correct = 0, 0\n    for xb, yb in loader:\n        seq_vectors = xb.numpy()  # frequencies\n        # revert to counts to avoid floating\n        counts = (seq_vectors * 1000).astype(int)  # arbitrary scaling\n        preds = []\n        for count_vec in counts:\n            votes = []\n            for cls in range(num_classes):\n                votes.append(count_vec[top_idx[cls]].sum())\n            preds.append(int(np.argmax(votes)))\n        preds = torch.tensor(preds)\n        correct += (preds == yb).sum().item()\n        total += yb.size(0)\n    return correct / total\n\n\n# ---------------- Training loop ---------------- #\nfor epoch in range(1, EPOCHS + 1):\n    model.train()\n    running_loss, running_correct, seen = 0.0, 0, 0\n    start_t = time.time()\n    for xb, yb in train_loader:\n        xb, yb = xb.to(device), yb.to(device)\n        optimizer.zero_grad()\n        logits = model(xb)\n        loss = criterion(logits, yb)\n        loss.backward()\n        optimizer.step()\n\n        preds = logits.argmax(1)\n        running_loss += loss.item() * yb.size(0)\n        running_correct += (preds == yb).sum().item()\n        seen += yb.size(0)\n\n    train_acc = running_correct / seen\n    train_loss = running_loss / seen\n    val_acc, val_loss = evaluate(val_loader)\n    rba = compute_rule_accuracy(val_loader)\n\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"train_acc\"].append(train_acc)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"val_acc\"].append(val_acc)\n    experiment_data[\"SPR_BENCH\"][\"metrics\"][\"RBA\"].append(rba)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"train\"].append(train_loss)\n    experiment_data[\"SPR_BENCH\"][\"losses\"][\"val\"].append(val_loss)\n    experiment_data[\"SPR_BENCH\"][\"timestamps\"].append(time.time())\n\n    print(\n        f\"Epoch {epoch:02d}: \"\n        f\"train_loss={train_loss:.4f}, train_acc={train_acc:.3f} | \"\n        f\"val_loss={val_loss:.4f}, val_acc={val_acc:.3f} | \"\n        f\"RBA={rba:.3f} | \"\n        f\"epoch_time={time.time()-start_t:.1f}s\"\n    )\n\n# ---------------- Final test evaluation ---------------- #\ntest_acc, test_loss = evaluate(test_loader)\nrba_test = compute_rule_accuracy(test_loader)\nprint(f\"\\nTest set: loss={test_loss:.4f}, acc={test_acc:.3f}, RBA={rba_test:.3f}\")\n\n# Store final predictions for interpretability\nmodel.eval()\nall_preds, all_gts = [], []\nwith torch.no_grad():\n    for xb, yb in test_loader:\n        xb = xb.to(device)\n        logits = model(xb)\n        preds = logits.argmax(1).cpu()\n        all_preds.append(preds)\n        all_gts.append(yb)\nexperiment_data[\"SPR_BENCH\"][\"predictions\"] = torch.cat(all_preds).numpy()\nexperiment_data[\"SPR_BENCH\"][\"ground_truth\"] = torch.cat(all_gts).numpy()\n\n# ---------------- Save everything ---------------- #\nnp.save(os.path.join(working_dir, \"experiment_data.npy\"), experiment_data)\nprint(f\"\\nExperiment data saved to {os.path.join(working_dir, 'experiment_data.npy')}\")\n",
+      "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ----- paths -----\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ----- load data -----\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\ndata = experiment_data.get(\"SPR_BENCH\", {})\n\n\n# Helper to safely fetch arrays\ndef get(arr, key):\n    return arr.get(key, [])\n\n\nmetrics = data.get(\"metrics\", {})\nlosses = data.get(\"losses\", {})\n\n# Plot 1: Accuracy curves\ntry:\n    train_acc = np.array(get(metrics, \"train_acc\"))\n    val_acc = np.array(get(metrics, \"val_acc\"))\n    if train_acc.size and val_acc.size:\n        plt.figure()\n        epochs = np.arange(1, len(train_acc) + 1)\n        plt.plot(epochs, train_acc, label=\"Train Acc\")\n        plt.plot(epochs, val_acc, label=\"Val Acc\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Accuracy\")\n        plt.title(\"SPR_BENCH: Train vs Validation Accuracy\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_accuracy_curves.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating accuracy plot: {e}\")\n    plt.close()\n\n# Plot 2: Loss curves\ntry:\n    train_loss = np.array(get(losses, \"train\"))\n    val_loss = np.array(get(losses, \"val\"))\n    if train_loss.size and val_loss.size:\n        plt.figure()\n        epochs = np.arange(1, len(train_loss) + 1)\n        plt.plot(epochs, train_loss, label=\"Train Loss\")\n        plt.plot(epochs, val_loss, label=\"Val Loss\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Cross-Entropy Loss\")\n        plt.title(\"SPR_BENCH: Train vs Validation Loss\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_loss_curves.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating loss plot: {e}\")\n    plt.close()\n\n# Plot 3: RBA vs Validation Accuracy\ntry:\n    rba = np.array(get(metrics, \"RBA\"))\n    val_acc = np.array(get(metrics, \"val_acc\"))\n    if rba.size and val_acc.size:\n        plt.figure()\n        epochs = np.arange(1, len(rba) + 1)\n        plt.plot(epochs, val_acc, label=\"Val Acc\")\n        plt.plot(epochs, rba, label=\"RBA\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Accuracy\")\n        plt.title(\"SPR_BENCH: Validation Accuracy vs Rule-Based Accuracy\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_rba_vs_val.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating RBA plot: {e}\")\n    plt.close()\n\n# Plot 4: Confusion Matrix\ntry:\n    preds = np.array(data.get(\"predictions\", []))\n    gts = np.array(data.get(\"ground_truth\", []))\n    if preds.size and gts.size and preds.shape == gts.shape:\n        n_cls = int(max(preds.max(), gts.max()) + 1)\n        cm = np.zeros((n_cls, n_cls), dtype=int)\n        for p, t in zip(preds, gts):\n            cm[t, p] += 1\n        plt.figure(figsize=(6, 5))\n        plt.imshow(cm, cmap=\"Blues\")\n        plt.colorbar()\n        plt.xlabel(\"Predicted\")\n        plt.ylabel(\"Ground Truth\")\n        plt.title(\"SPR_BENCH: Confusion Matrix (Test Set)\")\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_confusion_matrix.png\"))\n        plt.close()\nexcept Exception as e:\n    print(f\"Error creating confusion matrix: {e}\")\n    plt.close()\n\n# ----- evaluation metric -----\nif \"predictions\" in data and \"ground_truth\" in data:\n    preds = np.array(data[\"predictions\"])\n    gts = np.array(data[\"ground_truth\"])\n    if preds.size and preds.shape == gts.shape:\n        test_acc = (preds == gts).mean()\n        print(f\"Test Accuracy: {test_acc:.3f}\")\n",
+      "plot_analyses": [
+        {
+          "analysis": "This plot shows the accuracy trends for training and validation sets over epochs. The training accuracy increases rapidly and stabilizes close to 100%, indicating that the model is learning well on the training data. However, the validation accuracy increases initially but fluctuates and does not stabilize at a similarly high level. This could suggest overfitting, where the model performs well on the training set but struggles to generalize to unseen data. Adjustments to regularization techniques or hyperparameters might be necessary to improve validation performance.",
+          "plot_path": "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_9498c6e0ecb24213ac2d3a12541a47ec_proc_3204920/SPR_BENCH_accuracy_curves.png"
+        },
+        {
+          "analysis": "This plot depicts the cross-entropy loss trends for both training and validation sets. The training loss decreases steadily, reflecting effective learning on the training data. The validation loss also decreases but at a slower rate, and the gap between training and validation losses widens over epochs. This further supports the observation of potential overfitting, as the model's performance on the validation set does not improve as much as on the training set.",
+          "plot_path": "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_9498c6e0ecb24213ac2d3a12541a47ec_proc_3204920/SPR_BENCH_loss_curves.png"
+        },
+        {
+          "analysis": "This plot compares validation accuracy with rule-based accuracy (RBA). The validation accuracy surpasses RBA early in training, indicating that the model is learning patterns beyond the rule-based baseline. However, the validation accuracy fluctuates after an initial rise, which might indicate instability in generalization. This suggests that while the model is capable of outperforming the baseline, its consistency needs improvement, possibly through hyperparameter tuning or model regularization.",
+          "plot_path": "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_9498c6e0ecb24213ac2d3a12541a47ec_proc_3204920/SPR_BENCH_rba_vs_val.png"
+        },
+        {
+          "analysis": "The confusion matrix for the test set shows the distribution of predictions versus ground truth labels. The diagonal elements represent correct predictions, while off-diagonal elements indicate misclassifications. The darker diagonal indicates that the model performs well overall, but the lighter off-diagonal areas suggest some systematic errors. Analyzing these misclassifications could provide insights into specific sequences or rules that the model struggles to learn, guiding further improvements.",
+          "plot_path": "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_9498c6e0ecb24213ac2d3a12541a47ec_proc_3204920/SPR_BENCH_confusion_matrix.png"
+        }
+      ],
+      "plot_paths": [
+        "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_9498c6e0ecb24213ac2d3a12541a47ec_proc_3204920/SPR_BENCH_accuracy_curves.png",
+        "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_9498c6e0ecb24213ac2d3a12541a47ec_proc_3204920/SPR_BENCH_loss_curves.png",
+        "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_9498c6e0ecb24213ac2d3a12541a47ec_proc_3204920/SPR_BENCH_rba_vs_val.png",
+        "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_9498c6e0ecb24213ac2d3a12541a47ec_proc_3204920/SPR_BENCH_confusion_matrix.png"
+      ],
+      "vlm_feedback_summary": "The provided plots indicate that the model is learning effectively on the training data but exhibits signs of overfitting, as evidenced by the divergence between training and validation performance. While the model surpasses the rule-based baseline in validation accuracy, its performance is inconsistent, suggesting a need for further tuning and regularization to enhance generalization. The confusion matrix highlights areas of systematic misclassification, offering potential directions for targeted improvements.",
+      "exp_results_dir": "experiment_results/experiment_9498c6e0ecb24213ac2d3a12541a47ec_proc_3204920",
+      "exp_results_npy_files": [
+        "experiment_results/experiment_9498c6e0ecb24213ac2d3a12541a47ec_proc_3204920/experiment_data.npy"
+      ]
+    }
+  ],
+  "aggregated results of nodes with different seeds": {
+    "overall_plan": "The overall plan began with addressing issues in the training process, particularly with a misconstructed batch dictionary that prevented optimization steps. The training loop was rewritten to correctly handle TensorDataset batches, ensuring tensors were moved to the correct device, and included forward/backward passes and optimizer updates. Input normalization by sequence length was added, and validation monitoring was implemented, along with a new metric termed 'Rule-Based Accuracy' that uses the most influential character per class as a rule. The revised code runs end-to-end, capturing epoch-level losses and accuracies, with all data persisted for analysis. Building on this, the current plan focuses on aggregating results from multiple seeds to assess the model's robustness and generalization across different initial conditions, ensuring the findings are statistically sound and reliable.",
+    "metric": {
+      "value": null,
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# plotting aggregation code",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# ---------- paths ----------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ---------- experiment paths (provided) ----------\nexperiment_data_path_list = [\n    \"experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_67c8ec0854c64b15929b376f6d333a48_proc_3204919/experiment_data.npy\",\n    \"experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_9498c6e0ecb24213ac2d3a12541a47ec_proc_3204920/experiment_data.npy\",\n    \"experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/experiment_5677ab331cb645589beb2cedcbd57ec7_proc_3204921/experiment_data.npy\",\n]\n\n# ---------- load ----------\nall_experiment_data = []\nfor p in experiment_data_path_list:\n    try:\n        data = np.load(\n            os.path.join(os.getenv(\"AI_SCIENTIST_ROOT\", \"\"), p), allow_pickle=True\n        ).item()\n        all_experiment_data.append(data)\n    except Exception as e:\n        print(f\"Error loading {p}: {e}\")\n\n\n# ---------- helper ----------\ndef collect_metric(run_list, dataset, category, key):\n    \"\"\"Return list of 1-D np.arrays (one per run) for metric `key` located at data[dataset][category][key].\"\"\"\n    arrs = []\n    for run in run_list:\n        dset_dict = run.get(dataset, {})\n        cat_dict = dset_dict.get(category, {})\n        if key in cat_dict:\n            arrs.append(np.asarray(cat_dict[key], dtype=float))\n    return arrs\n\n\ndef pad_to_equal_length(arr_list, pad_val=np.nan):\n    max_len = max(len(a) for a in arr_list)\n    out = []\n    for a in arr_list:\n        if len(a) < max_len:\n            pad = np.full(max_len - len(a), pad_val, dtype=float)\n            out.append(np.concatenate([a, pad]))\n        else:\n            out.append(a)\n    return np.vstack(out)  # shape (n_runs, max_len)\n\n\n# ---------- iterate over datasets ----------\nif not all_experiment_data:\n    print(\"No experiment data loaded \u2013 nothing to plot.\")\nelse:\n    example_run = all_experiment_data[0]\n    dataset_names = example_run.keys()\n\n    for dset in dataset_names:\n\n        # ============ Accuracy curves (train & val) ============\n        try:\n            train_arrs = collect_metric(\n                all_experiment_data, dset, \"metrics\", \"train_acc\"\n            )\n            val_arrs = collect_metric(all_experiment_data, dset, \"metrics\", \"val_acc\")\n            if train_arrs and val_arrs:\n                train_mat = pad_to_equal_length(train_arrs)\n                val_mat = pad_to_equal_length(val_arrs)\n\n                epochs = np.arange(1, train_mat.shape[1] + 1)\n\n                train_mean = np.nanmean(train_mat, axis=0)\n                val_mean = np.nanmean(val_mat, axis=0)\n                train_sem = np.nanstd(train_mat, axis=0, ddof=1) / np.sqrt(\n                    train_mat.shape[0]\n                )\n                val_sem = np.nanstd(val_mat, axis=0, ddof=1) / np.sqrt(val_mat.shape[0])\n\n                plt.figure()\n                plt.fill_between(\n                    epochs,\n                    train_mean - train_sem,\n                    train_mean + train_sem,\n                    alpha=0.2,\n                    label=\"Train SEM\",\n                )\n                plt.fill_between(\n                    epochs,\n                    val_mean - val_sem,\n                    val_mean + val_sem,\n                    alpha=0.2,\n                    label=\"Val SEM\",\n                )\n                plt.plot(epochs, train_mean, label=\"Train Mean\")\n                plt.plot(epochs, val_mean, label=\"Val Mean\")\n                plt.xlabel(\"Epoch\")\n                plt.ylabel(\"Accuracy\")\n                plt.title(f\"{dset}: Mean \u00b1 SEM Train vs Validation Accuracy\")\n                plt.legend()\n                fname = f\"{dset}_agg_accuracy_curves.png\"\n                plt.savefig(os.path.join(working_dir, fname))\n                plt.close()\n        except Exception as e:\n            print(f\"Error creating aggregated accuracy plot for {dset}: {e}\")\n            plt.close()\n\n        # ============ Loss curves ============\n        try:\n            train_arrs = collect_metric(all_experiment_data, dset, \"losses\", \"train\")\n            val_arrs = collect_metric(all_experiment_data, dset, \"losses\", \"val\")\n            if train_arrs and val_arrs:\n                train_mat = pad_to_equal_length(train_arrs)\n                val_mat = pad_to_equal_length(val_arrs)\n\n                epochs = np.arange(1, train_mat.shape[1] + 1)\n\n                train_mean = np.nanmean(train_mat, axis=0)\n                val_mean = np.nanmean(val_mat, axis=0)\n                train_sem = np.nanstd(train_mat, axis=0, ddof=1) / np.sqrt(\n                    train_mat.shape[0]\n                )\n                val_sem = np.nanstd(val_mat, axis=0, ddof=1) / np.sqrt(val_mat.shape[0])\n\n                plt.figure()\n                plt.fill_between(\n                    epochs,\n                    train_mean - train_sem,\n                    train_mean + train_sem,\n                    alpha=0.2,\n                    label=\"Train SEM\",\n                )\n                plt.fill_between(\n                    epochs,\n                    val_mean - val_sem,\n                    val_mean + val_sem,\n                    alpha=0.2,\n                    label=\"Val SEM\",\n                )\n                plt.plot(epochs, train_mean, label=\"Train Mean\")\n                plt.plot(epochs, val_mean, label=\"Val Mean\")\n                plt.xlabel(\"Epoch\")\n                plt.ylabel(\"Loss\")\n                plt.title(f\"{dset}: Mean \u00b1 SEM Train vs Validation Loss\")\n                plt.legend()\n                fname = f\"{dset}_agg_loss_curves.png\"\n                plt.savefig(os.path.join(working_dir, fname))\n                plt.close()\n        except Exception as e:\n            print(f\"Error creating aggregated loss plot for {dset}: {e}\")\n            plt.close()\n\n        # ============ RBA vs Val Acc ============\n        try:\n            rba_arrs = collect_metric(all_experiment_data, dset, \"metrics\", \"RBA\")\n            val_arrs = collect_metric(all_experiment_data, dset, \"metrics\", \"val_acc\")\n            if rba_arrs and val_arrs:\n                rba_mat = pad_to_equal_length(rba_arrs)\n                val_mat = pad_to_equal_length(val_arrs)\n\n                epochs = np.arange(1, rba_mat.shape[1] + 1)\n                rba_mean = np.nanmean(rba_mat, axis=0)\n                val_mean = np.nanmean(val_mat, axis=0)\n                rba_sem = np.nanstd(rba_mat, axis=0, ddof=1) / np.sqrt(rba_mat.shape[0])\n                val_sem = np.nanstd(val_mat, axis=0, ddof=1) / np.sqrt(val_mat.shape[0])\n\n                plt.figure()\n                plt.fill_between(\n                    epochs,\n                    rba_mean - rba_sem,\n                    rba_mean + rba_sem,\n                    alpha=0.2,\n                    label=\"RBA SEM\",\n                )\n                plt.fill_between(\n                    epochs,\n                    val_mean - val_sem,\n                    val_mean + val_sem,\n                    alpha=0.2,\n                    label=\"Val SEM\",\n                )\n                plt.plot(epochs, val_mean, label=\"Val Mean\")\n                plt.plot(epochs, rba_mean, label=\"RBA Mean\")\n                plt.xlabel(\"Epoch\")\n                plt.ylabel(\"Accuracy\")\n                plt.title(\n                    f\"{dset}: Mean \u00b1 SEM Validation Accuracy vs Rule-Based Accuracy\"\n                )\n                plt.legend()\n                fname = f\"{dset}_agg_rba_vs_val.png\"\n                plt.savefig(os.path.join(working_dir, fname))\n                plt.close()\n        except Exception as e:\n            print(f\"Error creating aggregated RBA plot for {dset}: {e}\")\n            plt.close()\n\n        # ============ Aggregate final test accuracy ============\n        try:\n            final_test_accs = []\n            for run in all_experiment_data:\n                preds = np.asarray(run.get(dset, {}).get(\"predictions\", []))\n                gts = np.asarray(run.get(dset, {}).get(\"ground_truth\", []))\n                if preds.size and preds.shape == gts.shape:\n                    final_test_accs.append((preds == gts).mean())\n            if final_test_accs:\n                mean_acc = np.mean(final_test_accs)\n                sem_acc = np.std(final_test_accs, ddof=1) / np.sqrt(\n                    len(final_test_accs)\n                )\n                print(\n                    f\"{dset} \u2013 Aggregate Test Accuracy: {mean_acc:.3f} \u00b1 {sem_acc:.3f} (SEM, n={len(final_test_accs)})\"\n                )\n        except Exception as e:\n            print(f\"Error computing aggregate test accuracy for {dset}: {e}\")\n",
+    "plot_analyses": [],
+    "plot_paths": [
+      "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/seed_aggregation_d6282db7b56d4f548ce9762d3dfbe4bb/SPR_BENCH_agg_accuracy_curves.png",
+      "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/seed_aggregation_d6282db7b56d4f548ce9762d3dfbe4bb/SPR_BENCH_agg_loss_curves.png",
+      "experiments/2025-08-17_02-43-53_interpretable_neural_rule_learning_attempt_0/logs/0-run/experiment_results/seed_aggregation_d6282db7b56d4f548ce9762d3dfbe4bb/SPR_BENCH_agg_rba_vs_val.png"
+    ],
+    "vlm_feedback_summary": [],
+    "exp_results_dir": "experiment_results/seed_aggregation_d6282db7b56d4f548ce9762d3dfbe4bb",
+    "exp_results_npy_files": []
+  }
+}
