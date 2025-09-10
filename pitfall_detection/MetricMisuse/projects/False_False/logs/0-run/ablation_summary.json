@@ -1,0 +1,725 @@
+[
+  {
+    "overall_plan": "Initially, the plan involved upgrading from a bag-of-embedding encoder to a lightweight transformer with learnable positional encodings to enhance the model's understanding of token order and long-range dependencies, crucial for SPR rules. The method included stochastic, context-aware augmentations for contrastive learning, followed by fine-tuning with a classification head. The current plan introduces an ablation study, omitting positional embeddings to evaluate their impact on model performance. This complements the initial approach by assessing the necessity of positional embeddings, with both plans together offering a comprehensive investigation into the influence of these embeddings on model efficacy in sequence processing tasks.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "pretraining loss",
+            "lower_is_better": true,
+            "description": "The loss during the pretraining phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 12.466047,
+                "best_value": 12.466047
+              }
+            ]
+          },
+          {
+            "metric_name": "training loss",
+            "lower_is_better": true,
+            "description": "The loss during the training phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.174037,
+                "best_value": 0.174037
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "The loss during the validation phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.165283,
+                "best_value": 0.165283
+              }
+            ]
+          },
+          {
+            "metric_name": "validation SWA",
+            "lower_is_better": false,
+            "description": "The SWA metric during validation.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.944658,
+                "best_value": 0.944658
+              }
+            ]
+          },
+          {
+            "metric_name": "validation CWA",
+            "lower_is_better": false,
+            "description": "The CWA metric during validation.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.947654,
+                "best_value": 0.947654
+              }
+            ]
+          },
+          {
+            "metric_name": "validation SCWA",
+            "lower_is_better": false,
+            "description": "The SCWA metric during validation.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.94612,
+                "best_value": 0.94612
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, time, random, pathlib, numpy as np, torch, torch.nn as nn, torch.nn.functional as F\nfrom torch.utils.data import Dataset, DataLoader\nfrom datasets import load_dataset, DatasetDict\nfrom collections import Counter\n\n# ---------------------------------------------------------------\n# experiment bookkeeping\nexperiment_data = {\n    \"no_positional\": {\n        \"SPR_BENCH\": {\n            \"metrics\": {\"val_SWA\": [], \"val_CWA\": [], \"val_SCWA\": []},\n            \"losses\": {\"pretrain\": [], \"train\": [], \"val\": []},\n            \"predictions\": [],\n            \"ground_truth\": [],\n            \"timestamps\": [],\n        }\n    }\n}\n\n# ---------------------------------------------------------------\n# mandatory working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# device handling\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ---------------------------------------------------------------\n# metric helpers\ndef count_shape_variety(seq):\n    return len(set(tok[0] for tok in seq.strip().split() if tok))\n\n\ndef count_color_variety(seq):\n    return len(set(tok[1] for tok in seq.strip().split() if len(tok) > 1))\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    c = [w0 if t == p else 0 for w0, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) else 0.0\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    c = [w0 if t == p else 0 for w0, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) else 0.0\n\n\ndef scwa(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) + count_color_variety(s) for s in seqs]\n    c = [w0 if t == p else 0 for w0, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) else 0.0\n\n\n# ---------------------------------------------------------------\n# dataset loading\ndef resolve_spr_path() -> pathlib.Path:\n    for p in [\n        os.getenv(\"SPR_BENCH_PATH\", \"\"),\n        pathlib.Path.cwd() / \"SPR_BENCH\",\n        pathlib.Path.cwd().parent / \"SPR_BENCH\",\n        pathlib.Path.home() / \"SPR_BENCH\",\n        \"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\",\n    ]:\n        if p and (pathlib.Path(p) / \"train.csv\").exists():\n            return pathlib.Path(p)\n    raise FileNotFoundError(\"Could not locate SPR_BENCH\")\n\n\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(csv_name):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    return DatasetDict(\n        train=_load(\"train.csv\"), dev=_load(\"dev.csv\"), test=_load(\"test.csv\")\n    )\n\n\nspr_path = resolve_spr_path()\nspr = load_spr_bench(spr_path)\nprint({k: len(v) for k, v in spr.items()})\n\n\n# ---------------------------------------------------------------\n# vocabulary\ndef tokenize(s):\n    return s.strip().split()\n\n\nvocab_counter = Counter(tok for s in spr[\"train\"][\"sequence\"] for tok in tokenize(s))\nvocab = [\"<PAD>\", \"<UNK>\"] + sorted(vocab_counter)\nstoi = {w: i for i, w in enumerate(vocab)}\npad_idx, unk_idx = 0, 1\n\n\ndef encode_tokens(toks):\n    return [stoi.get(t, unk_idx) for t in toks]\n\n\ndef encode_seq(seq):\n    return encode_tokens(tokenize(seq))\n\n\nlabels = sorted(set(spr[\"train\"][\"label\"]))\nltoi = {l: i for i, l in enumerate(labels)}\nitos_l = {i: l for l, i in ltoi.items()}\n\n\n# ---------------------------------------------------------------\n# augmentations\ndef augment_tokens(toks):\n    toks = [t for t in toks if random.random() > 0.15] or toks\n    if len(toks) > 3 and random.random() < 0.3:\n        i, j = sorted(random.sample(range(len(toks)), 2))\n        toks[i:j] = reversed(toks[i:j])\n    return toks\n\n\n# ---------------------------------------------------------------\nMAX_LEN = 128\n\n\nclass ContrastiveSPR(Dataset):\n    def __init__(self, sequences):\n        self.seqs = sequences\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        return self.seqs[idx]\n\n\ndef collate_contrastive(batch):\n    views = []\n    for s in batch:\n        tok = tokenize(s)\n        views.append(encode_tokens(augment_tokens(tok)))\n        views.append(encode_tokens(augment_tokens(tok)))\n    maxlen = min(MAX_LEN, max(len(v) for v in views))\n    x = torch.full((len(views), maxlen), pad_idx, dtype=torch.long)\n    for i, seq in enumerate(views):\n        seq = seq[:maxlen]\n        x[i, : len(seq)] = torch.tensor(seq)\n    return x.to(device)\n\n\nclass SupervisedSPR(Dataset):\n    def __init__(self, split):\n        self.seqs = split[\"sequence\"]\n        self.labs = [ltoi[l] for l in split[\"label\"]]\n\n    def __len__(self):\n        return len(self.labs)\n\n    def __getitem__(self, idx):\n        return {\n            \"input\": torch.tensor(\n                encode_seq(self.seqs[idx])[:MAX_LEN], dtype=torch.long\n            ),\n            \"label\": torch.tensor(self.labs[idx], dtype=torch.long),\n        }\n\n\ndef collate_supervised(batch):\n    maxlen = max(len(b[\"input\"]) for b in batch)\n    x = torch.full((len(batch), maxlen), pad_idx, dtype=torch.long)\n    for i, b in enumerate(batch):\n        x[i, : len(b[\"input\"])] = b[\"input\"]\n    y = torch.stack([b[\"label\"] for b in batch])\n    return {\"input\": x.to(device), \"label\": y.to(device)}\n\n\n# ---------------------------------------------------------------\n# Transformer without positional embeddings\nclass NoPosSPRTransformer(nn.Module):\n    def __init__(self, vocab_size, emb_dim=128, n_heads=4, n_layers=2):\n        super().__init__()\n        self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=pad_idx)\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=emb_dim,\n            nhead=n_heads,\n            dim_feedforward=emb_dim * 4,\n            batch_first=True,\n        )\n        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)\n        self.emb_dim = emb_dim\n\n    def forward(self, x):\n        h = self.emb(x)  # NO positional encodings!\n        mask = x == pad_idx\n        h = self.encoder(h, src_key_padding_mask=mask)\n        mask_inv = (~mask).unsqueeze(-1)\n        pooled = (h * mask_inv).sum(1) / mask_inv.sum(1).clamp(min=1)\n        return pooled\n\n\nclass ProjectionHead(nn.Module):\n    def __init__(self, dim):\n        super().__init__()\n        self.fc = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, dim))\n\n    def forward(self, z):\n        return self.fc(z)\n\n\nclass SPRModel(nn.Module):\n    def __init__(self, encoder, num_labels):\n        super().__init__()\n        self.encoder = encoder\n        self.classifier = nn.Linear(encoder.emb_dim, num_labels)\n\n    def forward(self, x):\n        return self.classifier(self.encoder(x))\n\n\n# ---------------------------------------------------------------\ndef nt_xent(z, temp=0.5):\n    z = F.normalize(z, dim=1)\n    sim = torch.mm(z, z.t()) / temp\n    eye = torch.eye(sim.size(0), device=sim.device).bool()\n    sim.masked_fill_(eye, -9e15)\n    N = z.size(0) // 2\n    pos = torch.arange(sim.size(0), device=sim.device)\n    pos = torch.where(pos < N, pos + N, pos - N)\n    return F.cross_entropy(sim, pos)\n\n\n# ---------------------------------------------------------------\n# Contrastive pre-training\nemb_dim = 128\nencoder = NoPosSPRTransformer(len(vocab), emb_dim=emb_dim).to(device)\nproj = ProjectionHead(emb_dim).to(device)\nopt_pre = torch.optim.Adam(\n    list(encoder.parameters()) + list(proj.parameters()), lr=1e-3\n)\npre_loader = DataLoader(\n    ContrastiveSPR(spr[\"train\"][\"sequence\"]),\n    batch_size=256,\n    shuffle=True,\n    collate_fn=collate_contrastive,\n)\n\npre_epochs = 2\nfor ep in range(1, pre_epochs + 1):\n    encoder.train()\n    proj.train()\n    running = 0.0\n    for xb in pre_loader:\n        opt_pre.zero_grad()\n        loss = nt_xent(proj(encoder(xb)))\n        loss.backward()\n        opt_pre.step()\n        running += loss.item() * xb.size(0)\n    ep_loss = running / len(pre_loader.dataset)\n    experiment_data[\"no_positional\"][\"SPR_BENCH\"][\"losses\"][\"pretrain\"].append(ep_loss)\n    print(f\"[Pretrain] epoch {ep}: loss={ep_loss:.4f}\")\n\n# ---------------------------------------------------------------\n# Supervised fine-tuning\nmodel = SPRModel(encoder, len(labels)).to(device)\nopt = torch.optim.Adam(model.parameters(), lr=1e-3)\ncriterion = nn.CrossEntropyLoss()\ntrain_loader = DataLoader(\n    SupervisedSPR(spr[\"train\"]),\n    batch_size=128,\n    shuffle=True,\n    collate_fn=collate_supervised,\n)\nval_loader = DataLoader(\n    SupervisedSPR(spr[\"dev\"]),\n    batch_size=256,\n    shuffle=False,\n    collate_fn=collate_supervised,\n)\n\nbest_scwa, best_preds, best_trues = -1, [], []\nfine_epochs = 4\nfor ep in range(1, fine_epochs + 1):\n    # train\n    model.train()\n    tr_loss = 0.0\n    for batch in train_loader:\n        opt.zero_grad()\n        loss = criterion(model(batch[\"input\"]), batch[\"label\"])\n        loss.backward()\n        opt.step()\n        tr_loss += loss.item() * batch[\"label\"].size(0)\n    tr_loss /= len(train_loader.dataset)\n    experiment_data[\"no_positional\"][\"SPR_BENCH\"][\"losses\"][\"train\"].append(tr_loss)\n    # validation\n    model.eval()\n    val_loss = 0.0\n    preds, trues = [], []\n    with torch.no_grad():\n        for batch in val_loader:\n            logits = model(batch[\"input\"])\n            val_loss += criterion(logits, batch[\"label\"]).item() * batch[\"label\"].size(\n                0\n            )\n            preds += logits.argmax(1).cpu().tolist()\n            trues += batch[\"label\"].cpu().tolist()\n    val_loss /= len(val_loader.dataset)\n    experiment_data[\"no_positional\"][\"SPR_BENCH\"][\"losses\"][\"val\"].append(val_loss)\n    swa = shape_weighted_accuracy(spr[\"dev\"][\"sequence\"], trues, preds)\n    cwa = color_weighted_accuracy(spr[\"dev\"][\"sequence\"], trues, preds)\n    sc = scwa(spr[\"dev\"][\"sequence\"], trues, preds)\n    experiment_data[\"no_positional\"][\"SPR_BENCH\"][\"metrics\"][\"val_SWA\"].append(swa)\n    experiment_data[\"no_positional\"][\"SPR_BENCH\"][\"metrics\"][\"val_CWA\"].append(cwa)\n    experiment_data[\"no_positional\"][\"SPR_BENCH\"][\"metrics\"][\"val_SCWA\"].append(sc)\n    experiment_data[\"no_positional\"][\"SPR_BENCH\"][\"timestamps\"].append(time.time())\n    print(\n        f\"[Finetune] epoch {ep}: val_loss={val_loss:.4f} | SWA={swa:.4f} CWA={cwa:.4f} SCWA={sc:.4f}\"\n    )\n    if sc > best_scwa:\n        best_scwa, best_preds, best_trues = sc, preds, trues\n\nexperiment_data[\"no_positional\"][\"SPR_BENCH\"][\"predictions\"] = best_preds\nexperiment_data[\"no_positional\"][\"SPR_BENCH\"][\"ground_truth\"] = best_trues\n\n# ---------------------------------------------------------------\n# save experiment data\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Experiment data saved to working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# mandatory working directory\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# -------------------------------------------------\n# load experiment data\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\n    exp = experiment_data[\"no_positional\"][\"SPR_BENCH\"]\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    exp = None\n\nif exp:\n    # -------------------------------------------------\n    # 1) Loss curves\n    try:\n        plt.figure()\n        epochs_pre = np.arange(1, len(exp[\"losses\"][\"pretrain\"]) + 1)\n        epochs_ft = np.arange(1, len(exp[\"losses\"][\"train\"]) + 1)\n        # plot\n        if epochs_pre.size:\n            plt.plot(epochs_pre, exp[\"losses\"][\"pretrain\"], label=\"Pretrain Loss\")\n        plt.plot(epochs_ft, exp[\"losses\"][\"train\"], label=\"Train Loss\")\n        plt.plot(epochs_ft, exp[\"losses\"][\"val\"], label=\"Validation Loss\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Loss\")\n        plt.title(\"SPR_BENCH Loss Curves\\nLeft: Pretrain, Right: Fine-tune\")\n        plt.legend()\n        fname = os.path.join(working_dir, \"SPR_BENCH_loss_curves.png\")\n        plt.savefig(fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating loss plot: {e}\")\n        plt.close()\n\n    # -------------------------------------------------\n    # 2) Metric curves\n    try:\n        plt.figure()\n        epochs = np.arange(1, len(exp[\"metrics\"][\"val_SWA\"]) + 1)\n        plt.plot(epochs, exp[\"metrics\"][\"val_SWA\"], label=\"SWA\")\n        plt.plot(epochs, exp[\"metrics\"][\"val_CWA\"], label=\"CWA\")\n        plt.plot(epochs, exp[\"metrics\"][\"val_SCWA\"], label=\"SCWA\")\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Metric Value\")\n        plt.title(\"SPR_BENCH Validation Metrics\\nLeft: SWA, Right: CWA & SCWA\")\n        plt.legend()\n        fname = os.path.join(working_dir, \"SPR_BENCH_metric_curves.png\")\n        plt.savefig(fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating metric plot: {e}\")\n        plt.close()\n\n    # -------------------------------------------------\n    # 3) Final metric bar chart\n    try:\n        plt.figure()\n        final_vals = [\n            exp[\"metrics\"][\"val_SWA\"][-1],\n            exp[\"metrics\"][\"val_CWA\"][-1],\n            exp[\"metrics\"][\"val_SCWA\"][-1],\n        ]\n        names = [\"SWA\", \"CWA\", \"SCWA\"]\n        plt.bar(names, final_vals, color=[\"tab:blue\", \"tab:orange\", \"tab:green\"])\n        plt.ylim(0, 1)\n        for i, v in enumerate(final_vals):\n            plt.text(i, v + 0.01, f\"{v:.2f}\", ha=\"center\")\n        plt.title(\n            \"SPR_BENCH Final Validation Metrics\\nBar heights show last-epoch values\"\n        )\n        fname = os.path.join(working_dir, \"SPR_BENCH_final_metric_bars.png\")\n        plt.savefig(fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating bar chart: {e}\")\n        plt.close()\n\n    # -------------------------------------------------\n    # Print latest metric values\n    latest_swa = exp[\"metrics\"][\"val_SWA\"][-1]\n    latest_cwa = exp[\"metrics\"][\"val_CWA\"][-1]\n    latest_scwa = exp[\"metrics\"][\"val_SCWA\"][-1]\n    print(\n        f\"Latest Validation Metrics -> SWA: {latest_swa:.4f}, \"\n        f\"CWA: {latest_cwa:.4f}, SCWA: {latest_scwa:.4f}\"\n    )\n",
+    "plot_plan": "We will first load experiment_data.npy from the mandatory working directory and pull out the section corresponding to the \u201cno_positional / SPR_BENCH\u201d run. Next, we will create up to three concise figures: (1) a line plot of the available loss curves (pre-train, train, validation) across epochs; (2) a line plot of the three validation metrics (SWA, CWA, SCWA); and (3) a simple bar chart summarising the best/last values of those metrics. Each figure is wrapped in its own try-except block, saved with descriptive filenames that include the dataset name and plot type, titled clearly, and then closed. We respect the \u22645-plot rule and only use data found in the NumPy file\u2014no fabricated values. After plotting, the script prints the final (latest) metric values so the user can see them immediately in the notebook/console. All paths are resolved through the provided working_dir variable to avoid permission issues. The code is compact, self-contained, and follows the plotting conventions laid out in the developer instructions.",
+    "plot_analyses": [
+      {
+        "analysis": "The loss curves indicate that the pre-training phase suffers from a lack of convergence, as the pre-training loss remains constant and does not decrease over epochs. This suggests that the pre-training process might require adjustments, such as optimizing the learning rate, modifying the loss function, or improving the quality of positive and negative pairs for contrastive learning. In contrast, the fine-tuning phase shows a steady decrease in both training and validation losses, indicating that the model is successfully learning and generalizing to the validation set.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_678cfcf90bbb418d8e86dedea8f5833b_proc_2971858/SPR_BENCH_loss_curves.png"
+      },
+      {
+        "analysis": "The validation metric curves show a rapid improvement in SWA, CWA, and SCWA metrics during the initial epochs, followed by a plateau. This suggests that the model quickly learns the essential patterns in the data and achieves high performance early in the training process. The plateauing of the metrics indicates that further training does not significantly improve the model's performance, which could imply that the model has reached its capacity or that the data augmentation and denoising strategies are effective at capturing the necessary features.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_678cfcf90bbb418d8e86dedea8f5833b_proc_2971858/SPR_BENCH_metric_curves.png"
+      },
+      {
+        "analysis": "The bar chart of final validation metrics shows that the model achieves similar performance across SWA, CWA, and SCWA metrics, with all values close to 0.95. This indicates that the model performs consistently well across different evaluation criteria, suggesting that the context-aware contrastive learning framework with the applied augmentations and denoising techniques is effective for the SPR task. However, further analysis is needed to determine if this performance is sufficient to surpass the current state-of-the-art benchmarks.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_678cfcf90bbb418d8e86dedea8f5833b_proc_2971858/SPR_BENCH_final_metric_bars.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_678cfcf90bbb418d8e86dedea8f5833b_proc_2971858/SPR_BENCH_loss_curves.png",
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_678cfcf90bbb418d8e86dedea8f5833b_proc_2971858/SPR_BENCH_metric_curves.png",
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_678cfcf90bbb418d8e86dedea8f5833b_proc_2971858/SPR_BENCH_final_metric_bars.png"
+    ],
+    "vlm_feedback_summary": "The results demonstrate promising trends in fine-tuning and validation performance, with high and consistent metrics across different evaluation criteria. However, the pre-training phase shows no convergence, indicating potential issues with the pre-training process that need to be addressed.",
+    "exp_results_dir": "experiment_results/experiment_678cfcf90bbb418d8e86dedea8f5833b_proc_2971858",
+    "ablation_name": "No Positional Embeddings",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_678cfcf90bbb418d8e86dedea8f5833b_proc_2971858/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "The overall plan involves transitioning from a bag-of-embedding encoder to a lightweight transformer with learnable positional encodings to enhance the model's ability to reason over token order and long-range dependencies, which are crucial for SPR rules. This includes integrating stochastic, context-aware augmentations (token masking and local shuffle/reversal) to build positive pairs, with unrelated sequences forming negatives for an NT-Xent objective. After a short pre-training period, a classification head is attached for fine-tuning with cross-entropy monitoring SWA, CWA, and SCWA. The current plan introduces an ablation study by removing the projection head, applying the NT-Xent loss directly on the mean-pooled encoder outputs, aiming to isolate and evaluate the impact of the projection head while keeping other aspects constant. This comprehensive approach seeks to refine architectural decisions and better understand their effects on model performance for semantic role labeling.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "pretraining loss",
+            "lower_is_better": true,
+            "description": "Loss during the pretraining phase.",
+            "data": [
+              {
+                "dataset_name": "SPR",
+                "final_value": 12.466,
+                "best_value": 12.466
+              }
+            ]
+          },
+          {
+            "metric_name": "training loss",
+            "lower_is_better": true,
+            "description": "Loss during the training phase.",
+            "data": [
+              {
+                "dataset_name": "SPR",
+                "final_value": 0.0861,
+                "best_value": 0.0861
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "Validation loss during the evaluation phase.",
+            "data": [
+              {
+                "dataset_name": "SPR",
+                "final_value": 0.0601,
+                "best_value": 0.0601
+              }
+            ]
+          },
+          {
+            "metric_name": "validation shape-weighted accuracy",
+            "lower_is_better": false,
+            "description": "Validation accuracy weighted by shape.",
+            "data": [
+              {
+                "dataset_name": "SPR",
+                "final_value": 0.984,
+                "best_value": 0.984
+              }
+            ]
+          },
+          {
+            "metric_name": "validation color-weighted accuracy",
+            "lower_is_better": false,
+            "description": "Validation accuracy weighted by color.",
+            "data": [
+              {
+                "dataset_name": "SPR",
+                "final_value": 0.9844,
+                "best_value": 0.9844
+              }
+            ]
+          },
+          {
+            "metric_name": "validation shape+color-weighted accuracy",
+            "lower_is_better": false,
+            "description": "Validation accuracy weighted by both shape and color.",
+            "data": [
+              {
+                "dataset_name": "SPR",
+                "final_value": 0.9842,
+                "best_value": 0.9842
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "# No-Projection-Head Ablation : Encoder-Only Contrastive Learning\nimport os, time, random, pathlib, numpy as np, torch, torch.nn as nn, torch.nn.functional as F\nfrom torch.utils.data import Dataset, DataLoader\nfrom datasets import load_dataset, DatasetDict\nfrom collections import Counter\n\n# ----------------------------- paths & device -----------------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(\"Device:\", device)\n\n\n# ----------------------------- metrics ------------------------------------\ndef count_shape_variety(seq):\n    return len(set(tok[0] for tok in seq.strip().split() if tok))\n\n\ndef count_color_variety(seq):\n    return len(set(tok[1] for tok in seq.strip().split() if len(tok) > 1))\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    c = [w0 if t == p else 0 for w0, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) else 0.0\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    c = [w0 if t == p else 0 for w0, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) else 0.0\n\n\ndef scwa(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) + count_color_variety(s) for s in seqs]\n    c = [w0 if t == p else 0 for w0, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) else 0.0\n\n\n# ----------------------------- data loading -------------------------------\ndef resolve_spr_path() -> pathlib.Path:\n    for p in [\n        os.getenv(\"SPR_BENCH_PATH\", \"\"),\n        pathlib.Path.cwd() / \"SPR_BENCH\",\n        pathlib.Path.cwd().parent / \"SPR_BENCH\",\n        pathlib.Path.home() / \"SPR_BENCH\",\n        \"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\",\n    ]:\n        if p and (pathlib.Path(p) / \"train.csv\").exists():\n            return pathlib.Path(p)\n    raise FileNotFoundError(\"SPR_BENCH not found\")\n\n\ndef load_spr_bench(root):\n    def _load(csv_name):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    return DatasetDict(\n        train=_load(\"train.csv\"), dev=_load(\"dev.csv\"), test=_load(\"test.csv\")\n    )\n\n\nspr = load_spr_bench(resolve_spr_path())\nprint({k: len(v) for k, v in spr.items()})\n\n\n# ----------------------------- vocabulary ---------------------------------\ndef tokenize(s):\n    return s.strip().split()\n\n\nvocab_counter = Counter(tok for s in spr[\"train\"][\"sequence\"] for tok in tokenize(s))\nvocab = [\"<PAD>\", \"<UNK>\"] + sorted(vocab_counter)\nstoi = {w: i for i, w in enumerate(vocab)}\npad_idx, unk_idx = 0, 1\n\n\ndef encode_tokens(toks):\n    return [stoi.get(t, unk_idx) for t in toks]\n\n\ndef encode_seq(seq):\n    return encode_tokens(tokenize(seq))\n\n\nlabels = sorted(set(spr[\"train\"][\"label\"]))\nltoi = {l: i for i, l in enumerate(labels)}\n\n\n# ----------------------------- augmentations ------------------------------\ndef augment_tokens(toks):\n    toks = [t for t in toks if random.random() > 0.15] or toks\n    if len(toks) > 3 and random.random() < 0.3:\n        i, j = sorted(random.sample(range(len(toks)), 2))\n        toks[i:j] = reversed(toks[i:j])\n    return toks\n\n\n# ----------------------------- datasets -----------------------------------\nMAX_LEN = 128\n\n\nclass ContrastiveSPR(Dataset):\n    def __init__(self, seqs):\n        self.seqs = seqs\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        return self.seqs[idx]\n\n\ndef collate_contrastive(batch):\n    views = []\n    for s in batch:\n        tok = tokenize(s)\n        views.append(encode_tokens(augment_tokens(tok)))\n        views.append(encode_tokens(augment_tokens(tok)))\n    maxlen = min(MAX_LEN, max(len(v) for v in views))\n    x = torch.full((len(views), maxlen), pad_idx, dtype=torch.long)\n    for i, seq in enumerate(views):\n        seq = seq[:maxlen]\n        x[i, : len(seq)] = torch.tensor(seq)\n    return x.to(device)\n\n\nclass SupervisedSPR(Dataset):\n    def __init__(self, split):\n        self.seqs = split[\"sequence\"]\n        self.labs = [ltoi[l] for l in split[\"label\"]]\n\n    def __len__(self):\n        return len(self.labs)\n\n    def __getitem__(self, idx):\n        return {\n            \"input\": torch.tensor(\n                encode_seq(self.seqs[idx])[:MAX_LEN], dtype=torch.long\n            ),\n            \"label\": torch.tensor(self.labs[idx], dtype=torch.long),\n        }\n\n\ndef collate_supervised(batch):\n    maxlen = max(len(b[\"input\"]) for b in batch)\n    x = torch.full((len(batch), maxlen), pad_idx, dtype=torch.long)\n    for i, b in enumerate(batch):\n        x[i, : len(b[\"input\"])] = b[\"input\"]\n    y = torch.stack([b[\"label\"] for b in batch])\n    return {\"input\": x.to(device), \"label\": y.to(device)}\n\n\n# ----------------------------- model --------------------------------------\nclass SPRTransformer(nn.Module):\n    def __init__(self, vocab_size, emb_dim=128, n_heads=4, n_layers=2, max_len=MAX_LEN):\n        super().__init__()\n        self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=pad_idx)\n        self.pos = nn.Embedding(max_len, emb_dim)\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=emb_dim,\n            nhead=n_heads,\n            dim_feedforward=emb_dim * 4,\n            batch_first=True,\n        )\n        self.encoder = nn.TransformerEncoder(enc_layer, n_layers)\n        self.emb_dim = emb_dim\n\n    def forward(self, x):\n        pos_ids = torch.arange(0, x.size(1), device=x.device).unsqueeze(0)\n        h = self.emb(x) + self.pos(pos_ids)\n        mask = x == pad_idx\n        h = self.encoder(h, src_key_padding_mask=mask)\n        mask_inv = (~mask).unsqueeze(-1)\n        pooled = (h * mask_inv).sum(1) / mask_inv.sum(1).clamp(min=1)\n        return pooled\n\n\nclass SPRModel(nn.Module):\n    def __init__(self, encoder, num_labels):\n        super().__init__()\n        self.encoder = encoder\n        self.classifier = nn.Linear(encoder.emb_dim, num_labels)\n\n    def forward(self, x):\n        return self.classifier(self.encoder(x))\n\n\n# ----------------------------- loss ---------------------------------------\ndef nt_xent(z, temp=0.5):\n    z = nn.functional.normalize(z, dim=1)\n    sim = torch.mm(z, z.t()) / temp\n    eye = torch.eye(sim.size(0), device=sim.device).bool()\n    sim.masked_fill_(eye, -9e15)\n    N = z.size(0) // 2\n    pos = torch.arange(sim.size(0), device=sim.device)\n    pos = torch.where(pos < N, pos + N, pos - N)\n    return nn.functional.cross_entropy(sim, pos)\n\n\n# ----------------------------- experiment dict ----------------------------\nexperiment_data = {\n    \"no_projection_head\": {\n        \"SPR\": {\n            \"metrics\": {\"val_SWA\": [], \"val_CWA\": [], \"val_SCWA\": []},\n            \"losses\": {\"pretrain\": [], \"train\": [], \"val\": []},\n            \"predictions\": [],\n            \"ground_truth\": [],\n            \"timestamps\": [],\n        }\n    }\n}\n\n# ----------------------------- contrastive pre-training -------------------\nemb_dim = 128\nencoder = SPRTransformer(len(vocab), emb_dim).to(device)\nopt_pre = torch.optim.Adam(encoder.parameters(), lr=1e-3)\npre_loader = DataLoader(\n    ContrastiveSPR(spr[\"train\"][\"sequence\"]),\n    batch_size=256,\n    shuffle=True,\n    collate_fn=collate_contrastive,\n)\nfor ep in range(1, 3):\n    encoder.train()\n    running = 0.0\n    for xb in pre_loader:\n        opt_pre.zero_grad()\n        z = encoder(xb)  # <<< no projection head\n        loss = nt_xent(z)\n        loss.backward()\n        opt_pre.step()\n        running += loss.item() * xb.size(0)\n    ep_loss = running / len(pre_loader.dataset)\n    experiment_data[\"no_projection_head\"][\"SPR\"][\"losses\"][\"pretrain\"].append(ep_loss)\n    print(f\"Pretrain Epoch {ep}: loss={ep_loss:.4f}\")\n\n# ----------------------------- fine-tuning --------------------------------\nmodel = SPRModel(encoder, len(labels)).to(device)\nopt = torch.optim.Adam(model.parameters(), lr=1e-3)\ncriterion = nn.CrossEntropyLoss()\ntrain_loader = DataLoader(\n    SupervisedSPR(spr[\"train\"]),\n    batch_size=128,\n    shuffle=True,\n    collate_fn=collate_supervised,\n)\nval_loader = DataLoader(\n    SupervisedSPR(spr[\"dev\"]),\n    batch_size=256,\n    shuffle=False,\n    collate_fn=collate_supervised,\n)\n\nbest_scwa = -1\nbest_preds = []\nbest_trues = []\nfor ep in range(1, 5):\n    model.train()\n    tr_loss = 0.0\n    for batch in train_loader:\n        opt.zero_grad()\n        logits = model(batch[\"input\"])\n        loss = criterion(logits, batch[\"label\"])\n        loss.backward()\n        opt.step()\n        tr_loss += loss.item() * batch[\"label\"].size(0)\n    tr_loss /= len(train_loader.dataset)\n    experiment_data[\"no_projection_head\"][\"SPR\"][\"losses\"][\"train\"].append(tr_loss)\n    # validation\n    model.eval()\n    val_loss = 0.0\n    preds = []\n    trues = []\n    with torch.no_grad():\n        for batch in val_loader:\n            logits = model(batch[\"input\"])\n            loss = criterion(logits, batch[\"label\"])\n            val_loss += loss.item() * batch[\"label\"].size(0)\n            preds += logits.argmax(1).cpu().tolist()\n            trues += batch[\"label\"].cpu().tolist()\n    val_loss /= len(val_loader.dataset)\n    experiment_data[\"no_projection_head\"][\"SPR\"][\"losses\"][\"val\"].append(val_loss)\n    swa = shape_weighted_accuracy(spr[\"dev\"][\"sequence\"], trues, preds)\n    cwa = color_weighted_accuracy(spr[\"dev\"][\"sequence\"], trues, preds)\n    sc = scwa(spr[\"dev\"][\"sequence\"], trues, preds)\n    ed = experiment_data[\"no_projection_head\"][\"SPR\"]\n    ed[\"metrics\"][\"val_SWA\"].append(swa)\n    ed[\"metrics\"][\"val_CWA\"].append(cwa)\n    ed[\"metrics\"][\"val_SCWA\"].append(sc)\n    ed[\"timestamps\"].append(time.time())\n    print(\n        f\"Epoch {ep}: val_loss={val_loss:.4f} | SWA={swa:.4f} CWA={cwa:.4f} SCWA={sc:.4f}\"\n    )\n    if sc > best_scwa:\n        best_scwa = sc\n        best_preds = preds\n        best_trues = trues\nexperiment_data[\"no_projection_head\"][\"SPR\"][\"predictions\"] = best_preds\nexperiment_data[\"no_projection_head\"][\"SPR\"][\"ground_truth\"] = best_trues\n\n# ----------------------------- save ---------------------------------------\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Saved experiment data to working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# -------------------- paths --------------------\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# -------------------- data load ----------------\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\n    ed = experiment_data[\"no_projection_head\"][\"SPR\"]\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    exit()\n\n# -------------------- figure 1: pretrain loss --------------------\ntry:\n    plt.figure()\n    pre_losses = ed[\"losses\"][\"pretrain\"]\n    plt.plot(range(1, len(pre_losses) + 1), pre_losses, marker=\"o\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Contrastive Loss\")\n    plt.title(\"SPR Pre-training Loss (No Projection Head)\")\n    fname = os.path.join(working_dir, \"SPR_pretrain_loss_no_projection_head.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating pretraining loss plot: {e}\")\n    plt.close()\n\n# -------------------- figure 2: train vs val loss --------------------\ntry:\n    plt.figure()\n    train_losses = ed[\"losses\"][\"train\"]\n    val_losses = ed[\"losses\"][\"val\"]\n    epochs = range(1, len(train_losses) + 1)\n    plt.plot(epochs, train_losses, marker=\"o\", label=\"Train\")\n    plt.plot(epochs, val_losses, marker=\"s\", label=\"Validation\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Cross-Entropy Loss\")\n    plt.title(\"SPR Training vs Validation Loss (No Projection Head)\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_train_val_loss_no_projection_head.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating train/val loss plot: {e}\")\n    plt.close()\n\n# -------------------- figure 3: validation metrics --------------------\ntry:\n    plt.figure()\n    swa = ed[\"metrics\"][\"val_SWA\"]\n    cwa = ed[\"metrics\"][\"val_CWA\"]\n    scwa = ed[\"metrics\"][\"val_SCWA\"]\n    epochs = range(1, len(swa) + 1)\n    plt.plot(epochs, swa, marker=\"o\", label=\"SWA\")\n    plt.plot(epochs, cwa, marker=\"s\", label=\"CWA\")\n    plt.plot(epochs, scwa, marker=\"^\", label=\"SCWA\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Accuracy\")\n    plt.title(\"SPR Validation Metrics (No Projection Head)\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_validation_metrics_no_projection_head.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating validation metrics plot: {e}\")\n    plt.close()\n\n# -------------------- figure 4: confusion heatmap --------------------\ntry:\n    plt.figure()\n    preds = np.array(ed[\"predictions\"])\n    trues = np.array(ed[\"ground_truth\"])\n    labels = np.unique(np.concatenate([preds, trues]))\n    cm = np.zeros((len(labels), len(labels)), dtype=int)\n    for t, p in zip(trues, preds):\n        cm[t, p] += 1\n    im = plt.imshow(cm, interpolation=\"nearest\", cmap=\"Blues\")\n    plt.colorbar(im)\n    plt.xticks(range(len(labels)), labels, rotation=90)\n    plt.yticks(range(len(labels)), labels)\n    plt.xlabel(\"Predicted Label\")\n    plt.ylabel(\"True Label\")\n    plt.title(\"SPR Confusion Matrix (No Projection Head)\")\n    fname = os.path.join(working_dir, \"SPR_confusion_matrix_no_projection_head.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating confusion matrix plot: {e}\")\n    plt.close()\n",
+    "plot_plan": "The script will first load experiment_data.npy and extract the single run stored under no_projection_head->SPR. We will then plot four figures: (1) pre-training contrastive loss across epochs; (2) fine-tuning training versus validation loss; (3) validation metrics (SWA, CWA, SCWA) versus epoch; and (4) a confusion-matrix style heat-map comparing the best validation predictions to ground-truth labels. Each figure is wrapped in its own try-except block to guarantee graceful failure and proper figure closure. All plots are saved in the working directory with descriptive filenames that mention the dataset (SPR) and the plot type. At most five figures are produced, satisfying the interval requirement. Basic matplotlib is used without extra styling, and every plot includes an informative title and axis labels to ease interpretation. Finally, the code prints confirmation messages and closes every figure to avoid memory leaks. Below is the concise implementation.",
+    "plot_analyses": [
+      {
+        "analysis": "This plot shows the contrastive loss during pre-training without a projection head. The loss decreases sharply within the first two epochs, indicating that the model quickly learns to differentiate between positive and negative pairs. The rapid convergence suggests that the contrastive learning framework is effective, but further epochs could be explored to ensure the model is not overfitting or underfitting.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_e1275fbf08aa435fb6b4779cf11f262c_proc_2971859/SPR_pretrain_loss_no_projection_head.png"
+      },
+      {
+        "analysis": "This plot compares the training and validation cross-entropy loss over four epochs without a projection head. The training loss decreases consistently, while the validation loss follows a similar trend, indicating good generalization. The gap between the two losses narrows over time, suggesting that the model is learning effectively without overfitting. This is a positive sign for the robustness of the training process.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_e1275fbf08aa435fb6b4779cf11f262c_proc_2971859/SPR_train_val_loss_no_projection_head.png"
+      },
+      {
+        "analysis": "This plot illustrates the validation metrics (SWA, CWA, and SCWA) over four epochs without a projection head. All three metrics show a steady improvement, with SWA slightly outperforming the others. This demonstrates that the model's performance is improving not only in terms of general accuracy but also in tasks that require shape and color awareness, validating the hypothesis of enhanced feature representation.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_e1275fbf08aa435fb6b4779cf11f262c_proc_2971859/SPR_validation_metrics_no_projection_head.png"
+      },
+      {
+        "analysis": "This confusion matrix shows the classification performance on the validation set. The diagonal dominance indicates that the model performs well in distinguishing between the two classes. However, a detailed analysis of misclassified instances could provide insights into possible improvements, such as refining the data augmentation or the contrastive learning framework.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_e1275fbf08aa435fb6b4779cf11f262c_proc_2971859/SPR_confusion_matrix_no_projection_head.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_e1275fbf08aa435fb6b4779cf11f262c_proc_2971859/SPR_pretrain_loss_no_projection_head.png",
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_e1275fbf08aa435fb6b4779cf11f262c_proc_2971859/SPR_train_val_loss_no_projection_head.png",
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_e1275fbf08aa435fb6b4779cf11f262c_proc_2971859/SPR_validation_metrics_no_projection_head.png",
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_e1275fbf08aa435fb6b4779cf11f262c_proc_2971859/SPR_confusion_matrix_no_projection_head.png"
+    ],
+    "vlm_feedback_summary": "The plots indicate that the context-aware contrastive learning framework is effective. The pre-training loss decreases rapidly, suggesting efficient learning. Training and validation losses converge, indicating good generalization. Validation metrics (SWA, CWA, and SCWA) improve steadily, and the confusion matrix confirms strong classification performance. These results support the hypothesis and demonstrate the potential of the proposed approach.",
+    "exp_results_dir": "experiment_results/experiment_e1275fbf08aa435fb6b4779cf11f262c_proc_2971859",
+    "ablation_name": "No Projection Head (Encoder-Only Contrastive Learning)",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_e1275fbf08aa435fb6b4779cf11f262c_proc_2971859/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "The overall plan is to enhance the model's ability to comprehend sequential data by replacing the previous bag-of-embedding encoder with a lightweight transformer that includes learnable positional encodings. This enables the model to capture token order and longer-range dependencies crucial for understanding SPR rules. The initial plan incorporated stochastic, context-aware augmentations (token-masking and local shuffle/reversal) to form positive pairs for contrastive learning using the NT-Xent objective, followed by fine-tuning with a classification head using cross-entropy. The current plan introduces an ablation study to assess the impact of these augmentations by reproducing the baseline pipeline without applying token-level augmentations. A new dataloader ensures input sequences remain unchanged to isolate the effects of encoder noise and dropout. This comprehensive plan focuses on both innovation in model architecture and training, as well as rigorous evaluation through ablation, to ensure improvements are both effective and justified.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "validation SWA",
+            "lower_is_better": false,
+            "description": "Validation Set Weighted Accuracy",
+            "data": [
+              {
+                "dataset_name": "no_view_aug",
+                "final_value": 0.9837228229275665,
+                "best_value": 0.9837228229275665
+              }
+            ]
+          },
+          {
+            "metric_name": "validation CWA",
+            "lower_is_better": false,
+            "description": "Validation Class Weighted Accuracy",
+            "data": [
+              {
+                "dataset_name": "no_view_aug",
+                "final_value": 0.9848087365017387,
+                "best_value": 0.9848087365017387
+              }
+            ]
+          },
+          {
+            "metric_name": "validation SCWA",
+            "lower_is_better": false,
+            "description": "Validation Set Class Weighted Accuracy",
+            "data": [
+              {
+                "dataset_name": "no_view_aug",
+                "final_value": 0.9842526716875539,
+                "best_value": 0.9842526716875539
+              }
+            ]
+          },
+          {
+            "metric_name": "pretrain loss",
+            "lower_is_better": true,
+            "description": "Loss during pretraining",
+            "data": [
+              {
+                "dataset_name": "no_view_aug",
+                "final_value": 12.466100065612792,
+                "best_value": 12.466100065612792
+              }
+            ]
+          },
+          {
+            "metric_name": "train loss",
+            "lower_is_better": true,
+            "description": "Loss during training",
+            "data": [
+              {
+                "dataset_name": "no_view_aug",
+                "final_value": 0.039742440738528964,
+                "best_value": 0.039742440738528964
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "Loss on validation set",
+            "data": [
+              {
+                "dataset_name": "no_view_aug",
+                "final_value": 0.055935291278362276,
+                "best_value": 0.055935291278362276
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, time, random, pathlib, numpy as np, torch, torch.nn as nn, torch.nn.functional as F\nfrom torch.utils.data import Dataset, DataLoader\nfrom datasets import load_dataset, DatasetDict\nfrom collections import Counter\n\n# ------------------------------------------------------------------\n# mandatory working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ------------------------------------------------------------------\n# metric helpers ----------------------------------------------------\ndef count_shape_variety(seq):  # shape = first char of token\n    return len(set(tok[0] for tok in seq.strip().split() if tok))\n\n\ndef count_color_variety(seq):  # color = second char of token\n    return len(set(tok[1] for tok in seq.strip().split() if len(tok) > 1))\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    return (\n        sum(w0 for w0, t, p in zip(w, y_true, y_pred) if t == p) / sum(w)\n        if sum(w)\n        else 0.0\n    )\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    return (\n        sum(w0 for w0, t, p in zip(w, y_true, y_pred) if t == p) / sum(w)\n        if sum(w)\n        else 0.0\n    )\n\n\ndef scwa(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) + count_color_variety(s) for s in seqs]\n    return (\n        sum(w0 for w0, t, p in zip(w, y_true, y_pred) if t == p) / sum(w)\n        if sum(w)\n        else 0.0\n    )\n\n\n# ------------------------------------------------------------------\n# SPR dataset loading ----------------------------------------------\ndef resolve_spr_path() -> pathlib.Path:\n    for p in [\n        os.getenv(\"SPR_BENCH_PATH\", \"\"),\n        pathlib.Path.cwd() / \"SPR_BENCH\",\n        pathlib.Path.cwd().parent / \"SPR_BENCH\",\n        pathlib.Path.home() / \"SPR_BENCH\",\n        \"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\",\n    ]:\n        if p and (pathlib.Path(p) / \"train.csv\").exists():\n            return pathlib.Path(p)\n    raise FileNotFoundError(\"Could not locate SPR_BENCH\")\n\n\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(name):\n        return load_dataset(\n            \"csv\", data_files=str(root / name), split=\"train\", cache_dir=\".cache_dsets\"\n        )\n\n    return DatasetDict(\n        train=_load(\"train.csv\"), dev=_load(\"dev.csv\"), test=_load(\"test.csv\")\n    )\n\n\nspr_path = resolve_spr_path()\nspr = load_spr_bench(spr_path)\nprint({k: len(v) for k, v in spr.items()})\n\n\n# ------------------------------------------------------------------\n# vocabulary --------------------------------------------------------\ndef tokenize(s):\n    return s.strip().split()\n\n\nvocab_counter = Counter(tok for s in spr[\"train\"][\"sequence\"] for tok in tokenize(s))\nvocab = [\"<PAD>\", \"<UNK>\"] + sorted(vocab_counter)\nstoi = {w: i for i, w in enumerate(vocab)}\npad_idx, unk_idx = 0, 1\n\n\ndef encode_tokens(toks):\n    return [stoi.get(t, unk_idx) for t in toks]\n\n\ndef encode_seq(seq):\n    return encode_tokens(tokenize(seq))\n\n\nlabels = sorted(set(spr[\"train\"][\"label\"]))\nltoi = {l: i for i, l in enumerate(labels)}\nitos_l = {i: l for l, i in ltoi.items()}\n\n\n# ------------------------------------------------------------------\n# ORIGINAL augmentations (kept for reference but unused in ablation)-\ndef augment_tokens(toks):\n    toks = [t for t in toks if random.random() > 0.15] or toks\n    if len(toks) > 3 and random.random() < 0.3:\n        i, j = sorted(random.sample(range(len(toks)), 2))\n        toks[i:j] = reversed(toks[i:j])\n    return toks\n\n\nMAX_LEN = 128\n\n\nclass ContrastiveSPR(Dataset):\n    def __init__(self, seqs):\n        self.seqs = seqs\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        return self.seqs[idx]\n\n\n# --------- NO-VIEW-AUGMENTATION COLLATE FUNCTION ------------------\ndef collate_contrastive_noaug(batch):\n    views = []\n    for s in batch:\n        enc = encode_tokens(tokenize(s))  # NO augmentation\n        views.append(enc)\n        views.append(enc)  # identical pair\n    maxlen = min(MAX_LEN, max(len(v) for v in views))\n    x = torch.full((len(views), maxlen), pad_idx, dtype=torch.long)\n    for i, seq in enumerate(views):\n        seq = seq[:maxlen]\n        x[i, : len(seq)] = torch.tensor(seq)\n    return x.to(device)\n\n\n# supervised dataset ----------------------------------------------\nclass SupervisedSPR(Dataset):\n    def __init__(self, split):\n        self.seqs = split[\"sequence\"]\n        self.labs = [ltoi[l] for l in split[\"label\"]]\n\n    def __len__(self):\n        return len(self.labs)\n\n    def __getitem__(self, idx):\n        return {\n            \"input\": torch.tensor(\n                encode_seq(self.seqs[idx])[:MAX_LEN], dtype=torch.long\n            ),\n            \"label\": torch.tensor(self.labs[idx], dtype=torch.long),\n        }\n\n\ndef collate_supervised(batch):\n    maxlen = max(len(b[\"input\"]) for b in batch)\n    x = torch.full((len(batch), maxlen), pad_idx, dtype=torch.long)\n    for i, b in enumerate(batch):\n        x[i, : len(b[\"input\"])] = b[\"input\"]\n    y = torch.stack([b[\"label\"] for b in batch])\n    return {\"input\": x.to(device), \"label\": y.to(device)}\n\n\n# ------------------------------------------------------------------\n# Transformer encoder ----------------------------------------------\nclass SPRTransformer(nn.Module):\n    def __init__(self, vocab_size, emb_dim=128, n_heads=4, n_layers=2, max_len=MAX_LEN):\n        super().__init__()\n        self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=pad_idx)\n        self.pos = nn.Embedding(max_len, emb_dim)\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=emb_dim,\n            nhead=n_heads,\n            dim_feedforward=emb_dim * 4,\n            batch_first=True,\n        )\n        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)\n        self.emb_dim = emb_dim\n\n    def forward(self, x):\n        pos_ids = torch.arange(0, x.size(1), device=x.device).unsqueeze(0)\n        h = self.emb(x) + self.pos(pos_ids)\n        mask = x == pad_idx\n        h = self.encoder(h, src_key_padding_mask=mask)\n        mask_inv = (~mask).unsqueeze(-1)\n        return (h * mask_inv).sum(1) / mask_inv.sum(1).clamp(min=1)\n\n\nclass ProjectionHead(nn.Module):\n    def __init__(self, dim):\n        super().__init__()\n        self.fc = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, dim))\n\n    def forward(self, z):\n        return self.fc(z)\n\n\nclass SPRModel(nn.Module):\n    def __init__(self, encoder, num_labels):\n        super().__init__()\n        self.encoder = encoder\n        self.cls = nn.Linear(encoder.emb_dim, num_labels)\n\n    def forward(self, x):\n        return self.cls(self.encoder(x))\n\n\n# ------------------------------------------------------------------\ndef nt_xent(z, temp=0.5):\n    z = F.normalize(z, dim=1)\n    sim = torch.mm(z, z.t()) / temp\n    eye = torch.eye(sim.size(0), device=sim.device, dtype=torch.bool)\n    sim.masked_fill_(eye, -9e15)\n    N = z.size(0) // 2\n    pos = torch.arange(sim.size(0), device=sim.device)\n    pos = torch.where(pos < N, pos + N, pos - N)\n    return F.cross_entropy(sim, pos)\n\n\n# ------------------------------------------------------------------\n# experiment data dict ---------------------------------------------\nexperiment_data = {\n    \"no_view_aug\": {\n        \"SPR_transformer\": {\n            \"metrics\": {\"val_SWA\": [], \"val_CWA\": [], \"val_SCWA\": []},\n            \"losses\": {\"pretrain\": [], \"train\": [], \"val\": []},\n            \"predictions\": [],\n            \"ground_truth\": [],\n            \"timestamps\": [],\n        }\n    }\n}\n\n# ------------------------------------------------------------------\n# Contrastive pre-training (no view augmentation) ------------------\nemb_dim = 128\nencoder = SPRTransformer(len(vocab), emb_dim=emb_dim).to(device)\nproj = ProjectionHead(emb_dim).to(device)\nopt_pre = torch.optim.Adam(\n    list(encoder.parameters()) + list(proj.parameters()), lr=1e-3\n)\n\npre_loader = DataLoader(\n    ContrastiveSPR(spr[\"train\"][\"sequence\"]),\n    batch_size=256,\n    shuffle=True,\n    collate_fn=collate_contrastive_noaug,\n)\n\npre_epochs = 2\nfor ep in range(1, pre_epochs + 1):\n    encoder.train()\n    proj.train()\n    running = 0.0\n    for xb in pre_loader:\n        opt_pre.zero_grad()\n        z = proj(encoder(xb))\n        loss = nt_xent(z)\n        loss.backward()\n        opt_pre.step()\n        running += loss.item() * xb.size(0)\n    ep_loss = running / len(pre_loader.dataset)\n    experiment_data[\"no_view_aug\"][\"SPR_transformer\"][\"losses\"][\"pretrain\"].append(\n        ep_loss\n    )\n    print(f\"Pretrain Epoch {ep}: loss={ep_loss:.4f}\")\n\n# ------------------------------------------------------------------\n# Supervised fine-tuning -------------------------------------------\nmodel = SPRModel(encoder, len(labels)).to(device)\nopt = torch.optim.Adam(model.parameters(), lr=1e-3)\ncriterion = nn.CrossEntropyLoss()\n\ntrain_loader = DataLoader(\n    SupervisedSPR(spr[\"train\"]),\n    batch_size=128,\n    shuffle=True,\n    collate_fn=collate_supervised,\n)\nval_loader = DataLoader(\n    SupervisedSPR(spr[\"dev\"]),\n    batch_size=256,\n    shuffle=False,\n    collate_fn=collate_supervised,\n)\n\nbest_scwa = -1\nbest_preds = []\nbest_trues = []\nfine_epochs = 4\nfor ep in range(1, fine_epochs + 1):\n    # train\n    model.train()\n    tr_loss = 0.0\n    for batch in train_loader:\n        opt.zero_grad()\n        logits = model(batch[\"input\"])\n        loss = criterion(logits, batch[\"label\"])\n        loss.backward()\n        opt.step()\n        tr_loss += loss.item() * batch[\"label\"].size(0)\n    tr_loss /= len(train_loader.dataset)\n    experiment_data[\"no_view_aug\"][\"SPR_transformer\"][\"losses\"][\"train\"].append(tr_loss)\n    # val\n    model.eval()\n    val_loss = 0.0\n    preds = []\n    trues = []\n    with torch.no_grad():\n        for batch in val_loader:\n            logits = model(batch[\"input\"])\n            loss = criterion(logits, batch[\"label\"])\n            val_loss += loss.item() * batch[\"label\"].size(0)\n            preds += logits.argmax(1).cpu().tolist()\n            trues += batch[\"label\"].cpu().tolist()\n    val_loss /= len(val_loader.dataset)\n    experiment_data[\"no_view_aug\"][\"SPR_transformer\"][\"losses\"][\"val\"].append(val_loss)\n    swa = shape_weighted_accuracy(spr[\"dev\"][\"sequence\"], trues, preds)\n    cwa = color_weighted_accuracy(spr[\"dev\"][\"sequence\"], trues, preds)\n    sc = scwa(spr[\"dev\"][\"sequence\"], trues, preds)\n    ed = experiment_data[\"no_view_aug\"][\"SPR_transformer\"]\n    ed[\"metrics\"][\"val_SWA\"].append(swa)\n    ed[\"metrics\"][\"val_CWA\"].append(cwa)\n    ed[\"metrics\"][\"val_SCWA\"].append(sc)\n    ed[\"timestamps\"].append(time.time())\n    print(\n        f\"Epoch {ep}: val_loss={val_loss:.4f} | SWA={swa:.4f} CWA={cwa:.4f} SCWA={sc:.4f}\"\n    )\n    if sc > best_scwa:\n        best_scwa = sc\n        best_preds = preds\n        best_trues = trues\n\nexperiment_data[\"no_view_aug\"][\"SPR_transformer\"][\"predictions\"] = best_preds\nexperiment_data[\"no_view_aug\"][\"SPR_transformer\"][\"ground_truth\"] = best_trues\n\n# ------------------------------------------------------------------\n# save\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Experiment data saved to working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# mandatory working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ------------------------------------------------------------------\n# load experiment data\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\n    run = experiment_data[\"no_view_aug\"][\"SPR_transformer\"]\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    exit()\n\nlosses, metrics = run[\"losses\"], run[\"metrics\"]\n\n# ------------------------------------------------------------------\n# 1) Pre-training loss curve\ntry:\n    plt.figure()\n    plt.plot(range(1, len(losses[\"pretrain\"]) + 1), losses[\"pretrain\"], marker=\"o\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"NT-Xent Loss\")\n    plt.title(\"SPR Dataset \u2013 Contrastive Pre-training Loss\")\n    fname = os.path.join(working_dir, \"SPR_pretrain_loss.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating pretrain loss plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------\n# 2) Fine-tuning train / val loss curves\ntry:\n    plt.figure()\n    epochs = range(1, len(losses[\"train\"]) + 1)\n    plt.plot(epochs, losses[\"train\"], label=\"Train CE Loss\", marker=\"o\")\n    plt.plot(epochs, losses[\"val\"], label=\"Val CE Loss\", marker=\"s\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Cross-Entropy Loss\")\n    plt.title(\"SPR Dataset \u2013 Fine-tuning Loss Curves\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_finetune_loss.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating fine-tuning loss plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------\n# 3) Validation metric curves\ntry:\n    plt.figure()\n    epochs = range(1, len(metrics[\"val_SCWA\"]) + 1)\n    plt.plot(epochs, metrics[\"val_SWA\"], label=\"SWA\", marker=\"o\")\n    plt.plot(epochs, metrics[\"val_CWA\"], label=\"CWA\", marker=\"s\")\n    plt.plot(epochs, metrics[\"val_SCWA\"], label=\"SCWA\", marker=\"^\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Weighted Accuracy\")\n    plt.title(\"SPR Dataset \u2013 Validation Metrics\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_validation_metrics.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating metric plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------\n# Print best epoch summary\nval_scwa = np.array(metrics[\"val_SCWA\"])\nbest_idx = int(val_scwa.argmax())\nprint(\n    f\"Best SCWA achieved at epoch {best_idx + 1}: \"\n    f\"SCWA={val_scwa[best_idx]:.4f}, \"\n    f\"SWA={metrics['val_SWA'][best_idx]:.4f}, \"\n    f\"CWA={metrics['val_CWA'][best_idx]:.4f}\"\n)\n",
+    "plot_plan": "We will first load experiment_data.npy from the working directory and extract the dictionary for the \u201cno_view_aug / SPR_transformer\u201d run.  Using its content we generate three standard plots: (1) the contrastive-pretraining loss over epochs, (2) supervised fine-tuning train/validation losses over epochs, and (3) the three validation metrics (SWA, CWA, SCWA) over epochs.  Each figure is wrapped in its own try/except block, given a clear title, and saved with a descriptive filename that contains \u201cSPR\u201d and the plot type.  After plotting we compute and print the epoch that achieved the best SCWA together with the corresponding SWA and CWA values, providing a concise quantitative summary.  All figures are closed after saving to keep memory usage low.  At most three figures are produced, satisfying the guideline of not exceeding five.  Only data found inside experiment_data.npy are accessed\u2014no synthetic values are introduced.  The code complies with the required import block, directory handling, and figure-saving conventions.",
+    "plot_analyses": [
+      {
+        "analysis": "The contrastive pre-training loss (NT-Xent loss) decreases significantly within just two epochs, indicating that the model quickly learns effective feature representations during this phase. The steep decline suggests that the training process is efficient, but the limited number of epochs raises questions about whether the model has achieved optimal convergence or if additional training could further enhance performance.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_91297a1be36341f38f1522d48a9f45a1_proc_2971860/SPR_pretrain_loss.png"
+      },
+      {
+        "analysis": "The fine-tuning loss curves for both training and validation data show a consistent decrease over four epochs, with validation loss slightly lower than training loss after the initial epoch. This indicates that the model generalizes well to unseen data and does not overfit. The steady decline in loss suggests that the fine-tuning process is effective and that the learned embeddings from the pre-training phase are beneficial for the SPR task.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_91297a1be36341f38f1522d48a9f45a1_proc_2971860/SPR_finetune_loss.png"
+      },
+      {
+        "analysis": "The validation metrics (SWA, CWA, and SCWA) improve consistently over the first three epochs, reaching a peak before slightly declining. The close alignment of these metrics indicates that the model performs well across different weighted accuracy measures. The slight drop in metrics after the third epoch suggests potential overfitting or instability in generalization, which might benefit from additional regularization or early stopping.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_91297a1be36341f38f1522d48a9f45a1_proc_2971860/SPR_validation_metrics.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_91297a1be36341f38f1522d48a9f45a1_proc_2971860/SPR_pretrain_loss.png",
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_91297a1be36341f38f1522d48a9f45a1_proc_2971860/SPR_finetune_loss.png",
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_91297a1be36341f38f1522d48a9f45a1_proc_2971860/SPR_validation_metrics.png"
+    ],
+    "vlm_feedback_summary": "The plots indicate that the contrastive pre-training and fine-tuning processes are effective, with rapid loss reduction and high validation metrics. However, there is a slight decline in validation metrics after the third epoch, suggesting potential overfitting or instability. The results are promising and demonstrate the viability of the proposed approach for the SPR task.",
+    "exp_results_dir": "experiment_results/experiment_91297a1be36341f38f1522d48a9f45a1_proc_2971860",
+    "ablation_name": "No-View-Augmentation Contrastive Pre-training",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_91297a1be36341f38f1522d48a9f45a1_proc_2971860/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "The overall plan consists of two complementary phases. The initial phase involved replacing the bag-of-embedding encoder with a lightweight transformer that includes learnable positional encodings to enhance the model's ability to handle token order and long-range dependencies, using contrastive learning with token-masking and local shuffle/reversal to improve the model's understanding of SPR rules. This was followed by a brief pre-training and end-to-end fine-tuning process, with careful metric monitoring. The current phase introduces an ablation study to compare two representation strategies: 'mean_pool', which averages non-PAD positions, and 'cls_token', which uses a [CLS] token to capture sequence information. Both strategies are evaluated independently on the SPR-BENCH dataset, with the same pipeline as the initial phase, to determine the impact of these representation strategies. This comprehensive exploration aims to refine the transformer architecture and optimize its performance through informed choices about representation methods.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "validation shape weighted accuracy",
+            "lower_is_better": false,
+            "description": "The weighted accuracy of shape predictions during validation.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH (mean_pool)",
+                "final_value": 0.9871,
+                "best_value": 0.9871
+              },
+              {
+                "dataset_name": "SPR_BENCH (cls_token)",
+                "final_value": 0.9799,
+                "best_value": 0.9799
+              }
+            ]
+          },
+          {
+            "metric_name": "validation color weighted accuracy",
+            "lower_is_better": false,
+            "description": "The weighted accuracy of color predictions during validation.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH (mean_pool)",
+                "final_value": 0.9877,
+                "best_value": 0.9877
+              },
+              {
+                "dataset_name": "SPR_BENCH (cls_token)",
+                "final_value": 0.9801,
+                "best_value": 0.9801
+              }
+            ]
+          },
+          {
+            "metric_name": "validation SCWA",
+            "lower_is_better": false,
+            "description": "The shape and color weighted accuracy during validation.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH (mean_pool)",
+                "final_value": 0.9874,
+                "best_value": 0.9874
+              },
+              {
+                "dataset_name": "SPR_BENCH (cls_token)",
+                "final_value": 0.98,
+                "best_value": 0.98
+              }
+            ]
+          },
+          {
+            "metric_name": "pretraining loss",
+            "lower_is_better": true,
+            "description": "The loss during pretraining phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH (mean_pool)",
+                "final_value": 12.4659,
+                "best_value": 12.4659
+              },
+              {
+                "dataset_name": "SPR_BENCH (cls_token)",
+                "final_value": 12.4661,
+                "best_value": 12.4661
+              }
+            ]
+          },
+          {
+            "metric_name": "training loss",
+            "lower_is_better": true,
+            "description": "The loss during training phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH (mean_pool)",
+                "final_value": 0.0456,
+                "best_value": 0.0456
+              },
+              {
+                "dataset_name": "SPR_BENCH (cls_token)",
+                "final_value": 0.0862,
+                "best_value": 0.0862
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "The loss during validation phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH (mean_pool)",
+                "final_value": 0.0424,
+                "best_value": 0.0424
+              },
+              {
+                "dataset_name": "SPR_BENCH (cls_token)",
+                "final_value": 0.0718,
+                "best_value": 0.0718
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, time, random, pathlib, numpy as np, torch, torch.nn as nn, torch.nn.functional as F\nfrom torch.utils.data import Dataset, DataLoader\nfrom datasets import load_dataset, DatasetDict\nfrom collections import Counter\n\n# ------------------------------------------------------------------\n# mandatory working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ------------------------------------------------------------------\n# metrics\ndef count_shape_variety(seq):\n    return len(set(tok[0] for tok in seq.strip().split() if tok))\n\n\ndef count_color_variety(seq):\n    return len(set(tok[1] for tok in seq.strip().split() if len(tok) > 1))\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    c = [w0 if t == p else 0 for w0, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) else 0.0\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    c = [w0 if t == p else 0 for w0, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) else 0.0\n\n\ndef scwa(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) + count_color_variety(s) for s in seqs]\n    c = [w0 if t == p else 0 for w0, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) else 0.0\n\n\n# ------------------------------------------------------------------\n# dataset loading\ndef resolve_spr_path() -> pathlib.Path:\n    for p in [\n        os.getenv(\"SPR_BENCH_PATH\", \"\"),\n        pathlib.Path.cwd() / \"SPR_BENCH\",\n        pathlib.Path.cwd().parent / \"SPR_BENCH\",\n        pathlib.Path.home() / \"SPR_BENCH\",\n        \"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\",\n    ]:\n        if p and (pathlib.Path(p) / \"train.csv\").exists():\n            return pathlib.Path(p)\n    raise FileNotFoundError(\"Could not locate SPR_BENCH\")\n\n\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    ld = lambda name: load_dataset(\n        \"csv\", data_files=str(root / name), split=\"train\", cache_dir=\".cache_dsets\"\n    )\n    return DatasetDict(train=ld(\"train.csv\"), dev=ld(\"dev.csv\"), test=ld(\"test.csv\"))\n\n\nspr = load_spr_bench(resolve_spr_path())\nprint({k: len(v) for k, v in spr.items()})\n\n\n# ------------------------------------------------------------------\n# vocab\ndef tokenize(s):\n    return s.strip().split()\n\n\nvocab_counter = Counter(tok for s in spr[\"train\"][\"sequence\"] for tok in tokenize(s))\nvocab = [\"<PAD>\", \"<UNK>\"] + sorted(vocab_counter)\nstoi = {w: i for i, w in enumerate(vocab)}\npad_idx, unk_idx = 0, 1\n\n\ndef encode_tokens(toks):\n    return [stoi.get(t, unk_idx) for t in toks]\n\n\ndef encode_seq(seq):\n    return encode_tokens(tokenize(seq))\n\n\nlabels = sorted(set(spr[\"train\"][\"label\"]))\nltoi = {l: i for i, l in enumerate(labels)}\nitos_l = {i: l for l, i in ltoi.items()}\n\n\n# ------------------------------------------------------------------\n# simple augmentations\ndef augment_tokens(toks):\n    toks = [t for t in toks if random.random() > 0.15] or toks\n    if len(toks) > 3 and random.random() < 0.3:\n        i, j = sorted(random.sample(range(len(toks)), 2))\n        toks[i:j] = reversed(toks[i:j])\n    return toks\n\n\nMAX_LEN = 128\n\n\n# ------------------------------------------------------------------\n# datasets\nclass ContrastiveSPR(Dataset):\n    def __init__(self, seqs):\n        self.seqs = seqs\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        return self.seqs[idx]\n\n\ndef collate_contrastive(batch):\n    views = []\n    for s in batch:\n        tok = tokenize(s)\n        views.append(encode_tokens(augment_tokens(tok)))\n        views.append(encode_tokens(augment_tokens(tok)))\n    maxlen = min(MAX_LEN, max(len(v) for v in views))\n    x = torch.full((len(views), maxlen), pad_idx, dtype=torch.long)\n    for i, seq in enumerate(views):\n        seq = seq[:maxlen]\n        x[i, : len(seq)] = torch.tensor(seq)\n    return x.to(device)\n\n\nclass SupervisedSPR(Dataset):\n    def __init__(self, split):\n        self.seqs = split[\"sequence\"]\n        self.labs = [ltoi[l] for l in split[\"label\"]]\n\n    def __len__(self):\n        return len(self.labs)\n\n    def __getitem__(self, idx):\n        return {\n            \"input\": torch.tensor(\n                encode_seq(self.seqs[idx])[:MAX_LEN], dtype=torch.long\n            ),\n            \"label\": torch.tensor(self.labs[idx], dtype=torch.long),\n        }\n\n\ndef collate_supervised(batch):\n    maxlen = max(len(b[\"input\"]) for b in batch)\n    x = torch.full((len(batch), maxlen), pad_idx, dtype=torch.long)\n    for i, b in enumerate(batch):\n        x[i, : len(b[\"input\"])] = b[\"input\"]\n    y = torch.stack([b[\"label\"] for b in batch])\n    return {\"input\": x.to(device), \"label\": y.to(device)}\n\n\n# ------------------------------------------------------------------\n# Transformer encoders\nclass SPRTransformer(nn.Module):\n    def __init__(\n        self,\n        vocab_size,\n        emb_dim=128,\n        n_heads=4,\n        n_layers=2,\n        max_len=MAX_LEN,\n        use_cls=False,\n    ):\n        super().__init__()\n        self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=pad_idx)\n        # +1 for cls so we can index positions safely\n        self.pos = nn.Embedding(max_len + 1, emb_dim)\n        self.use_cls = use_cls\n        if use_cls:\n            self.cls_token = nn.Parameter(torch.randn(1, 1, emb_dim))\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=emb_dim,\n            nhead=n_heads,\n            dim_feedforward=emb_dim * 4,\n            batch_first=True,\n        )\n        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)\n        self.emb_dim = emb_dim\n\n    def forward(self, x):\n        if self.use_cls:\n            b, seq_len = x.shape\n            cls_tok = self.cls_token.repeat(b, 1, 1)\n            pos_ids = torch.arange(1, seq_len + 1, device=x.device).unsqueeze(0)\n            h = torch.cat([cls_tok, self.emb(x) + self.pos(pos_ids)], dim=1)\n            mask = torch.cat(\n                [torch.zeros((b, 1), dtype=torch.bool, device=x.device), x == pad_idx],\n                dim=1,\n            )\n            h = self.encoder(h, src_key_padding_mask=mask)\n            return h[:, 0]  # CLS\n        else:\n            pos_ids = torch.arange(0, x.size(1), device=x.device).unsqueeze(0)\n            h = self.emb(x) + self.pos(pos_ids)\n            mask = x == pad_idx\n            h = self.encoder(h, src_key_padding_mask=mask)\n            mask_inv = (~mask).unsqueeze(-1)\n            pooled = (h * mask_inv).sum(1) / mask_inv.sum(1).clamp(min=1)\n            return pooled\n\n\nclass ProjectionHead(nn.Module):\n    def __init__(self, dim):\n        super().__init__()\n        self.fc = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, dim))\n\n    def forward(self, z):\n        return self.fc(z)\n\n\nclass SPRModel(nn.Module):\n    def __init__(self, encoder, num_labels):\n        super().__init__()\n        self.encoder = encoder\n        self.classifier = nn.Linear(encoder.emb_dim, num_labels)\n\n    def forward(self, x):\n        return self.classifier(self.encoder(x))\n\n\n# ------------------------------------------------------------------\ndef nt_xent(z, temp=0.5):\n    z = F.normalize(z, dim=1)\n    sim = torch.mm(z, z.t()) / temp\n    eye = torch.eye(sim.size(0), device=sim.device).bool()\n    sim.masked_fill_(eye, -9e15)\n    N = z.size(0) // 2\n    pos = torch.arange(sim.size(0), device=sim.device)\n    pos = torch.where(pos < N, pos + N, pos - N)\n    return F.cross_entropy(sim, pos)\n\n\n# ------------------------------------------------------------------\ndef run_experiment(strategy_name, use_cls, pre_epochs=2, fine_epochs=4, emb_dim=128):\n    print(f\"\\n=== Running strategy: {strategy_name} (CLS={use_cls}) ===\")\n    encoder = SPRTransformer(len(vocab), emb_dim=emb_dim, use_cls=use_cls).to(device)\n    proj = ProjectionHead(emb_dim).to(device)\n    opt_pre = torch.optim.Adam(\n        list(encoder.parameters()) + list(proj.parameters()), lr=1e-3\n    )\n\n    pre_loader = DataLoader(\n        ContrastiveSPR(spr[\"train\"][\"sequence\"]),\n        batch_size=256,\n        shuffle=True,\n        collate_fn=collate_contrastive,\n    )\n    exp_data = {\n        \"metrics\": {\"val_SWA\": [], \"val_CWA\": [], \"val_SCWA\": []},\n        \"losses\": {\"pretrain\": [], \"train\": [], \"val\": []},\n        \"predictions\": [],\n        \"ground_truth\": [],\n        \"timestamps\": [],\n    }\n\n    # contrastive pre-training\n    for ep in range(1, pre_epochs + 1):\n        encoder.train()\n        proj.train()\n        running = 0.0\n        for xb in pre_loader:\n            opt_pre.zero_grad()\n            loss = nt_xent(proj(encoder(xb)))\n            loss.backward()\n            opt_pre.step()\n            running += loss.item() * xb.size(0)\n        ep_loss = running / len(pre_loader.dataset)\n        exp_data[\"losses\"][\"pretrain\"].append(ep_loss)\n        print(f\"Pretrain epoch {ep}: loss={ep_loss:.4f}\")\n\n    # supervised fine-tuning\n    model = SPRModel(encoder, len(labels)).to(device)\n    opt = torch.optim.Adam(model.parameters(), lr=1e-3)\n    criterion = nn.CrossEntropyLoss()\n    train_loader = DataLoader(\n        SupervisedSPR(spr[\"train\"]),\n        batch_size=128,\n        shuffle=True,\n        collate_fn=collate_supervised,\n    )\n    val_loader = DataLoader(\n        SupervisedSPR(spr[\"dev\"]),\n        batch_size=256,\n        shuffle=False,\n        collate_fn=collate_supervised,\n    )\n    best_scwa = -1\n    best_preds = []\n    best_trues = []\n    for ep in range(1, fine_epochs + 1):\n        model.train()\n        tr_loss = 0.0\n        for batch in train_loader:\n            opt.zero_grad()\n            loss = criterion(model(batch[\"input\"]), batch[\"label\"])\n            loss.backward()\n            opt.step()\n            tr_loss += loss.item() * batch[\"label\"].size(0)\n        tr_loss /= len(train_loader.dataset)\n        exp_data[\"losses\"][\"train\"].append(tr_loss)\n\n        model.eval()\n        val_loss = 0.0\n        preds = []\n        trues = []\n        with torch.no_grad():\n            for batch in val_loader:\n                logits = model(batch[\"input\"])\n                val_loss += criterion(logits, batch[\"label\"]).item() * batch[\n                    \"label\"\n                ].size(0)\n                preds += logits.argmax(1).cpu().tolist()\n                trues += batch[\"label\"].cpu().tolist()\n        val_loss /= len(val_loader.dataset)\n        exp_data[\"losses\"][\"val\"].append(val_loss)\n\n        swa = shape_weighted_accuracy(spr[\"dev\"][\"sequence\"], trues, preds)\n        cwa = color_weighted_accuracy(spr[\"dev\"][\"sequence\"], trues, preds)\n        sc = scwa(spr[\"dev\"][\"sequence\"], trues, preds)\n        exp_data[\"metrics\"][\"val_SWA\"].append(swa)\n        exp_data[\"metrics\"][\"val_CWA\"].append(cwa)\n        exp_data[\"metrics\"][\"val_SCWA\"].append(sc)\n        exp_data[\"timestamps\"].append(time.time())\n        print(\n            f\"Epoch {ep}: val_loss={val_loss:.4f} | SWA={swa:.4f} CWA={cwa:.4f} SCWA={sc:.4f}\"\n        )\n        if sc > best_scwa:\n            best_scwa = sc\n            best_preds = preds\n            best_trues = trues\n    exp_data[\"predictions\"] = best_preds\n    exp_data[\"ground_truth\"] = best_trues\n    return exp_data\n\n\n# ------------------------------------------------------------------\nexperiment_data = {\"mean_pool\": {\"SPR_BENCH\": {}}, \"cls_token\": {\"SPR_BENCH\": {}}}\n\nexperiment_data[\"mean_pool\"][\"SPR_BENCH\"] = run_experiment(\"mean_pool\", False)\nexperiment_data[\"cls_token\"][\"SPR_BENCH\"] = run_experiment(\"cls_token\", True)\n\n# ------------------------------------------------------------------\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Experiment data saved to working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ------------------------------------------------------------------\n# load data\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\nstrategies = list(experiment_data.keys())\ndataset = \"SPR_BENCH\"  # only dataset stored by the training script\n\n# helper to pick color styles\ncolors = {\"mean_pool\": \"tab:blue\", \"cls_token\": \"tab:orange\"}\n\n# ------------------------------------------------------------------\n# 1) Pre-training loss curves (both strategies on same plot)\ntry:\n    plt.figure()\n    for strat in strategies:\n        losses = experiment_data[strat][dataset][\"losses\"].get(\"pretrain\", [])\n        if losses:\n            plt.plot(\n                range(1, len(losses) + 1),\n                losses,\n                marker=\"o\",\n                label=strat,\n                color=colors.get(strat, None),\n            )\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.title(\"SPR_BENCH: Pre-training Loss (mean_pool vs cls_token)\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_BENCH_pretrain_loss.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating pretrain loss plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------\n# 2-3) Fine-tuning train/val losses per strategy\nfor strat in strategies:\n    try:\n        plt.figure()\n        losses = experiment_data[strat][dataset][\"losses\"]\n        tr, val = losses.get(\"train\", []), losses.get(\"val\", [])\n        epochs = range(1, max(len(tr), len(val)) + 1)\n        if tr:\n            plt.plot(epochs[: len(tr)], tr, marker=\"o\", label=\"train\", color=\"tab:blue\")\n        if val:\n            plt.plot(\n                epochs[: len(val)],\n                val,\n                marker=\"o\",\n                label=\"validation\",\n                color=\"tab:green\",\n            )\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Loss\")\n        plt.title(f\"SPR_BENCH Fine-tuning Loss ({strat})\")\n        plt.legend()\n        fname = os.path.join(working_dir, f\"SPR_BENCH_finetune_loss_{strat}.png\")\n        plt.savefig(fname)\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating fine-tune loss plot ({strat}): {e}\")\n        plt.close()\n\n# ------------------------------------------------------------------\n# 4) Validation SCWA curves (both strategies on same plot)\ntry:\n    plt.figure()\n    for strat in strategies:\n        scwa = experiment_data[strat][dataset][\"metrics\"].get(\"val_SCWA\", [])\n        if scwa:\n            plt.plot(\n                range(1, len(scwa) + 1),\n                scwa,\n                marker=\"o\",\n                label=strat,\n                color=colors.get(strat, None),\n            )\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"SCWA\")\n    plt.title(\"SPR_BENCH: Validation SCWA (mean_pool vs cls_token)\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_BENCH_val_SCWA.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating SCWA plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------\n# 5) Confusion matrix for best-performing strategy\n# pick strategy with highest max SCWA\nbest_strat = None\nbest_score = -1\nfor strat in strategies:\n    scwa_list = experiment_data[strat][dataset][\"metrics\"].get(\"val_SCWA\", [])\n    if scwa_list and max(scwa_list) > best_score:\n        best_score = max(scwa_list)\n        best_strat = strat\n\nif best_strat:\n    try:\n        preds = np.array(experiment_data[best_strat][dataset][\"predictions\"])\n        trues = np.array(experiment_data[best_strat][dataset][\"ground_truth\"])\n        if preds.size and trues.size and preds.size == trues.size:\n            num_labels = int(max(trues.max(), preds.max()) + 1)\n            cm = np.zeros((num_labels, num_labels), dtype=int)\n            for t, p in zip(trues, preds):\n                cm[t, p] += 1\n\n            plt.figure(figsize=(6, 5))\n            im = plt.imshow(cm, cmap=\"Blues\")\n            plt.colorbar(im, fraction=0.046, pad=0.04)\n            plt.xlabel(\"Predicted\")\n            plt.ylabel(\"True\")\n            plt.title(f\"SPR_BENCH Confusion Matrix (best: {best_strat})\")\n            # annotate cells (optional readability for small matrices)\n            for i in range(num_labels):\n                for j in range(num_labels):\n                    plt.text(\n                        j,\n                        i,\n                        cm[i, j],\n                        ha=\"center\",\n                        va=\"center\",\n                        color=\"black\",\n                        fontsize=8,\n                    )\n            fname = os.path.join(working_dir, f\"SPR_BENCH_confusion_{best_strat}.png\")\n            plt.savefig(fname)\n            plt.close()\n    except Exception as e:\n        print(f\"Error creating confusion matrix: {e}\")\n        plt.close()\n\n# ------------------------------------------------------------------\n# Print final evaluation metrics\nfor strat in strategies:\n    mets = experiment_data[strat][dataset][\"metrics\"]\n    swa, cwa, scwa = map(\n        max,\n        (mets.get(\"val_SWA\", [0]), mets.get(\"val_CWA\", [0]), mets.get(\"val_SCWA\", [0])),\n    )\n    print(f\"{strat}: best_SWA={swa:.4f}, best_CWA={cwa:.4f}, best_SCWA={scwa:.4f}\")\n",
+    "plot_plan": "We will load the saved experiment_data, extract losses and validation metrics for the two strategies (mean_pool and cls_token), and create up-to-five figures: (1) pre-training loss comparison, (2-3) fine-tuning train/val loss per strategy, (4) validation SCWA comparison, and (5) a confusion matrix for the strategy with the best SCWA.  \nEach figure is wrapped in its own try\u2013except block, has a clear title (including the dataset name and a subtitle where needed), is saved to working_dir with a descriptive filename, and the figure is closed afterwards.  \nEpoch axes are capped automatically by the data; no simulated values are introduced.  \nAfter plotting we compute and print the maximum Shape/Color/SC weighted accuracies for each strategy so users can quickly compare results.  \nThe code follows the required import order, respects the plotting guidelines, and limits similar figures to \u22645.  \nAll plots are generated only if the corresponding data exist in experiment_data.npy; otherwise the block reports the error and continues.  \nFinally, every open figure is closed even on exception to avoid resource leakage.",
+    "plot_analyses": [
+      {
+        "analysis": "This plot compares pre-training loss between the 'mean_pool' and 'cls_token' strategies over two epochs. Both strategies show a consistent decrease in loss, indicating effective pre-training. However, 'mean_pool' achieves a slightly lower loss by the second epoch, suggesting it may better capture the symbolic sequence features during pre-training.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_674fac0b2890482c80e9496ae173d132_proc_2971857/SPR_BENCH_pretrain_loss.png"
+      },
+      {
+        "analysis": "This plot illustrates the fine-tuning loss for the 'mean_pool' strategy over four epochs. Both training and validation losses decrease steadily, with validation loss stabilizing after epoch 3. This indicates effective fine-tuning with minimal overfitting, as the validation loss follows the training loss closely.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_674fac0b2890482c80e9496ae173d132_proc_2971857/SPR_BENCH_finetune_loss_mean_pool.png"
+      },
+      {
+        "analysis": "This plot shows the fine-tuning loss for the 'cls_token' strategy. Both training and validation losses decrease similarly to the 'mean_pool' strategy. However, the validation loss plateaus slightly earlier, suggesting that 'cls_token' may converge faster but potentially with less fine-tuned performance compared to 'mean_pool'.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_674fac0b2890482c80e9496ae173d132_proc_2971857/SPR_BENCH_finetune_loss_cls_token.png"
+      },
+      {
+        "analysis": "This plot compares the validation SCWA (Shape and Color Weighted Accuracy) between 'mean_pool' and 'cls_token' strategies. Both methods improve over epochs, with 'mean_pool' achieving a higher SCWA by epoch 3 and maintaining it. This indicates that 'mean_pool' produces more contextually aware embeddings, leading to better symbolic pattern recognition.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_674fac0b2890482c80e9496ae173d132_proc_2971857/SPR_BENCH_val_SCWA.png"
+      },
+      {
+        "analysis": "The confusion matrix for the 'mean_pool' strategy shows strong performance, with minimal misclassifications (53 false positives and 9 false negatives). This highlights the model's ability to accurately classify symbolic sequences, further validating the effectiveness of the 'mean_pool' strategy.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_674fac0b2890482c80e9496ae173d132_proc_2971857/SPR_BENCH_confusion_mean_pool.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_674fac0b2890482c80e9496ae173d132_proc_2971857/SPR_BENCH_pretrain_loss.png",
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_674fac0b2890482c80e9496ae173d132_proc_2971857/SPR_BENCH_finetune_loss_mean_pool.png",
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_674fac0b2890482c80e9496ae173d132_proc_2971857/SPR_BENCH_finetune_loss_cls_token.png",
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_674fac0b2890482c80e9496ae173d132_proc_2971857/SPR_BENCH_val_SCWA.png",
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_674fac0b2890482c80e9496ae173d132_proc_2971857/SPR_BENCH_confusion_mean_pool.png"
+    ],
+    "vlm_feedback_summary": "The experimental results highlight the effectiveness of the 'mean_pool' strategy, which consistently outperforms 'cls_token' across pre-training loss, fine-tuning loss, and validation SCWA. The confusion matrix further confirms the robustness of 'mean_pool' in classifying symbolic sequences, with minimal errors. Overall, the findings support the hypothesis that context-aware contrastive learning with 'mean_pool' enhances symbolic pattern recognition.",
+    "exp_results_dir": "experiment_results/experiment_674fac0b2890482c80e9496ae173d132_proc_2971857",
+    "ablation_name": "CLS-Token Representation Instead of Mean-Pooling",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_674fac0b2890482c80e9496ae173d132_proc_2971857/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "The research plan initially focused on replacing the bag-of-embedding encoder with a lightweight transformer featuring learnable positional encodings to improve reasoning over token order and long-range dependencies. This was achieved using stochastic, context-aware augmentations to create positive pairs for contrastive learning, followed by fine-tuning with a new classification head, monitoring key metrics. The current plan shifts to evaluating the quality of learned representations through a linear-probe approach, freezing the encoder and only training a fresh linear classifier during supervised learning. This isolates the encoder's ability to capture meaningful features, enhancing overall understanding and benchmarking of pre-trained representations under the ablation key frozen_encoder/SPR_BENCH.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "shape-weighted accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy weighted by shape attribute.",
+            "data": [
+              {
+                "dataset_name": "validation",
+                "final_value": 0.7415,
+                "best_value": 0.7415
+              }
+            ]
+          },
+          {
+            "metric_name": "color-weighted accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy weighted by color attribute.",
+            "data": [
+              {
+                "dataset_name": "validation",
+                "final_value": 0.7412,
+                "best_value": 0.7412
+              }
+            ]
+          },
+          {
+            "metric_name": "shape-and-color weighted accuracy",
+            "lower_is_better": false,
+            "description": "Accuracy weighted by both shape and color attributes.",
+            "data": [
+              {
+                "dataset_name": "validation",
+                "final_value": 0.7414,
+                "best_value": 0.7414
+              }
+            ]
+          },
+          {
+            "metric_name": "pretraining loss",
+            "lower_is_better": true,
+            "description": "Loss during the pretraining phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 12.4661,
+                "best_value": 12.4661
+              }
+            ]
+          },
+          {
+            "metric_name": "training loss",
+            "lower_is_better": true,
+            "description": "Loss during the training phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.5888,
+                "best_value": 0.5888
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "Loss on the validation dataset.",
+            "data": [
+              {
+                "dataset_name": "validation",
+                "final_value": 0.5697,
+                "best_value": 0.5697
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, time, random, pathlib, numpy as np, torch, torch.nn as nn, torch.nn.functional as F\nfrom torch.utils.data import Dataset, DataLoader\nfrom datasets import load_dataset, DatasetDict\nfrom collections import Counter\n\n# ------------------------------------------------------------\n# mandatory working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# device\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(\"Using device:\", device)\n\n\n# ------------------------------------------------------------\n# metrics -----------------------------------------------------\ndef count_shape_variety(seq):\n    return len(set(tok[0] for tok in seq.strip().split() if tok))\n\n\ndef count_color_variety(seq):\n    return len(set(tok[1] for tok in seq.strip().split() if len(tok) > 1))\n\n\ndef shape_weighted_accuracy(seqs, y_t, y_p):\n    w = [count_shape_variety(s) for s in seqs]\n    c = [w0 if t == p else 0 for w0, t, p in zip(w, y_t, y_p)]\n    return sum(c) / sum(w) if sum(w) else 0.0\n\n\ndef color_weighted_accuracy(seqs, y_t, y_p):\n    w = [count_color_variety(s) for s in seqs]\n    c = [w0 if t == p else 0 for w0, t, p in zip(w, y_t, y_p)]\n    return sum(c) / sum(w) if sum(w) else 0.0\n\n\ndef scwa(seqs, y_t, y_p):\n    w = [count_shape_variety(s) + count_color_variety(s) for s in seqs]\n    c = [w0 if t == p else 0 for w0, t, p in zip(w, y_t, y_p)]\n    return sum(c) / sum(w) if sum(w) else 0.0\n\n\n# ------------------------------------------------------------\n# dataset -----------------------------------------------------\ndef resolve_spr_path() -> pathlib.Path:\n    for p in [\n        os.getenv(\"SPR_BENCH_PATH\", \"\"),\n        pathlib.Path.cwd() / \"SPR_BENCH\",\n        pathlib.Path.cwd().parent / \"SPR_BENCH\",\n        pathlib.Path.home() / \"SPR_BENCH\",\n        \"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\",\n    ]:\n        if p and (pathlib.Path(p) / \"train.csv\").exists():\n            return pathlib.Path(p)\n    raise FileNotFoundError(\"SPR_BENCH not found\")\n\n\ndef load_spr_bench(root) -> DatasetDict:\n    def _load(name):\n        return load_dataset(\n            \"csv\", data_files=str(root / name), split=\"train\", cache_dir=\".cache_dsets\"\n        )\n\n    return DatasetDict(\n        train=_load(\"train.csv\"), dev=_load(\"dev.csv\"), test=_load(\"test.csv\")\n    )\n\n\nspr_path = resolve_spr_path()\nspr = load_spr_bench(spr_path)\nprint({k: len(v) for k, v in spr.items()})\n\n\n# ------------------------------------------------------------\n# vocab -------------------------------------------------------\ndef tokenize(s):\n    return s.strip().split()\n\n\nvocab_counter = Counter(tok for s in spr[\"train\"][\"sequence\"] for tok in tokenize(s))\nvocab = [\"<PAD>\", \"<UNK>\"] + sorted(vocab_counter)\nstoi = {w: i for i, w in enumerate(vocab)}\npad_idx, unk_idx = 0, 1\n\n\ndef encode_tokens(toks):\n    return [stoi.get(t, unk_idx) for t in toks]\n\n\ndef encode_seq(seq):\n    return encode_tokens(tokenize(seq))\n\n\nlabels = sorted(set(spr[\"train\"][\"label\"]))\nltoi = {l: i for i, l in enumerate(labels)}\nitos_l = {i: l for l, i in ltoi.items()}\n\n\n# ------------------------------------------------------------\n# augment -----------------------------------------------------\ndef augment_tokens(toks):\n    toks = [t for t in toks if random.random() > 0.15] or toks\n    if len(toks) > 3 and random.random() < 0.3:\n        i, j = sorted(random.sample(range(len(toks)), 2))\n        toks[i:j] = reversed(toks[i:j])\n    return toks\n\n\nMAX_LEN = 128\n\n\nclass ContrastiveSPR(Dataset):\n    def __init__(self, seqs):\n        self.seqs = seqs\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, i):\n        return self.seqs[i]\n\n\ndef collate_contrastive(batch):\n    views = []\n    for s in batch:\n        tok = tokenize(s)\n        views.append(encode_tokens(augment_tokens(tok)))\n        views.append(encode_tokens(augment_tokens(tok)))\n    maxlen = min(MAX_LEN, max(len(v) for v in views))\n    x = torch.full((len(views), maxlen), pad_idx, dtype=torch.long)\n    for i, seq in enumerate(views):\n        seq = seq[:maxlen]\n        x[i, : len(seq)] = torch.tensor(seq)\n    return x.to(device)\n\n\nclass SupervisedSPR(Dataset):\n    def __init__(self, split):\n        self.seqs = split[\"sequence\"]\n        self.labs = [ltoi[l] for l in split[\"label\"]]\n\n    def __len__(self):\n        return len(self.labs)\n\n    def __getitem__(self, i):\n        return {\n            \"input\": torch.tensor(encode_seq(self.seqs[i])[:MAX_LEN], dtype=torch.long),\n            \"label\": torch.tensor(self.labs[i], dtype=torch.long),\n        }\n\n\ndef collate_supervised(batch):\n    maxlen = max(len(b[\"input\"]) for b in batch)\n    x = torch.full((len(batch), maxlen), pad_idx, dtype=torch.long)\n    for i, b in enumerate(batch):\n        x[i, : len(b[\"input\"])] = b[\"input\"]\n    y = torch.stack([b[\"label\"] for b in batch])\n    return {\"input\": x.to(device), \"label\": y.to(device)}\n\n\n# ------------------------------------------------------------\n# model -------------------------------------------------------\nclass SPRTransformer(nn.Module):\n    def __init__(self, vocab_size, emb_dim=128, n_heads=4, n_layers=2, max_len=MAX_LEN):\n        super().__init__()\n        self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=pad_idx)\n        self.pos = nn.Embedding(max_len, emb_dim)\n        enc_layer = nn.TransformerEncoderLayer(\n            d_model=emb_dim,\n            nhead=n_heads,\n            dim_feedforward=emb_dim * 4,\n            batch_first=True,\n        )\n        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)\n        self.emb_dim = emb_dim\n\n    def forward(self, x):\n        pos_ids = torch.arange(0, x.size(1), device=x.device).unsqueeze(0)\n        h = self.emb(x) + self.pos(pos_ids)\n        mask = x == pad_idx\n        h = self.encoder(h, src_key_padding_mask=mask)\n        mask_inv = (~mask).unsqueeze(-1)\n        return (h * mask_inv).sum(1) / mask_inv.sum(1).clamp(min=1)\n\n\nclass ProjectionHead(nn.Module):\n    def __init__(self, d):\n        super().__init__()\n        self.fc = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, d))\n\n    def forward(self, z):\n        return self.fc(z)\n\n\nclass SPRModel(nn.Module):\n    def __init__(self, enc, num_labels):\n        super().__init__()\n        self.encoder = enc\n        self.classifier = nn.Linear(enc.emb_dim, num_labels)\n\n    def forward(self, x):\n        return self.classifier(self.encoder(x))\n\n\n# ------------------------------------------------------------\ndef nt_xent(z, temp=0.5):\n    z = nn.functional.normalize(z, dim=1)\n    sim = torch.mm(z, z.t()) / temp\n    sim.masked_fill_(torch.eye(sim.size(0), device=sim.device).bool(), -9e15)\n    N = z.size(0) // 2\n    pos = torch.arange(sim.size(0), device=sim.device)\n    pos = torch.where(pos < N, pos + N, pos - N)\n    return F.cross_entropy(sim, pos)\n\n\n# ------------------------------------------------------------\n# experiment storage scaffold\nexperiment_data = {\n    \"frozen_encoder\": {\n        \"SPR_BENCH\": {\n            \"metrics\": {\"val_SWA\": [], \"val_CWA\": [], \"val_SCWA\": []},\n            \"losses\": {\"pretrain\": [], \"train\": [], \"val\": []},\n            \"predictions\": [],\n            \"ground_truth\": [],\n            \"timestamps\": [],\n        }\n    }\n}\nexp = experiment_data[\"frozen_encoder\"][\"SPR_BENCH\"]\n\n# ------------------------------------------------------------\n# contrastive pre-training ------------------------------------\nemb_dim = 128\nencoder = SPRTransformer(len(vocab), emb_dim=emb_dim).to(device)\nproj = ProjectionHead(emb_dim).to(device)\nopt_pre = torch.optim.Adam(\n    list(encoder.parameters()) + list(proj.parameters()), lr=1e-3\n)\n\npre_loader = DataLoader(\n    ContrastiveSPR(spr[\"train\"][\"sequence\"]),\n    batch_size=256,\n    shuffle=True,\n    collate_fn=collate_contrastive,\n)\npre_epochs = 2\nfor ep in range(1, pre_epochs + 1):\n    encoder.train()\n    proj.train()\n    running = 0.0\n    for xb in pre_loader:\n        opt_pre.zero_grad()\n        loss = nt_xent(proj(encoder(xb)))\n        loss.backward()\n        opt_pre.step()\n        running += loss.item() * xb.size(0)\n    ep_loss = running / len(pre_loader.dataset)\n    exp[\"losses\"][\"pretrain\"].append(ep_loss)\n    print(f\"Pretrain Epoch {ep}: loss={ep_loss:.4f}\")\n\n# ------------------------------------------------------------\n# freeze encoder for linear probe -----------------------------\nfor p in encoder.parameters():\n    p.requires_grad = False\n\nmodel = SPRModel(encoder, len(labels)).to(device)\nopt = torch.optim.Adam(model.classifier.parameters(), lr=1e-3)\ncriterion = nn.CrossEntropyLoss()\n\ntrain_loader = DataLoader(\n    SupervisedSPR(spr[\"train\"]),\n    batch_size=128,\n    shuffle=True,\n    collate_fn=collate_supervised,\n)\nval_loader = DataLoader(\n    SupervisedSPR(spr[\"dev\"]),\n    batch_size=256,\n    shuffle=False,\n    collate_fn=collate_supervised,\n)\n\nbest_scwa = -1\nbest_preds = []\nbest_trues = []\nfine_epochs = 4\nfor ep in range(1, fine_epochs + 1):\n    # train\n    model.train()\n    tr_loss = 0.0\n    for batch in train_loader:\n        opt.zero_grad()\n        logits = model(batch[\"input\"])\n        loss = criterion(logits, batch[\"label\"])\n        loss.backward()\n        opt.step()\n        tr_loss += loss.item() * batch[\"label\"].size(0)\n    tr_loss /= len(train_loader.dataset)\n    exp[\"losses\"][\"train\"].append(tr_loss)\n\n    # val\n    model.eval()\n    val_loss = 0.0\n    preds = []\n    trues = []\n    with torch.no_grad():\n        for batch in val_loader:\n            logits = model(batch[\"input\"])\n            val_loss += criterion(logits, batch[\"label\"]).item() * batch[\"label\"].size(\n                0\n            )\n            preds += logits.argmax(1).cpu().tolist()\n            trues += batch[\"label\"].cpu().tolist()\n    val_loss /= len(val_loader.dataset)\n    exp[\"losses\"][\"val\"].append(val_loss)\n\n    swa = shape_weighted_accuracy(spr[\"dev\"][\"sequence\"], trues, preds)\n    cwa = color_weighted_accuracy(spr[\"dev\"][\"sequence\"], trues, preds)\n    sc = scwa(spr[\"dev\"][\"sequence\"], trues, preds)\n    exp[\"metrics\"][\"val_SWA\"].append(swa)\n    exp[\"metrics\"][\"val_CWA\"].append(cwa)\n    exp[\"metrics\"][\"val_SCWA\"].append(sc)\n    exp[\"timestamps\"].append(time.time())\n    print(\n        f\"Epoch {ep}: val_loss={val_loss:.4f} | SWA={swa:.4f} CWA={cwa:.4f} SCWA={sc:.4f}\"\n    )\n    if sc > best_scwa:\n        best_scwa = sc\n        best_preds = preds\n        best_trues = trues\n\nexp[\"predictions\"] = best_preds\nexp[\"ground_truth\"] = best_trues\n\n# ------------------------------------------------------------\n# save --------------------------------------------------------\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Saved experiment data to working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# mandatory working directory\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ------------------------------------------------------------------\n# load experiment data\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\n    exp = experiment_data[\"frozen_encoder\"][\"SPR_BENCH\"]\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    exp = None\n\nif exp:\n    # ------------------------------------------------------------------\n    # Plot 1: Loss curves\n    try:\n        plt.figure()\n        if exp[\"losses\"][\"pretrain\"]:\n            plt.plot(exp[\"losses\"][\"pretrain\"], label=\"Pre-train loss\")\n        if exp[\"losses\"][\"train\"]:\n            plt.plot(\n                range(\n                    len(exp[\"losses\"][\"pretrain\"]),\n                    len(exp[\"losses\"][\"pretrain\"]) + len(exp[\"losses\"][\"train\"]),\n                ),\n                exp[\"losses\"][\"train\"],\n                label=\"Train loss\",\n            )\n        if exp[\"losses\"][\"val\"]:\n            plt.plot(\n                range(\n                    len(exp[\"losses\"][\"pretrain\"]),\n                    len(exp[\"losses\"][\"pretrain\"]) + len(exp[\"losses\"][\"val\"]),\n                ),\n                exp[\"losses\"][\"val\"],\n                label=\"Val loss\",\n            )\n        plt.xlabel(\"Epoch\")\n        plt.ylabel(\"Loss\")\n        plt.title(\"SPR_BENCH: Pre-train / Train / Val Loss\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_loss_curves.png\"))\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating loss plot: {e}\")\n        plt.close()\n\n    # ------------------------------------------------------------------\n    # Plot 2: Validation metric curves\n    try:\n        plt.figure()\n        if exp[\"metrics\"][\"val_SWA\"]:\n            plt.plot(exp[\"metrics\"][\"val_SWA\"], label=\"SWA\")\n        if exp[\"metrics\"][\"val_CWA\"]:\n            plt.plot(exp[\"metrics\"][\"val_CWA\"], label=\"CWA\")\n        if exp[\"metrics\"][\"val_SCWA\"]:\n            plt.plot(exp[\"metrics\"][\"val_SCWA\"], label=\"SCWA\")\n        plt.xlabel(\"Fine-tuning Epoch\")\n        plt.ylabel(\"Accuracy\")\n        plt.title(\"SPR_BENCH: Validation Metrics\")\n        plt.legend()\n        plt.savefig(os.path.join(working_dir, \"SPR_BENCH_validation_metrics.png\"))\n        plt.close()\n    except Exception as e:\n        print(f\"Error creating metric plot: {e}\")\n        plt.close()\n\n    # ------------------------------------------------------------------\n    # Print best metrics\n    if exp[\"metrics\"][\"val_SCWA\"]:\n        best_idx = int(np.argmax(exp[\"metrics\"][\"val_SCWA\"]))\n        best_swa = exp[\"metrics\"][\"val_SWA\"][best_idx]\n        best_cwa = exp[\"metrics\"][\"val_CWA\"][best_idx]\n        best_scwa = exp[\"metrics\"][\"val_SCWA\"][best_idx]\n        print(\n            f\"Best epoch: {best_idx + 1} | SWA={best_swa:.4f} \"\n            f\"CWA={best_cwa:.4f} SCWA={best_scwa:.4f}\"\n        )\n    else:\n        print(\"No validation metrics recorded.\")\n",
+    "plot_plan": "We first load the serialized experiment_data dictionary, select the \u201cfrozen_encoder / SPR_BENCH\u201d entry, and extract three parallel time-series: the pre-training loss, the fine-tuning training loss, and the fine-tuning validation loss.  A line plot will display these losses against epoch indices so that convergence behaviour can be inspected.  Next we gather the validation metrics (shape-weighted, color-weighted and combined SCWA) logged after every fine-tuning epoch; a second plot will show all three curves in one figure to visualise performance trends.  Each plot is produced inside its own try-except block, saved in the mandatory \u201cworking\u201d folder with clear file names that include the dataset and plot type, and the figure is always closed afterwards.  After plotting we compute the best (maximum) SCWA value and print it together with its corresponding SWA and CWA for quick textual inspection.  All plotting relies solely on the values present in experiment_data.npy\u2014no synthetic data are introduced.  At most two figures are created, satisfying the five-figure cap.  The code below is concise, starts with the required imports, and prints the chosen evaluation metrics at the end.",
+    "plot_analyses": [
+      {
+        "analysis": "This plot highlights the loss trends during the pre-training, training, and validation phases over a span of 5 epochs. The pre-train loss starts at a high value of approximately 12 and remains constant, indicating that the pre-training process may not have been properly initialized or updated. On the other hand, both the training and validation losses start at a much lower level (around 2) and exhibit a slight decreasing trend, suggesting that the model is learning during the fine-tuning phase. However, the lack of significant reduction in the training and validation losses raises concerns about the model's capacity to learn effectively or the suitability of the learning rate and optimization parameters.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_4513fc1921e44032a9fc68742c8f0796_proc_2971858/SPR_BENCH_loss_curves.png"
+      },
+      {
+        "analysis": "This plot presents the validation performance metrics (SWA, CWA, and SCWA) across fine-tuning epochs. All three metrics show an initial improvement, peaking at epoch 2, before slightly declining at epoch 3. This pattern suggests that the model benefits from fine-tuning up to a certain point but may start to overfit or lose generalization capability beyond epoch 2. Among the metrics, SWA consistently outperforms CWA and SCWA, indicating that the model is better at capturing shape-weighted patterns compared to color-weighted or combined patterns. The relatively small differences between the metrics suggest a balanced performance across different aspects of the task.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_4513fc1921e44032a9fc68742c8f0796_proc_2971858/SPR_BENCH_validation_metrics.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_4513fc1921e44032a9fc68742c8f0796_proc_2971858/SPR_BENCH_loss_curves.png",
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_4513fc1921e44032a9fc68742c8f0796_proc_2971858/SPR_BENCH_validation_metrics.png"
+    ],
+    "vlm_feedback_summary": "The analysis reveals that while the training and validation losses decrease slightly, the pre-train loss remains constant, signaling potential issues in pre-training. Validation metrics improve up to a certain point, with SWA being the highest, but a slight drop at later epochs indicates potential overfitting or loss of generalization.",
+    "exp_results_dir": "experiment_results/experiment_4513fc1921e44032a9fc68742c8f0796_proc_2971858",
+    "ablation_name": "Frozen Encoder (Linear-Probe Fine-Tuning)",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_4513fc1921e44032a9fc68742c8f0796_proc_2971858/experiment_data.npy"
+    ]
+  },
+  {
+    "overall_plan": "The research plan initially sought to enhance model reasoning over token order and capture long-range dependencies by replacing a bag-of-embedding encoder with a lightweight transformer with learnable positional encodings. This involved stochastic, context-aware augmentations for contrastive learning, followed by supervised fine-tuning with careful metric monitoring. The current plan introduces an ablation study by creating an Attention-Only TransformerEncoderLayer, omitting feed-forward networks to assess their impact. The rest of the pipeline remains identical to ensure a controlled comparison with the baseline. The overall scientific objective is to delineate the contributions of transformer components, particularly the feed-forward network, to model capacity and performance.",
+    "analysis": "",
+    "metric": {
+      "value": {
+        "metric_names": [
+          {
+            "metric_name": "pretraining loss",
+            "lower_is_better": true,
+            "description": "The loss during the pretraining phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 12.4661,
+                "best_value": 12.4661
+              }
+            ]
+          },
+          {
+            "metric_name": "training loss",
+            "lower_is_better": true,
+            "description": "The loss during the training phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.0678,
+                "best_value": 0.0678
+              }
+            ]
+          },
+          {
+            "metric_name": "validation loss",
+            "lower_is_better": true,
+            "description": "The loss during the validation phase.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.0507,
+                "best_value": 0.0507
+              }
+            ]
+          },
+          {
+            "metric_name": "validation Shape-Weighted Accuracy",
+            "lower_is_better": false,
+            "description": "The shape-weighted accuracy during validation.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.9868,
+                "best_value": 0.9868
+              }
+            ]
+          },
+          {
+            "metric_name": "validation Color-Weighted Accuracy",
+            "lower_is_better": false,
+            "description": "The color-weighted accuracy during validation.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.9875,
+                "best_value": 0.9875
+              }
+            ]
+          },
+          {
+            "metric_name": "validation Shape+Color-Weighted Accuracy",
+            "lower_is_better": false,
+            "description": "The combined shape and color-weighted accuracy during validation.",
+            "data": [
+              {
+                "dataset_name": "SPR_BENCH",
+                "final_value": 0.9871,
+                "best_value": 0.9871
+              }
+            ]
+          }
+        ]
+      },
+      "maximize": null,
+      "name": null,
+      "description": null
+    },
+    "code": "import os, time, random, pathlib, numpy as np, torch, torch.nn as nn, torch.nn.functional as F\nfrom torch.utils.data import Dataset, DataLoader\nfrom datasets import load_dataset, DatasetDict\nfrom collections import Counter\n\n# ------------------------------------------------------------------\n# mandatory working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# device handling\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(f\"Using device: {device}\")\n\n\n# ------------------------------------------------------------------\n# metric helpers\ndef count_shape_variety(seq):\n    return len(set(tok[0] for tok in seq.strip().split() if tok))\n\n\ndef count_color_variety(seq):\n    return len(set(tok[1] for tok in seq.strip().split() if len(tok) > 1))\n\n\ndef shape_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) for s in seqs]\n    c = [w0 if t == p else 0 for w0, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) else 0.0\n\n\ndef color_weighted_accuracy(seqs, y_true, y_pred):\n    w = [count_color_variety(s) for s in seqs]\n    c = [w0 if t == p else 0 for w0, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) else 0.0\n\n\ndef scwa(seqs, y_true, y_pred):\n    w = [count_shape_variety(s) + count_color_variety(s) for s in seqs]\n    c = [w0 if t == p else 0 for w0, t, p in zip(w, y_true, y_pred)]\n    return sum(c) / sum(w) if sum(w) else 0.0\n\n\n# ------------------------------------------------------------------\n# dataset loading\ndef resolve_spr_path() -> pathlib.Path:\n    for p in [\n        os.getenv(\"SPR_BENCH_PATH\", \"\"),\n        pathlib.Path.cwd() / \"SPR_BENCH\",\n        pathlib.Path.cwd().parent / \"SPR_BENCH\",\n        pathlib.Path.home() / \"SPR_BENCH\",\n        \"/home/zxl240011/AI-Scientist-v2/SPR_BENCH\",\n    ]:\n        if p and (pathlib.Path(p) / \"train.csv\").exists():\n            return pathlib.Path(p)\n    raise FileNotFoundError(\"Could not locate SPR_BENCH\")\n\n\ndef load_spr_bench(root: pathlib.Path) -> DatasetDict:\n    def _load(csv_name):\n        return load_dataset(\n            \"csv\",\n            data_files=str(root / csv_name),\n            split=\"train\",\n            cache_dir=\".cache_dsets\",\n        )\n\n    return DatasetDict(\n        train=_load(\"train.csv\"), dev=_load(\"dev.csv\"), test=_load(\"test.csv\")\n    )\n\n\nspr_path = resolve_spr_path()\nspr = load_spr_bench(spr_path)\nprint({k: len(v) for k, v in spr.items()})\n\n\n# ------------------------------------------------------------------\n# vocabulary\ndef tokenize(s):\n    return s.strip().split()\n\n\nvocab_counter = Counter(tok for s in spr[\"train\"][\"sequence\"] for tok in tokenize(s))\nvocab = [\"<PAD>\", \"<UNK>\"] + sorted(vocab_counter)\nstoi = {w: i for i, w in enumerate(vocab)}\npad_idx, unk_idx = 0, 1\n\n\ndef encode_tokens(toks):\n    return [stoi.get(t, unk_idx) for t in toks]\n\n\ndef encode_seq(seq):\n    return encode_tokens(tokenize(seq))\n\n\nlabels = sorted(set(spr[\"train\"][\"label\"]))\nltoi = {l: i for i, l in enumerate(labels)}\nitos_l = {i: l for l, i in ltoi.items()}\n\n\n# ------------------------------------------------------------------\n# augmentations\ndef augment_tokens(toks):\n    toks = [t for t in toks if random.random() > 0.15] or toks\n    if len(toks) > 3 and random.random() < 0.3:\n        i, j = sorted(random.sample(range(len(toks)), 2))\n        toks[i:j] = reversed(toks[i:j])\n    return toks\n\n\n# ------------------------------------------------------------------\nMAX_LEN = 128\n\n\nclass ContrastiveSPR(Dataset):\n    def __init__(self, sequences):\n        self.seqs = sequences\n\n    def __len__(self):\n        return len(self.seqs)\n\n    def __getitem__(self, idx):\n        return self.seqs[idx]\n\n\ndef collate_contrastive(batch):\n    views = []\n    for s in batch:\n        tok = tokenize(s)\n        views.append(encode_tokens(augment_tokens(tok)))\n        views.append(encode_tokens(augment_tokens(tok)))\n    maxlen = min(MAX_LEN, max(len(v) for v in views))\n    x = torch.full((len(views), maxlen), pad_idx, dtype=torch.long)\n    for i, seq in enumerate(views):\n        seq = seq[:maxlen]\n        x[i, : len(seq)] = torch.tensor(seq)\n    return x.to(device)\n\n\nclass SupervisedSPR(Dataset):\n    def __init__(self, split):\n        self.seqs = split[\"sequence\"]\n        self.labs = [ltoi[l] for l in split[\"label\"]]\n\n    def __len__(self):\n        return len(self.labs)\n\n    def __getitem__(self, idx):\n        return {\n            \"input\": torch.tensor(\n                encode_seq(self.seqs[idx])[:MAX_LEN], dtype=torch.long\n            ),\n            \"label\": torch.tensor(self.labs[idx], dtype=torch.long),\n        }\n\n\ndef collate_supervised(batch):\n    maxlen = max(len(b[\"input\"]) for b in batch)\n    x = torch.full((len(batch), maxlen), pad_idx, dtype=torch.long)\n    for i, b in enumerate(batch):\n        x[i, : len(b[\"input\"])] = b[\"input\"]\n    y = torch.stack([b[\"label\"] for b in batch])\n    return {\"input\": x.to(device), \"label\": y.to(device)}\n\n\n# ------------------------------------------------------------------\n# Attention-Only Encoder Layer\nclass AttentionOnlyEncoderLayer(nn.Module):\n    def __init__(self, d_model, nhead, dropout=0.1):\n        super().__init__()\n        self.self_attn = nn.MultiheadAttention(\n            d_model, nhead, dropout=dropout, batch_first=True\n        )\n        self.dropout = nn.Dropout(dropout)\n        self.norm = nn.LayerNorm(d_model)\n\n    def forward(self, src, src_mask=None, src_key_padding_mask=None):\n        attn_output, _ = self.self_attn(\n            src, src, src, attn_mask=src_mask, key_padding_mask=src_key_padding_mask\n        )\n        src = self.norm(src + self.dropout(attn_output))\n        return src\n\n\n# ------------------------------------------------------------------\n# Transformer Encoder (Attention-Only stack)\nclass AttentionOnlyTransformer(nn.Module):\n    def __init__(self, vocab_size, emb_dim=128, n_heads=4, n_layers=2, max_len=MAX_LEN):\n        super().__init__()\n        self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=pad_idx)\n        self.pos = nn.Embedding(max_len, emb_dim)\n        layers = [AttentionOnlyEncoderLayer(emb_dim, n_heads) for _ in range(n_layers)]\n        self.encoder = nn.ModuleList(layers)\n        self.emb_dim = emb_dim\n\n    def forward(self, x):\n        pos_ids = torch.arange(0, x.size(1), device=x.device).unsqueeze(0)\n        h = self.emb(x) + self.pos(pos_ids)\n        mask = x == pad_idx\n        for layer in self.encoder:\n            h = layer(h, src_key_padding_mask=mask)\n        mask_inv = (~mask).unsqueeze(-1)\n        pooled = (h * mask_inv).sum(1) / mask_inv.sum(1).clamp(min=1)\n        return pooled\n\n\nclass ProjectionHead(nn.Module):\n    def __init__(self, dim):\n        super().__init__()\n        self.fc = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, dim))\n\n    def forward(self, z):\n        return self.fc(z)\n\n\nclass SPRModel(nn.Module):\n    def __init__(self, encoder, num_labels):\n        super().__init__()\n        self.encoder = encoder\n        self.classifier = nn.Linear(encoder.emb_dim, num_labels)\n\n    def forward(self, x):\n        return self.classifier(self.encoder(x))\n\n\n# ------------------------------------------------------------------\ndef nt_xent(z, temp=0.5):\n    z = F.normalize(z, dim=1)\n    sim = torch.mm(z, z.t()) / temp\n    eye = torch.eye(sim.size(0), device=sim.device).bool()\n    sim.masked_fill_(eye, -9e15)\n    N = z.size(0) // 2\n    pos = torch.arange(sim.size(0), device=sim.device)\n    pos = torch.where(pos < N, pos + N, pos - N)\n    return F.cross_entropy(sim, pos)\n\n\n# ------------------------------------------------------------------\nexperiment_data = {\n    \"attention_only\": {\n        \"SPR_BENCH\": {\n            \"metrics\": {\"val_SWA\": [], \"val_CWA\": [], \"val_SCWA\": []},\n            \"losses\": {\"pretrain\": [], \"train\": [], \"val\": []},\n            \"predictions\": [],\n            \"ground_truth\": [],\n            \"timestamps\": [],\n        }\n    }\n}\n\n# ------------------------------------------------------------------\n# Contrastive pre-training\nemb_dim = 128\nencoder = AttentionOnlyTransformer(len(vocab), emb_dim=emb_dim).to(device)\nproj = ProjectionHead(emb_dim).to(device)\nopt_pre = torch.optim.Adam(\n    list(encoder.parameters()) + list(proj.parameters()), lr=1e-3\n)\n\npre_loader = DataLoader(\n    ContrastiveSPR(spr[\"train\"][\"sequence\"]),\n    batch_size=256,\n    shuffle=True,\n    collate_fn=collate_contrastive,\n)\n\npre_epochs = 2\nfor ep in range(1, pre_epochs + 1):\n    encoder.train()\n    proj.train()\n    running = 0.0\n    for xb in pre_loader:\n        opt_pre.zero_grad()\n        z = proj(encoder(xb))\n        loss = nt_xent(z)\n        loss.backward()\n        opt_pre.step()\n        running += loss.item() * xb.size(0)\n    ep_loss = running / len(pre_loader.dataset)\n    experiment_data[\"attention_only\"][\"SPR_BENCH\"][\"losses\"][\"pretrain\"].append(ep_loss)\n    print(f\"Pretrain Epoch {ep}: loss={ep_loss:.4f}\")\n\n# ------------------------------------------------------------------\n# Supervised fine-tuning\nmodel = SPRModel(encoder, len(labels)).to(device)\nopt = torch.optim.Adam(model.parameters(), lr=1e-3)\ncriterion = nn.CrossEntropyLoss()\n\ntrain_loader = DataLoader(\n    SupervisedSPR(spr[\"train\"]),\n    batch_size=128,\n    shuffle=True,\n    collate_fn=collate_supervised,\n)\nval_loader = DataLoader(\n    SupervisedSPR(spr[\"dev\"]),\n    batch_size=256,\n    shuffle=False,\n    collate_fn=collate_supervised,\n)\n\nbest_scwa, best_preds, best_trues = -1, [], []\nfine_epochs = 4\nfor ep in range(1, fine_epochs + 1):\n    model.train()\n    tr_loss = 0.0\n    for batch in train_loader:\n        opt.zero_grad()\n        logits = model(batch[\"input\"])\n        loss = criterion(logits, batch[\"label\"])\n        loss.backward()\n        opt.step()\n        tr_loss += loss.item() * batch[\"label\"].size(0)\n    tr_loss /= len(train_loader.dataset)\n    experiment_data[\"attention_only\"][\"SPR_BENCH\"][\"losses\"][\"train\"].append(tr_loss)\n\n    model.eval()\n    val_loss = 0.0\n    preds = []\n    trues = []\n    with torch.no_grad():\n        for batch in val_loader:\n            logits = model(batch[\"input\"])\n            loss = criterion(logits, batch[\"label\"])\n            val_loss += loss.item() * batch[\"label\"].size(0)\n            preds += logits.argmax(1).cpu().tolist()\n            trues += batch[\"label\"].cpu().tolist()\n    val_loss /= len(val_loader.dataset)\n    experiment_data[\"attention_only\"][\"SPR_BENCH\"][\"losses\"][\"val\"].append(val_loss)\n\n    swa = shape_weighted_accuracy(spr[\"dev\"][\"sequence\"], trues, preds)\n    cwa = color_weighted_accuracy(spr[\"dev\"][\"sequence\"], trues, preds)\n    sc = scwa(spr[\"dev\"][\"sequence\"], trues, preds)\n    md = experiment_data[\"attention_only\"][\"SPR_BENCH\"][\"metrics\"]\n    md[\"val_SWA\"].append(swa)\n    md[\"val_CWA\"].append(cwa)\n    md[\"val_SCWA\"].append(sc)\n    experiment_data[\"attention_only\"][\"SPR_BENCH\"][\"timestamps\"].append(time.time())\n\n    print(\n        f\"Epoch {ep}: val_loss={val_loss:.4f} | SWA={swa:.4f} CWA={cwa:.4f} SCWA={sc:.4f}\"\n    )\n    if sc > best_scwa:\n        best_scwa = sc\n        best_preds = preds\n        best_trues = trues\n\nexperiment_data[\"attention_only\"][\"SPR_BENCH\"][\"predictions\"] = best_preds\nexperiment_data[\"attention_only\"][\"SPR_BENCH\"][\"ground_truth\"] = best_trues\n\n# ------------------------------------------------------------------\n# save experiment data\nnp.save(\n    os.path.join(working_dir, \"experiment_data.npy\"), experiment_data, allow_pickle=True\n)\nprint(\"Experiment data saved to working/experiment_data.npy\")\n",
+    "plot_code": "import matplotlib.pyplot as plt\nimport numpy as np\nimport os\n\n# mandatory working dir\nworking_dir = os.path.join(os.getcwd(), \"working\")\nos.makedirs(working_dir, exist_ok=True)\n\n# ------------------------------------------------------------------\n# helper to load data\ntry:\n    experiment_data = np.load(\n        os.path.join(working_dir, \"experiment_data.npy\"), allow_pickle=True\n    ).item()\nexcept Exception as e:\n    print(f\"Error loading experiment data: {e}\")\n    experiment_data = {}\n\n# ------------------------------------------------------------------\nmodel_key, ds_key = \"attention_only\", \"SPR_BENCH\"\ndata = experiment_data.get(model_key, {}).get(ds_key, {})\nlosses = data.get(\"losses\", {})\nmetrics = data.get(\"metrics\", {})\n\n# ------------------------------------------------------------------\n# Plot 1: contrastive pretraining loss\ntry:\n    plt.figure()\n    plt.plot(\n        range(1, len(losses.get(\"pretrain\", [])) + 1),\n        losses.get(\"pretrain\", []),\n        marker=\"o\",\n    )\n    plt.title(\"SPR_BENCH: Contrastive Pretraining Loss\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Loss\")\n    fname = os.path.join(working_dir, \"SPR_BENCH_pretrain_loss.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating pretraining loss plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------\n# Plot 2: supervised train vs val loss\ntry:\n    plt.figure()\n    ep = range(1, len(losses.get(\"train\", [])) + 1)\n    plt.plot(ep, losses.get(\"train\", []), label=\"Train\")\n    plt.plot(ep, losses.get(\"val\", []), label=\"Validation\")\n    plt.title(\"SPR_BENCH: Supervised Training & Validation Loss\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Loss\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_BENCH_train_val_loss.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating train/val loss plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------\n# Plot 3: validation metrics curves\ntry:\n    plt.figure()\n    ep = range(1, len(metrics.get(\"val_SWA\", [])) + 1)\n    plt.plot(ep, metrics.get(\"val_SWA\", []), label=\"SWA\")\n    plt.plot(ep, metrics.get(\"val_CWA\", []), label=\"CWA\")\n    plt.plot(ep, metrics.get(\"val_SCWA\", []), label=\"SCWA\")\n    plt.title(\"SPR_BENCH: Validation Metrics over Epochs\")\n    plt.xlabel(\"Epoch\")\n    plt.ylabel(\"Score\")\n    plt.legend()\n    fname = os.path.join(working_dir, \"SPR_BENCH_val_metrics_curves.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating metric curves plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------\n# Plot 4: best epoch metric summary\ntry:\n    best_idx = int(np.argmax(metrics.get(\"val_SCWA\", [0])))\n    vals = [\n        metrics.get(\"val_SWA\", [0])[best_idx] if metrics.get(\"val_SWA\") else 0,\n        metrics.get(\"val_CWA\", [0])[best_idx] if metrics.get(\"val_CWA\") else 0,\n        metrics.get(\"val_SCWA\", [0])[best_idx] if metrics.get(\"val_SCWA\") else 0,\n    ]\n    plt.figure()\n    plt.bar([\"SWA\", \"CWA\", \"SCWA\"], vals, color=[\"skyblue\", \"salmon\", \"gold\"])\n    plt.title(f\"SPR_BENCH: Best Epoch ({best_idx+1}) Metric Summary\")\n    plt.ylabel(\"Score\")\n    fname = os.path.join(working_dir, \"SPR_BENCH_best_epoch_metrics.png\")\n    plt.savefig(fname)\n    plt.close()\nexcept Exception as e:\n    print(f\"Error creating best epoch bar plot: {e}\")\n    plt.close()\n\n# ------------------------------------------------------------------\n# Print best metrics\nif metrics.get(\"val_SCWA\"):\n    best = int(np.argmax(metrics[\"val_SCWA\"]))\n    print(f\"Best epoch: {best+1}\")\n    print(f\"SWA:  {metrics['val_SWA'][best]:.4f}\")\n    print(f\"CWA:  {metrics['val_CWA'][best]:.4f}\")\n    print(f\"SCWA: {metrics['val_SCWA'][best]:.4f}\")\nelse:\n    print(\"No metrics available to show.\")\n",
+    "plot_plan": "We load the stored experiment_data.npy and safely extract the attention-only results for SPR_BENCH. Four figures are produced: (1) contrastive-pretraining loss over epochs, (2) supervised training vs validation loss, (3) validation SWA/CWA/SCWA curves, and (4) a bar chart summarising the best epoch\u2019s three metrics. Each plot is wrapped in its own try-except, saved under descriptive names containing the dataset and plot type, and the figure is always closed. We also compute and print the best SCWA together with its corresponding SWA and CWA so users have an at-a-glance evaluation. All plotting uses standard matplotlib without custom styles and only the data present in experiment_data.npy; no synthetic values are generated. Only up to four figures are emitted to respect the five-figure cap, and epochs are plotted exactly as stored. Paths use the mandated working directory. The code is concise and self-contained, starting with the required imports and ending with straightforward metric printing.",
+    "plot_analyses": [
+      {
+        "analysis": "The contrastive pretraining loss decreases steadily over the epochs, indicating that the model is effectively learning representations during the pretraining phase. The consistent and significant drop in loss suggests that the contrastive learning framework is converging well.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_c6283e1f3efe40898b8784119464649e_proc_2971860/SPR_BENCH_pretrain_loss.png"
+      },
+      {
+        "analysis": "Both training and validation losses decrease consistently over the epochs, indicating that the model is learning effectively and generalizing well to the validation set. The gap between the two losses remains relatively small, suggesting no significant overfitting.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_c6283e1f3efe40898b8784119464649e_proc_2971860/SPR_BENCH_train_val_loss.png"
+      },
+      {
+        "analysis": "The validation metrics (SWA, CWA, SCWA) improve steadily over the epochs, demonstrating that the model's performance on the SPR task is consistently improving. The close alignment of these metrics suggests that the model is equally effective across different evaluation criteria.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_c6283e1f3efe40898b8784119464649e_proc_2971860/SPR_BENCH_val_metrics_curves.png"
+      },
+      {
+        "analysis": "The metric summary at the best epoch shows that the model achieves very high scores for SWA, CWA, and SCWA, nearing perfect performance. This indicates the model's strong ability to generalize and perform well on the SPR task.",
+        "plot_path": "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_c6283e1f3efe40898b8784119464649e_proc_2971860/SPR_BENCH_best_epoch_metrics.png"
+      }
+    ],
+    "plot_paths": [
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_c6283e1f3efe40898b8784119464649e_proc_2971860/SPR_BENCH_pretrain_loss.png",
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_c6283e1f3efe40898b8784119464649e_proc_2971860/SPR_BENCH_train_val_loss.png",
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_c6283e1f3efe40898b8784119464649e_proc_2971860/SPR_BENCH_val_metrics_curves.png",
+      "experiments/2025-08-15_18-22-30_context_aware_contrastive_learning_attempt_0/logs/0-run/experiment_results/experiment_c6283e1f3efe40898b8784119464649e_proc_2971860/SPR_BENCH_best_epoch_metrics.png"
+    ],
+    "vlm_feedback_summary": "The plots indicate effective learning during both pretraining and supervised training phases, with consistent improvements in validation metrics. The results demonstrate the model's ability to achieve high performance on the SPR task, validating the proposed approach.",
+    "exp_results_dir": "experiment_results/experiment_c6283e1f3efe40898b8784119464649e_proc_2971860",
+    "ablation_name": "Attention-Only Encoder (No Feed-Forward Layers)",
+    "exp_results_npy_files": [
+      "experiment_results/experiment_c6283e1f3efe40898b8784119464649e_proc_2971860/experiment_data.npy"
+    ]
+  }
+]

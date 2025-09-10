@@ -1,0 +1,352 @@
+import os, pathlib, random, json, time
+import numpy as np
+import torch, torch.nn as nn
+from torch.utils.data import DataLoader, Dataset, ConcatDataset
+from datasets import load_dataset, DatasetDict, Dataset as HFDataset
+
+# ---------- work dir & device ----------
+working_dir = os.path.join(os.getcwd(), "working")
+os.makedirs(working_dir, exist_ok=True)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# ---------- seeds for reproducibility ---
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+
+# ---------- helpers ----------
+def load_csv_bench(root: pathlib.Path) -> DatasetDict:
+    def _load(csv_name: str):
+        return load_dataset(
+            "csv",
+            data_files=str(root / csv_name),
+            split="train",
+            cache_dir=".cache_dsets",
+        )
+
+    return DatasetDict(
+        {
+            "train": _load("train.csv"),
+            "dev": (
+                _load("dev.csv") if (root / "dev.csv").exists() else _load("train.csv")
+            ),
+            "test": (
+                _load("test.csv")
+                if (root / "test.csv").exists()
+                else _load("train.csv")
+            ),
+        }
+    )
+
+
+# ---------- SPR_BENCH (always required) ---------------
+DATA_PATH_SPR = pathlib.Path("/home/zxl240011/AI-Scientist-v2/SPR_BENCH/")
+if not DATA_PATH_SPR.exists():
+    DATA_PATH_SPR = pathlib.Path("./SPR_BENCH")
+spr = load_csv_bench(DATA_PATH_SPR)
+print("SPR sizes:", {k: len(v) for k, v in spr.items()})
+
+# ---------- CSR/REL paths -----------------------------
+DATA_PATH_CSR = pathlib.Path("/home/zxl240011/AI-Scientist-v2/CSR_BENCH/")
+if not DATA_PATH_CSR.exists():
+    DATA_PATH_CSR = pathlib.Path("./CSR_BENCH")
+DATA_PATH_REL = pathlib.Path("/home/zxl240011/AI-Scientist-v2/REL_BENCH/")
+if not DATA_PATH_REL.exists():
+    DATA_PATH_REL = pathlib.Path("./REL_BENCH")
+
+
+# ---------- fallback dummy data generator -------------
+def generate_dummy_dataset(n_samples: int, shapes, colors, labels):
+    seqs, labs = [], []
+    for _ in range(n_samples):
+        ln = random.randint(3, 10)
+        toks = []
+        for _ in range(ln):
+            s = random.choice(list(shapes))
+            if random.random() < 0.7 and colors:
+                c = random.choice(list(colors))
+                toks.append(s + c)
+            else:
+                toks.append(s)
+        seqs.append(" ".join(toks))
+        labs.append(random.choice(labels))
+    return HFDataset.from_dict({"sequence": seqs, "label": labs})
+
+
+def prepare_bench(path, bench_name, fallback_samples=2000):
+    if path.exists():
+        try:
+            bench = load_csv_bench(path)
+            print(f"{bench_name} sizes:", {k: len(v) for k, v in bench.items()})
+            return bench
+        except Exception as e:
+            print(f"Failed to read {bench_name} ({e}), generating dummy.")
+    # dummy
+    dummy_ds = generate_dummy_dataset(
+        fallback_samples,
+        {tok[0] for tok in spr["train"][0]["sequence"].split()},
+        {tok[1] for tok in spr["train"][0]["sequence"].split() if len(tok) > 1},
+        list({row["label"] for row in spr["train"]}),
+    )
+    return DatasetDict(
+        {
+            "train": dummy_ds,
+            "dev": dummy_ds.select(range(200)),
+            "test": dummy_ds.select(range(200)),
+        }
+    )
+
+
+csr = prepare_bench(DATA_PATH_CSR, "CSR_BENCH")
+rel = prepare_bench(DATA_PATH_REL, "REL_BENCH")
+
+# ---------- vocabularies from SPR (kept identical) ----
+shape_set, color_set = set(), set()
+for row in spr["train"]:
+    for tok in row["sequence"].split():
+        shape_set.add(tok[0])
+        if len(tok) > 1:
+            color_set.add(tok[1])
+
+shape2id = {
+    "<pad>": 0,
+    "<unk>": 1,
+    **{s: i + 2 for i, s in enumerate(sorted(shape_set))},
+}
+color2id = {
+    "<pad>": 0,
+    "<unk>": 1,
+    **{c: i + 2 for i, c in enumerate(sorted(color_set))},
+}
+label_set = sorted({row["label"] for row in spr["train"]})
+label2id = {l: i for i, l in enumerate(label_set)}
+print(f"Shapes {len(shape2id)}  Colors {len(color2id)}  Classes {len(label2id)}")
+
+
+# ---------- converters ---------------
+def seq_to_indices(seq):
+    s_idx, c_idx = [], []
+    for tok in seq.strip().split():
+        s_idx.append(shape2id.get(tok[0], shape2id["<unk>"]))
+        if len(tok) > 1:
+            c_idx.append(color2id.get(tok[1], color2id["<unk>"]))
+        else:
+            c_idx.append(color2id["<pad>"])
+    return s_idx, c_idx
+
+
+def count_shape_variety(sequence: str) -> int:
+    return len(set(tok[0] for tok in sequence.strip().split() if tok))
+
+
+def count_color_variety(sequence: str) -> int:
+    return len(set(tok[1] for tok in sequence.strip().split() if len(tok) > 1))
+
+
+def shape_weighted_accuracy(seqs, y_true, y_pred):
+    w = [count_shape_variety(s) for s in seqs]
+    c = [wt if t == p else 0 for wt, t, p in zip(w, y_true, y_pred)]
+    return sum(c) / sum(w) if sum(w) > 0 else 0.0
+
+
+# ---------- torch Dataset -------------
+class BenchTorchDataset(Dataset):
+    def __init__(self, hf_split):
+        self.data = hf_split
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        row = self.data[idx]
+        s_idx, c_idx = seq_to_indices(row["sequence"])
+        return {
+            "shape_idx": torch.tensor(s_idx, dtype=torch.long),
+            "color_idx": torch.tensor(c_idx, dtype=torch.long),
+            "label": torch.tensor(label2id.get(row["label"], 0), dtype=torch.long),
+            "raw_seq": row["sequence"],
+        }
+
+
+def collate(batch):
+    shapes = [b["shape_idx"] for b in batch]
+    colors = [b["color_idx"] for b in batch]
+    lens = [len(x) for x in shapes]
+    pad_s = nn.utils.rnn.pad_sequence(
+        shapes, batch_first=True, padding_value=shape2id["<pad>"]
+    )
+    pad_c = nn.utils.rnn.pad_sequence(
+        colors, batch_first=True, padding_value=color2id["<pad>"]
+    )
+    labels = torch.stack([b["label"] for b in batch])
+    raws = [b["raw_seq"] for b in batch]
+
+    sv = torch.tensor([count_shape_variety(r) for r in raws], dtype=torch.float)
+    cv = torch.tensor([count_color_variety(r) for r in raws], dtype=torch.float)
+    ln = torch.tensor(lens, dtype=torch.float)
+    sh_hist = torch.zeros(len(batch), len(shape2id), dtype=torch.float)
+    co_hist = torch.zeros(len(batch), len(color2id), dtype=torch.float)
+    for i, (s_idx, c_idx) in enumerate(zip(shapes, colors)):
+        sh_hist[i].scatter_add_(0, s_idx, torch.ones_like(s_idx, dtype=torch.float))
+        co_hist[i].scatter_add_(0, c_idx, torch.ones_like(c_idx, dtype=torch.float))
+    sh_hist = sh_hist / ln.unsqueeze(1)
+    co_hist = co_hist / ln.unsqueeze(1)
+    sym_feats = torch.cat(
+        [sv.unsqueeze(1), cv.unsqueeze(1), ln.unsqueeze(1), sh_hist, co_hist], dim=1
+    )
+    return {
+        "shape_idx": pad_s,
+        "color_idx": pad_c,
+        "sym": sym_feats,
+        "label": labels,
+        "raw_seq": raws,
+    }
+
+
+# ---------- dataloaders ---------------
+batch_size = 256
+multi_train_dataset = ConcatDataset(
+    [
+        BenchTorchDataset(spr["train"]),
+        BenchTorchDataset(csr["train"]),
+        BenchTorchDataset(rel["train"]),
+    ]
+)
+train_loader = DataLoader(
+    multi_train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate
+)
+
+dev_loader = DataLoader(
+    BenchTorchDataset(spr["dev"]),
+    batch_size=batch_size,
+    shuffle=False,
+    collate_fn=collate,
+)
+test_loader = DataLoader(
+    BenchTorchDataset(spr["test"]),
+    batch_size=batch_size,
+    shuffle=False,
+    collate_fn=collate,
+)
+
+
+# ---------- model ----------------------
+class GatedHybrid(nn.Module):
+    def __init__(
+        self, shp_vocab, col_vocab, sym_dim, num_classes, d_model=64, nhead=8, nlayers=2
+    ):
+        super().__init__()
+        self.sh_emb = nn.Embedding(shp_vocab, d_model, padding_idx=shape2id["<pad>"])
+        self.co_emb = nn.Embedding(col_vocab, d_model, padding_idx=color2id["<pad>"])
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, batch_first=True, dropout=0.1
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=nlayers)
+        self.sym_proj = nn.Linear(sym_dim, d_model)
+        self.gate = nn.Linear(d_model * 2, d_model, bias=False)
+        self.classifier = nn.Sequential(nn.ReLU(), nn.Linear(d_model, num_classes))
+
+    def forward(self, shape_idx, color_idx, sym_feats):
+        token_rep = self.sh_emb(shape_idx) + self.co_emb(color_idx)
+        mask = shape_idx == shape2id["<pad>"]
+        enc = self.encoder(token_rep, src_key_padding_mask=mask)
+        mean_rep = (enc * (~mask).unsqueeze(-1)).sum(1) / (~mask).sum(
+            1, keepdim=True
+        ).clamp(min=1)
+        sym_rep = self.sym_proj(sym_feats)
+        fusion = torch.sigmoid(self.gate(torch.cat([mean_rep, sym_rep], dim=1)))
+        joint = fusion * mean_rep + (1 - fusion) * sym_rep
+        return self.classifier(joint)
+
+
+sym_dim_total = 3 + len(shape2id) + len(color2id)
+model = GatedHybrid(
+    len(shape2id), len(color2id), sym_dim_total, num_classes=len(label2id)
+).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+criterion = nn.CrossEntropyLoss()
+
+# ---------- logging container ----------
+experiment_data = {
+    "multi_synth_train": {
+        "spr_bench": {
+            "metrics": {"train": [], "val": []},
+            "swa": {"train": [], "val": []},
+            "losses": {"train": [], "val": []},
+            "predictions": {},
+            "ground_truth": {
+                "val": [label2id[l] for l in spr["dev"]["label"]],
+                "test": [label2id[l] for l in spr["test"]["label"]],
+            },
+        }
+    }
+}
+
+
+# ---------- train / eval loops ----------
+def run_epoch(loader, train: bool):
+    if train:
+        model.train()
+    else:
+        model.eval()
+    tot, correct, loss_sum = 0, 0, 0.0
+    preds, gts, raws = [], [], []
+    for batch in loader:
+        batch_tensors = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
+        logits = model(
+            batch_tensors["shape_idx"], batch_tensors["color_idx"], batch_tensors["sym"]
+        )
+        loss = criterion(logits, batch_tensors["label"])
+        if train:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        with torch.no_grad():
+            p = logits.argmax(-1)
+        loss_sum += loss.item() * batch_tensors["label"].size(0)
+        correct += (p == batch_tensors["label"]).sum().item()
+        tot += batch_tensors["label"].size(0)
+        preds.extend(p.cpu().tolist())
+        gts.extend(batch_tensors["label"].cpu().tolist())
+        raws.extend(batch["raw_seq"])
+    acc = correct / tot
+    avg_loss = loss_sum / tot
+    swa = shape_weighted_accuracy(raws, gts, preds)
+    return avg_loss, acc, swa, preds
+
+
+num_epochs = 5
+for epoch in range(1, num_epochs + 1):
+    tr_loss, tr_acc, tr_swa, _ = run_epoch(train_loader, True)
+    val_loss, val_acc, val_swa, val_pred = run_epoch(dev_loader, False)
+    print(
+        f"Epoch {epoch}: val_loss={val_loss:.4f}  val_acc={val_acc:.3f}  val_swa={val_swa:.3f}"
+    )
+    ed = experiment_data["multi_synth_train"]["spr_bench"]
+    ed["metrics"]["train"].append(tr_acc)
+    ed["metrics"]["val"].append(val_acc)
+    ed["swa"]["train"].append(tr_swa)
+    ed["swa"]["val"].append(val_swa)
+    ed["losses"]["train"].append(tr_loss)
+    ed["losses"]["val"].append(val_loss)
+    if epoch == num_epochs:
+        ed["predictions"]["val"] = val_pred
+
+# ---------- test evaluation -----------
+test_loss, test_acc, test_swa, test_pred = run_epoch(test_loader, False)
+print(f"TEST: loss={test_loss:.4f} acc={test_acc:.3f} SWA={test_swa:.3f}")
+ed = experiment_data["multi_synth_train"]["spr_bench"]
+ed["predictions"]["test"] = test_pred
+ed["test_metrics"] = {"loss": test_loss, "acc": test_acc, "swa": test_swa}
+
+# ---------- save artefacts ------------
+np.save(os.path.join(working_dir, "experiment_data.npy"), experiment_data)
+print("Saved experiment data to ./working")
