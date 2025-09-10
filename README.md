@@ -41,6 +41,18 @@ To generate a paper with The AI Scientist v2:
 
 ```bash
 cd AI Scientist v2
+# Create a new conda environment
+conda create -n ai_scientist python=3.11
+conda activate ai_scientist
+
+# Install PyTorch with CUDA support (adjust pytorch-cuda version for your setup)
+conda install pytorch torchvision torchaudio pytorch-cuda=12.4 -c pytorch -c nvidia
+
+# Install PDF and LaTeX tools
+conda install anaconda::poppler
+conda install conda-forge::chktex
+
+# Install Python package requirements
 pip install -r requirements.txt
 bash run.sh
 ```
@@ -49,6 +61,13 @@ To generate a paper with AgentLaboratory:
 
 ```bash
 cd AgentLaboratory
+# Set up and Activate Python Environment
+python -m venv venv_agent_lab
+# Now activate this environment:
+source venv_agent_lab/bin/activate
+# Install pdflatex [OPTIONAL]
+sudo apt install pdflatex
+# Install required libraries
 pip install -r requirements.txt
 bash run.sh
 ```
