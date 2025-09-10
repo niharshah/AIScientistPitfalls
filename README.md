@@ -1,17 +1,4 @@
 # AIScientistPitfalls
-This is the official for paper "The More You Automate, the Less You See: Hidden Pitfalls of AI Scientist Systems".
-
-# Overview
-This repository accompanies the paper "Pitfalls of AI Scientists" and aims to provide a structured framework for analyzing, reproducing, and mitigating common failure modes in AI-driven scientific discovery. As AI systems increasingly take on roles traditionally held by human researchers—such as hypothesis generation, experimentation, and interpretation—it becomes critical to understand where and how these systems can go wrong.
-
-
-Here's a draft **README** for the GitHub repository AIScientistPitfalls, based on its contents and context:
-
----
-
-# AIScientistPitfalls
-
-**Understanding and Mitigating Pitfalls in AI-Driven Scientific Research**
 
 ## Overview
 
@@ -65,7 +52,6 @@ cd AgentLaboratory
 pip install -r requirements.txt
 bash run.sh
 ```
-
 
 
 ## Citation
