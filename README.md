@@ -10,15 +10,15 @@ This repository accompanies the paper *"Understanding and Mitigating Pitfalls in
 AIScientistPitfalls/
 ├── AI Scientist v2/       # Case studies of The AI Scientist v2
 │   ├─ generated_research  # including the generated research under four pitfall detection experiments
-|   └─...
+│   └─...
 ├── AgentLaboratory/       # Case studies of Agent Laboratory
 │   ├─ generated_research  # including the generated research under four pitfall detection experiments
-|   └─...
+│   └─...
 ├── SPR Task/              # incuding datasets and task description for four identified pitfalls
-|
+│
 ├── pitfall_detection/     # including datasets and code for pitfall detection method 
-|                            
-└─ README.md              # This file
+│                            
+└─ README.md               # This file
 ```
 
 ## Getting Started
