@@ -2,7 +2,7 @@
 
 ## Overview
 
-This repository accompanies the paper [The More You Automate, the Less You See: Hidden Pitfalls of AI Scientist Systems](https://arxiv.org/abs/2509.08713) and aims to provide a structured framework for detecting and mitigating common failure modes in AI-driven scientific discovery. As AI systems increasingly take on roles traditionally held by human researchers—such as hypothesis generation, experimentation, and interpretation—it becomes critical to understand where and how these systems can go wrong.
+This repository accompanies the paper [The More You Automate, the Less You See: Hidden Pitfalls of AI Scientist Systems](https://arxiv.org/abs/2509.08713) and aims to provide a empirical framework for detecting common failure modes in AI-driven scientific discovery, including inappropriate benchmark selection, metric misuse, data leakage, post-hoc selection bias. As AI systems increasingly take on roles traditionally held by human researchers such as hypothesis generation, experimentation, and paper writing, it becomes critical to understand where and how these systems can go wrong.
 
 ## Repository Structure
 
@@ -94,21 +94,24 @@ This similarly produces the generated research under a new created folder `MATH_
 ## Pitfall Detection (`pitfall_detection/`)
 The pitfall_detection module provides tools to identify four methodological pitfalls in AI-generated scientific research outputs. 
 
-### Key Features
-
-* **Trace-level analysis**: Evaluates not just the final report but the full experimental trace for hidden errors.
-* **Configurable pipeline**: Easy to plug in new pitfall definitions or apply to outputs from other AI scientist systems.
-* **Rule-based and LLM-based detectors** for common pitfalls such as:
-
 ### Usage
 
 1. Go to the directory:
 
    ```bash
-   cd SPR\ Task/pitfall_detection
+   cd pitfall_detection
    ```
-2. Prepare your AI-generated research outputs (logs + reports) in the correct path.
-3. Run the detection pipeline (example):
+2. Prepare your the following AI-generated research outputs in correct paths:
+      - Task description
+            
+            For the inappropiate benchmarch selection bias issue, the list of available benchmarks can be retrieved from the internet by LLMs based on the task relevance.
+      - Generated paper
+      - Code
+
+            For the post-hoc selection bias issue, the code and logs should include all the experiments attempted by the AI scientist system.
+      - Logs 
+
+3. Run the detection pipeline:
 
    ```bash
    python detect_pitfalls.py
